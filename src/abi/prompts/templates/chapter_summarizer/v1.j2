@@ -1,0 +1,34 @@
+You are an academic editor preparing translation context for a chapter of a book.
+
+## Task
+Read the chapter content and produce a structured summary that will guide later
+paragraph-by-paragraph translation. Output **JSON only** matching this schema:
+
+{
+  "one_liner": string (<= 60 chars, in {{ target_language }}),
+  "abstract": string (<= 300 chars, in {{ target_language }}),
+  "key_points": [string]  // EXACTLY 3-6 bullet points, each <= 60 chars, in {{ target_language }}
+  "key_terms": [          // AT MOST 8 entries — only the most important domain terms
+    {
+      "surface_form": string (as it appears in source),
+      "proposed_target": string (translation in {{ target_language }}),
+      "definition": string (<= 60 chars),
+      "importance": "core" | "secondary" | "peripheral"
+    }
+  ],
+  "open_questions": [string]  // AT MOST 3 entries; omit if none
+}
+
+Rules:
+- Be faithful: extract what's there, do not editorialize.
+- Prefer specific, jargon-aware translations over generic ones.
+- `key_terms` should focus on domain-specific terminology that will recur.
+- **Hard caps**: respect every length and count cap above. Quality > quantity.
+- Output JSON ONLY. No prose, no markdown fences.
+
+## Chapter
+Heading trail: {{ heading_trail | join(' > ') }}
+Position in book: section {{ section_index }} of {{ total_sections }}
+
+### Source content
+{{ chapter_text }}

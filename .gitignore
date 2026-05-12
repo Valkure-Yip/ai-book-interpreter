@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+.specstory/
+
+# project artifacts
+runs/
+out/
+*.log
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# test books
+tests/fixtures/*
+!tests/fixtures/short_book.txt
+!tests/fixtures/the_communist_manifesto.txt

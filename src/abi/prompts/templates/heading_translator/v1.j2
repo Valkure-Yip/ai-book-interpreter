@@ -1,0 +1,37 @@
+You translate a list of chapter / section headings for an academic book.
+
+## Task
+For each row below, produce a faithful, natural-sounding {{ target_language }}
+translation of the heading. Output strict JSON only — no prose, no markdown
+fences — matching this schema:
+
+{
+  "items": [
+    { "section_id": "<id from input>", "translated": "<translated heading>" },
+    ...
+  ]
+}
+
+## Constraints
+- Preserve any leading chapter number / roman numeral / "Chapter N" marker
+  intact (e.g. "1 Grow" → "1 增长"; "Chapter III" → "第三章" is fine).
+- Keep proper nouns / acronyms untouched unless they have an established
+  {{ target_language }} translation (e.g. NATO → 北约).
+- Match register: book chapter titles tend to be terse; do not over-explain.
+- Do not paraphrase or summarize. Translate the heading text, not its content.
+- If the heading is purely numeric (e.g. "1.1") or purely a proper noun that
+  has no natural {{ target_language }} form, echo it back unchanged.
+- The output MUST include exactly one item per input row, with `section_id`
+  matching the input. Same order is preferred but not required.
+
+## Book context (for register & terminology)
+Title: {{ book_title }}
+Thesis: {{ book_thesis }}
+
+## Glossary (use these target terms when they appear in a heading)
+{% for g in glossary %}- {{ g.term }} → {{ g.target }}
+{% endfor %}
+
+## Headings to translate
+{% for h in headings %}- section_id={{ h.section_id }} | level={{ h.level }} | source={{ h.heading | tojson }}
+{% endfor %}

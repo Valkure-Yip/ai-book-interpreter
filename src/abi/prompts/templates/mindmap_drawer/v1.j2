@@ -1,0 +1,27 @@
+You are visualizing a book's structure as a Mermaid mindmap.
+
+## Task
+Produce a JSON object:
+
+{ "mermaid": "..." }
+
+Where the value is a complete, valid Mermaid `mindmap` source. Constraints:
+- root node = the book title (use the {{ target_language }} title if obvious, else original)
+- depth <= 4
+- total nodes <= 80
+- chapter nodes use chapter titles; under each, 2-4 of its key points (concise)
+
+## Book
+Title: {{ title }}
+Thesis (in {{ target_language }}): {{ thesis }}
+
+## Chapters
+{% for c in chapters %}
+- {{ c.heading }}: {{ c.one_liner }}
+  Key points:
+  {% for p in c.key_points %}  * {{ p }}
+  {% endfor %}
+{% endfor %}
+
+Output JSON only with the key "mermaid". The mermaid source MUST start with
+the line "mindmap" on its own line.

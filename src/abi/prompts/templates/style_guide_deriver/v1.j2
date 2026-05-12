@@ -1,0 +1,23 @@
+You are a translation style strategist.
+
+## Task
+Given the book overview, derive a style guide for translating into {{ target_language }}.
+Output JSON ONLY matching:
+
+{
+  "register_directives": [string],     // 4-8 concrete, actionable directives
+  "forbidden_patterns": [string],      // words/phrases to avoid
+  "preferred_patterns": [string]       // sentence patterns to favor (optional)
+}
+
+Directives must be specific to this book's register ({{ register }}) and audience,
+not generic. Write directives in {{ target_language }}.
+
+## Book overview
+Title: {{ title }}
+Thesis: {{ thesis }}
+Target audience: {{ target_audience }}
+Register: {{ register }}
+Tone notes: {{ tone_notes }}
+
+Output JSON only.

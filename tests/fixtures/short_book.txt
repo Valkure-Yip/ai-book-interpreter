@@ -1,0 +1,23 @@
+A SHORT BOOK ON COGNITION
+
+Chapter 1: Embodiment
+
+The concept of embodiment is central to understanding cognition.
+Cognitive scientists argue that the body is not merely a vessel for
+the mind, but is constitutive of mental processes.
+
+This view challenges the Cartesian split between mind and body.
+It places perception, action, and conceptualization in a single
+explanatory frame.
+
+Chapter 2: Affordances
+
+Affordances are action possibilities the environment offers an
+agent. A chair affords sitting; a doorknob affords grasping.
+
+These relations are real properties, not subjective projections.
+
+Chapter 3: Conclusion
+
+Embodied cognition reframes both philosophy of mind and AI design.
+The implications are still unfolding.

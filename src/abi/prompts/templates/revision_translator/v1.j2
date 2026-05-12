@@ -1,0 +1,38 @@
+You are revising a previous translation that failed validation.
+
+## Previous translation
+{{ previous_translation }}
+
+## Detected problems
+{% for p in problems %}
+- {{ p }}
+{% endfor %}
+
+## Source paragraph (re-translate this)
+paragraph_id: {{ target.id }}
+SOURCE:
+{{ target.source }}
+
+## Locked terms you MUST use exactly
+{% if glossary %}
+| source | target |
+| --- | --- |
+{% for g in glossary %}| {{ g.term }} | {{ g.target }} |
+{% endfor %}
+{% else %}
+(none)
+{% endif %}
+
+## Anchors to preserve verbatim
+{% if anchors %}{{ anchors | join(', ') }}{% else %}(none){% endif %}
+
+## Output schema (same as ParagraphTranslator)
+{
+  "translated_text": string,
+  "terms_used": [...],
+  "confidence": float in [0,1],
+  "notes": string (explain what you fixed),
+  "untranslated_passthrough": false
+}
+
+Output JSON ONLY. Fix every listed problem.

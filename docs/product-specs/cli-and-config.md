@@ -39,7 +39,18 @@ abi translate <input> [-o OUTPUT] [options]
 | `--max-cost-usd` | none | 超额自动暂停（带 checkpoint） |
 | `--dry-run` | false | 仅产出 Pass 1，不翻译 |
 | `--force-rerun` | false | 忽略 checkpoint，从头重跑 |
+| `--chapters` | none | 仅翻译指定的顶层章节，如 `1,3-5`（1-indexed） |
+| `--resume` | none | 从已有 run 续跑；传 `<run_id>` 或 `latest`，复用同一 run dir + 已有 survey/checkpoint |
 | `--ocr` | false | PDF 走 OCR |
+
+### 通过环境变量调优 (v0.1)
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ABI_WINDOW_BEFORE` | `3` | 滑动窗口的"前若干段"数量 |
+| `ABI_WINDOW_AFTER` | `2` | 滑动窗口的"后若干段"数量 |
+| `ABI_BATCH_SIZE` | `1` | 单次 LLM 请求翻译多少段。> 1 时启用批量翻译模板，显著降低请求数。代价：同一批次内的段落彼此看不到对方译文。 |
+| `ABI_CONCURRENCY` | `4` | 章节并行度（等价于 `--concurrency`） |
 
 ### 上下文调参
 

@@ -1,0 +1,82 @@
+[project]
+name = "ai-book-interpreter"
+version = "0.1.0"
+description = "An AI agent that translates academic books with sliding-window context and term locking."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ai-book-interpreter contributors" }]
+
+dependencies = [
+  "pydantic>=2.7,<3",
+  "langchain>=0.3,<0.4",
+  "langchain-openai>=0.2,<0.3",
+  "langchain-core>=0.3,<0.4",
+  "langfuse>=2.50,<3",
+  "typer>=0.12,<1",
+  "rich>=13,<14",
+  "ebooklib>=0.18,<0.19",
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5,<6",
+  "markdown-it-py>=3,<4",
+  "jinja2>=3.1,<4",
+  "chardet>=5,<6",
+  "httpx>=0.27,<0.29",
+  "aiolimiter>=1.1,<2",
+  "pyyaml>=6,<7",
+  "tiktoken>=0.7,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "respx>=0.21",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "types-PyYAML>=6",
+  "types-beautifulsoup4",
+]
+
+[project.scripts]
+abi = "abi.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/abi"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+  "E501",     # line length handled by formatter
+  "RUF001",   # ambiguous unicode in strings (we intentionally use Chinese fullwidth punctuation)
+  "RUF002",   # ambiguous unicode in docstrings
+  "RUF003",   # ambiguous unicode in comments
+  "N818",     # exception names need not end in `Error` (BudgetExceeded reads naturally)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+"src/abi/cli/**" = ["B008"]  # typer's recommended pattern uses function calls in defaults
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --tb=short"
+filterwarnings = [
+  "ignore:Field name .register. in.*shadows an attribute in parent.*:UserWarning",
+]

@@ -1,0 +1,26 @@
+You are an academic editor synthesizing a book-level overview from chapter summaries.
+
+## Task
+Produce a single JSON object with the schema:
+
+{
+  "thesis": string (<= 200 chars in {{ target_language }}; the central argument),
+  "target_audience": string (<= 80 chars),
+  "register": "academic-formal" | "academic-accessible" | "popular-science" | "textbook",
+  "tone_notes": string (<= 200 chars; freeform notes on voice and style)
+}
+
+Output JSON ONLY. No prose, no markdown fences.
+
+## Book
+Title: {{ title }}
+Authors: {{ authors | join(', ') }}
+
+## Chapter Summaries
+{% for c in chapters %}
+### {{ c.heading }}
+{{ c.abstract }}
+Key points:
+{% for p in c.key_points %}- {{ p }}
+{% endfor %}
+{% endfor %}

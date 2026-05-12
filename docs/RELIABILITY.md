@@ -24,8 +24,16 @@
 v0.1 用 LangChain `Runnable.with_retry(...)`：
 - 退避：`wait_exponential_jitter=True`，base=2, max=30
 - 最多次数：默认 3 次；429 单独走 token-bucket 等待，不计入重试计数
-- 超时：单次 60 秒（`ChatOpenAI.request_timeout`）、整体 300 秒（`asyncio.wait_for`）
+- 超时：单次 120 秒（`ChatOpenAI.request_timeout`）、整体 600 秒（`asyncio.wait_for`）
 - 非可重试错误（4xx 中 401/403/404）立即失败，不重试
+
+### 2.1.1 已知失败模式：LengthFinishReasonError
+
+某些 OpenAI 兼容端点（如 DeepSeek-V4-Pro）在 json_mode 下输出 token 占用偏多。当 `max_output_tokens` 设得太小时，会触发 `openai.LengthFinishReasonError`。
+
+v0.1 默认 `max_output_tokens=4096`。该错误目前走"agent 优雅降级"路径——例如 `chapter_summarizer` 失败时给该章一个空 abstract，整体流水线继续。
+
+v0.2 计划：对 `LengthFinishReasonError` 单独识别，重试时自动把 `max_tokens` 提升 2 倍（最多 16k）。
 
 ### 2.2 内容错
 

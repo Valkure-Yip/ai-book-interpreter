@@ -151,26 +151,25 @@ trace (root)         id = run_id
 
 ### 数据安全权衡（关键决策）
 
-默认 **Langfuse 仅接收 metadata + token usage**，**不上传 prompt/completion 全文**。
-理由：学术书内容可能涉版权与隐私。
+由 `observability.langfuse.upload_full_payload` / `LANGFUSE_FULL_PAYLOAD` 单一开关切换：
+
+| 取值 | 行为 | 适用场景 |
+|---|---|---|
+| `true` / `1` | 上传完整 prompt、completion、messages | 开发期 prompt 调试；个人书库；自托管 Langfuse |
+| `false` / `0` | 用 Langfuse `mask` 钩子把字符串内容替换为 `[REDACTED]`，保留消息结构与 token / latency / model 等 metadata | 处理版权书籍；合规环境 |
 
 实现：
-- `providers/observability/langfuse.py` 包装 `CallbackHandler`，在 `on_llm_start` / `on_llm_end` 钩子中**置空** `prompts` / `completions`
-- 用户显式 `LANGFUSE_FULL_PAYLOAD=1` 才上传全文
-- 段落 ID / 章节 ID / book_id 始终上传（这些是哈希或元数据，无版权风险）
+- `providers/observability/langfuse_client.py::build_langfuse_handler` 根据开关，按需把 `_redacting_mask` 作为 `mask=` 注入 `CallbackHandler`。
+- mask 函数递归遍历输入：`str → [REDACTED]`、`list/dict → 递归`、`role`/`type` 等结构 key 保留、原始数字/布尔保留。
+- 段落 ID / 章节 ID / book_id 是 hash，本身无内容信息，由本地 `events.jsonl` 承担——不依赖 Langfuse 是否上传全文。
+- CLI 启动横幅 + run 结尾摘要均显式打印 `payload=full|redacted`，避免"以为开了其实没开"。
+- run 结束 `router.flush()` 阻塞 Langfuse client，避免短任务 trace 丢失。
 
 ### 降级行为
 
-- 缺 Langfuse 凭据 → handler 为 no-op，本地 `events.jsonl` 与 `metrics.json` 仍正常工作
-- Langfuse 不可达 → 默认异步 flush，失败静默
-- 本地事件流是真相源（git 友好、可 grep）；Langfuse 是分析工具
-
-### 不变量
-- 任何把"原书内容 / 译文"塞进 Langfuse metadata 的代码路径需注解：
-  ```python
-  # allow-payload: report.flagged-sample
-  ```
-- lint `tools/lint/langfuse_payload.py` 扫 `metadata=` 调用点，未注解的字符串字段拒绝
+- 缺 Langfuse 凭据 → handler 为 no-op，本地 `events.jsonl` / `metrics.json` 仍正常工作；CLI 显示 `disabled (missing env: ...)`。
+- 凭据无效（`auth_check` 失败）→ 同上，`disabled (auth_check failed)`。
+- Langfuse 不可达 → 异步上传失败静默重试；本地事件流为真相源。
 
 ## 4. 两套观测的分工
 
