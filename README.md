@@ -32,33 +32,83 @@
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — 系统架构总览与分层依赖图
 - [`docs/`](./docs) — 全部设计文档、产品规范、执行计划与质量/可靠性/安全规范
 
-## 快速开始（v0.1 目标）
+## 环境要求
+
+| 依赖 | 版本 | 说明 |
+| --- | --- | --- |
+| Python | **>= 3.11** | 使用 `match` / `Self` 等新语法，低版本不支持 |
+| 包管理器 | `pip` 或 [`uv`](https://docs.astral.sh/uv/) | 推荐 `uv`，解析与安装更快 |
+| LLM 端点 | 任意 OpenAI 兼容 | OpenAI / DeepSeek / Together / Moonshot / 本地 Ollama / vLLM 均可 |
+| 可选：Langfuse | v2.x | 缺凭据时自动 no-op，不影响主流程 |
+
+## 安装
 
 ```bash
-# 配置 LLM 端点（任何 OpenAI 兼容均可）
-export LLM_BASE_URL=https://api.openai.com/v1
-export LLM_API_KEY=sk-...
+git clone https://github.com/<your-org>/ai-book-interpreter.git
+cd ai-book-interpreter
 
-# 可选：开启 Langfuse 追踪（缺凭据时自动跳过，不报错）
-export LANGFUSE_PUBLIC_KEY=pk-...
-export LANGFUSE_SECRET_KEY=sk-...
+# 方式 A：uv（推荐）
+uv venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 
-# 仅译本（EPUB）
-abi translate book.epub -o book.zh.md --target zh --model gpt-4o-mini
+# 方式 B：纯 pip
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 
-# 双语对照（TXT）
-abi translate book.txt -o ./out --mode bilingual --target zh --model gpt-4o-mini
-
-# 用 DeepSeek 兼容端点
-abi translate book.epub --base-url https://api.deepseek.com/v1 --model deepseek-chat
-
-# 仅做 Pass 1（不翻译，只产出摘要与术语表）
-abi survey book.epub -o ./out
+# 验证安装
+abi --help
 ```
+
+> `-e ".[dev]"` 同时安装 `pytest`、`ruff`、`mypy` 等开发依赖；只跑翻译可去掉 `[dev]`。
+
+## 配置
+
+所有运行时配置走环境变量。推荐用 `.env` 文件：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入 LLM_API_KEY；其余按需调整
+```
+
+最少必填的三项：
+
+```bash
+LLM_BASE_URL=https://api.openai.com/v1   # 或 DeepSeek / Ollama / vLLM 等
+LLM_API_KEY=sk-...
+LLM_MODEL=gpt-4o-mini
+```
+
+可选项（Langfuse 追踪、滑动窗口大小、批量大小、并发度、`runs/` 目录位置等）的完整说明见 [`.env.example`](./.env.example) 与 [`docs/product-specs/cli-and-config.md`](./docs/product-specs/cli-and-config.md)。
+
+## 启动引导
 
 v0.1 支持的输入：**EPUB / TXT**（PDF 路线见 v0.2）。
 
-详见 [`docs/product-specs/cli-and-config.md`](./docs/product-specs/cli-and-config.md)。
+```bash
+# 1) 冒烟测试：用仓库内的样本短文走一遍流水线
+abi translate tests/fixtures/short_book.txt -o ./out/smoke --target zh
+
+# 2) 仅译本（EPUB → 单个 Markdown 文件）
+abi translate book.epub -o book.zh.md --target zh --model gpt-4o-mini
+
+# 3) 双语对照（TXT → 输出目录）
+abi translate book.txt -o ./out --mode bilingual --target zh
+
+# 4) 切换到 DeepSeek 兼容端点（覆盖 .env 中的默认）
+abi translate book.epub --base-url https://api.deepseek.com/v1 --model deepseek-chat
+
+# 5) 仅做 Pass 1：产出章节摘要 + 术语表，不翻译
+abi survey book.epub -o ./out
+
+# 6) 崩溃 / 中断后续跑（段落级 checkpoint，幂等）
+abi translate book.epub -o ./out --resume latest
+```
+
+运行产物默认落到 `./runs/<book_id>/<run_id>/`，包含 `events.jsonl`、段落级 checkpoint 与 Langfuse trace 链接；最终 Markdown 写到 `-o` 指定的位置。
+
+CLI 完整参数表见 [`docs/product-specs/cli-and-config.md`](./docs/product-specs/cli-and-config.md)。
 
 ## 工程理念（摘要）
 

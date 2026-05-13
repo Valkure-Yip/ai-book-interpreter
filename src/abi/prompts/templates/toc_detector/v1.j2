@@ -1,0 +1,70 @@
+You are reconstructing the chapter / section structure of a book.
+
+Below is a list of CANDIDATE heading paragraphs from the book, in document
+order. Each candidate is a short text segment that **might** be a chapter or
+section title. For each, you also see a preview of the paragraph that
+immediately follows it, to help you judge.
+
+## Your task
+Identify which candidates are **real** chapter or section titles, and discard
+false positives such as:
+- ordinary sentences
+- page numbers / running headers
+- footnote references like "[12]"
+- license / copyright boilerplate (e.g. Project Gutenberg headers, "START OF THE",
+  "END OF THE PROJECT GUTENBERG EBOOK", "PLEASE READ THIS BEFORE YOU DISTRIBUTE")
+- author bio, dedication, epigraph (UNLESS they have a real heading)
+- entries inside an Index, Glossary, or Table-of-Contents listing
+- the **word "Contents" / "Table of Contents" itself** when it heads such a
+  listing (the listing duplicates the chapter structure and should NOT be a
+  chapter of its own)
+- short legal / metadata lines like "Title:", "Author:", "Release date:",
+  "Language:", "Credits:"
+
+## Output schema
+Return strict JSON only — no prose, no markdown fences:
+
+{
+  "chapters": [
+    {"anchor_id": "<echoed from input>",
+     "title": "<cleaned-up title text in {{ source_language }}>",
+     "level": <1 | 2 | 3>},
+    ...
+  ]
+}
+
+## Rules
+- Preserve document order. Do NOT reorder.
+- `level`: use **level 1 for the top-level chapters of this book** (whatever
+  the author called them — "Chapter N", "I.", "Part II", "第三章", or just a
+  numbered title). Only use level 2/3 for **sub-sections nested inside** a
+  top-level chapter (e.g. "1.1 Background" under "1 Introduction", or
+  "A. Petty-bourgeois Socialism" under "III. Socialist Literature"). When
+  unsure, prefer level 1 — over-flattening is recoverable; over-nesting hides
+  chapters under wrappers.
+- `title`: clean up the candidate text:
+    * combine two-line markers like "I." + "BOURGEOIS AND PROLETARIANS" into
+      "I. Bourgeois and Proletarians";
+    * normalize aggressive ALL-CAPS to title case unless the all-caps form is
+      stylistic (e.g. "WAR" in a one-word title);
+    * strip trailing page numbers, running heads, or stray punctuation.
+- The cleaned `title` MUST stay in the source language ({{ source_language }});
+  do NOT translate.
+- Skip non-content sections (Index, Acknowledgments only if trivial, Copyright,
+  Project Gutenberg boilerplate, etc.).
+- If a candidate's `next_preview` shows it's actually a sentence continuation
+  (the preview text would not logically follow a chapter break), drop it.
+- If unsure, prefer INCLUDING the candidate at level 2 — better to
+  over-segment than to lose chapter boundaries.
+
+## Book context
+Title: {{ book_title }}
+Source language: {{ source_language }}
+Heuristic ingestion already produced {{ heuristic_chapter_count }} top-level
+section(s); your output is allowed to differ.
+
+## Candidates ({{ candidates | length }} total)
+{% for c in candidates %}
+[{{ c.anchor_id }}] kind={{ c.kind }} text={{ c.text | tojson }}
+  next: {{ c.next_preview | tojson }}
+{% endfor %}

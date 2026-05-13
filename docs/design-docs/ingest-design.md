@@ -1,4 +1,4 @@
-# Ingest Design (Pass 0)
+# Ingest Design (Pass 0 + Pass 0.5)
 
 > txt / epub / pdf 三种输入到统一 `Book` IR 的解析策略。
 
@@ -6,8 +6,29 @@
 
 ```
 file → detect_format() → parse_to_blocks() → classify_blocks()
-     → group_into_sections() → assign_ids() → validate() → Book
+     → group_into_sections() → assign_ids() → validate() → Book (heuristic)
+     → [Pass 0.5] LLM toc_refiner → Book (LLM-corrected)
 ```
+
+Pass 0 仍按下述启发式规则切章并赋稳定 ID；得到 `Book` 之后，**Pass 0.5** 会让一次 LLM 调用扫描候选标题、给出修正后的 TOC，并用相同的 paragraph 流重建 `book.toc`。
+段落 ID 是内容哈希，重建过程中保持不变；section ID 因 `heading_trail` 变化而变化（设计如此）。
+
+下游所有阶段（survey/translate/assemble）看到的都是 LLM 修正后的 `book.toc`。
+
+## Pass 0.5: LLM TOC refinement
+
+| 字段 | 说明 |
+| --- | --- |
+| 触发条件 | `RunConfig.refine_toc=True`（默认），且非 `--resume` 续跑 |
+| 候选构造 | 把 heuristic 产出的所有 heading 与短而无终结符的 prose 段落作为候选（≤250 条） |
+| LLM 输出 | `{chapters: [{anchor_id, title, level}]}` —— 标题保留源语言，仅做轻量清洗 |
+| 失败兜底 | LLM 报错 / 输出空 / anchor 全部不合法 → 返回原 Book，metadata.method="heuristic_fallback" |
+| 产物 | `runs/<book>/<run>/ir/toc-refinement.json`（候选数、检测数、调用方法） |
+| 持久化 | LLM-corrected `Book` 写到 `runs/<book>/<run>/ir/book.json`；`--resume` 时直接复用 |
+
+事件：`toc.refinement.start` / `toc.refinement.applied` / `toc.refinement.failed` / `toc.refinement.skipped`。
+
+`--no-refine-toc` 或 `ABI_TOC_REFINE=0` 关闭整个 Pass 0.5（适合离线测试 / 已确认 heuristic 结果正确的批量任务）。
 
 ## TXT
 

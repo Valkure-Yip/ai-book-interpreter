@@ -20,6 +20,7 @@ DEFAULT_VERSIONS: dict[str, str] = {
     "mindmap_drawer": "v1",
     "heading_translator": "v1",
     "paragraph_batch_translator": "v1",
+    "toc_detector": "v1",
 }
 
 

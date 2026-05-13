@@ -69,6 +69,8 @@ def _env_overrides() -> dict[str, Any]:
         out["batch_size"] = n
     if (n := _env_int("ABI_CONCURRENCY")) is not None and n >= 1:
         out["concurrency"] = n
+    if (flag := os.environ.get("ABI_TOC_REFINE")) is not None and flag != "":
+        out["refine_toc"] = flag not in {"0", "false", "False", "no", "off"}
     return out
 
 

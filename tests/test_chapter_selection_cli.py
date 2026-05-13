@@ -83,14 +83,41 @@ class TestFilterBookByChapters:
         book = _book(["A", "B", "C", "D"])
         out, warnings = filter_book_by_chapters(book, {1, 3})
         assert [s.heading for s in out.toc] == ["A", "C"]
-        assert any(w.startswith("chapter_selection_applied:kept_2_of_4") for w in warnings)
+        assert any(
+            w.startswith("chapter_selection_applied:kept_2_of_4_chapters")
+            for w in warnings
+        )
         assert any(w.startswith("chapter_selection_dropped:") for w in warnings)
+
+    def test_synthetic_front_matter_is_skipped_in_indexing(self) -> None:
+        """``--chapters 1`` must pick the FIRST real chapter, not "Front Matter".
+
+        Regression test for the Manifesto bug where the LLM-refined toc looked
+        like ``[Front Matter, I. Bourgeois, II. ..., III. ..., IV. ...]`` and
+        a user typing ``--chapters 1`` got the unnamed preamble.
+        """
+        book = _book(["Front Matter", "I. Bourgeois", "II. Proletarians"])
+        out, warnings = filter_book_by_chapters(book, {1})
+        # toc[1] (I. Bourgeois) is selected, Front Matter is dropped entirely.
+        assert [s.heading for s in out.toc] == ["I. Bourgeois"]
+        assert any("kept_1_of_2_chapters" in w for w in warnings)
+        assert any("Front Matter" in w for w in warnings if "dropped" in w)
+
+    def test_front_matter_is_not_indexable_at_high_indices_either(self) -> None:
+        book = _book(["Front Matter", "I", "II", "III"])
+        out, _ = filter_book_by_chapters(book, {3})
+        # Real-chapter index 3 = "III" (Front Matter doesn't count).
+        assert [s.heading for s in out.toc] == ["III"]
 
     def test_out_of_range_indices_are_warned(self) -> None:
         book = _book(["A", "B"])
         out, warnings = filter_book_by_chapters(book, {1, 99})
         assert [s.heading for s in out.toc] == ["A"]
         assert any("out_of_range" in w for w in warnings)
+        # The OOR diagnostic should reference the count of REAL chapters,
+        # not the raw toc length (so users see "book_has_2_chapters" even if
+        # toc happens to include a Front Matter wrapper).
+        assert any("book_has_2_chapters" in w for w in warnings)
 
     def test_all_invalid_keeps_full_toc(self) -> None:
         book = _book(["A", "B"])

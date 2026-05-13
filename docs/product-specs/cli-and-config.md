@@ -41,6 +41,7 @@ abi translate <input> [-o OUTPUT] [options]
 | `--force-rerun` | false | 忽略 checkpoint，从头重跑 |
 | `--chapters` | none | 仅翻译指定的顶层章节，如 `1,3-5`（1-indexed） |
 | `--resume` | none | 从已有 run 续跑；传 `<run_id>` 或 `latest`，复用同一 run dir + 已有 survey/checkpoint |
+| `--no-refine-toc` | false | 跳过 ingest 与 survey 之间的 LLM 目录重建步骤；保留 heuristic 切章结果，少一次 LLM 调用 |
 | `--ocr` | false | PDF 走 OCR |
 
 ### 通过环境变量调优 (v0.1)
@@ -51,6 +52,7 @@ abi translate <input> [-o OUTPUT] [options]
 | `ABI_WINDOW_AFTER` | `2` | 滑动窗口的"后若干段"数量 |
 | `ABI_BATCH_SIZE` | `1` | 单次 LLM 请求翻译多少段。> 1 时启用批量翻译模板，显著降低请求数。代价：同一批次内的段落彼此看不到对方译文。 |
 | `ABI_CONCURRENCY` | `4` | 章节并行度（等价于 `--concurrency`） |
+| `ABI_TOC_REFINE` | `1` | 是否启用 ingest 后的 LLM 目录重建（pass 0.5）。`0` 跳过。CLI `--no-refine-toc` 等价。失败/超时会安全降级回 heuristic 切章。 |
 
 ### 上下文调参
 
@@ -104,6 +106,9 @@ defaults:
   mode: [translated, annotated]
   quality: standard
   concurrency: 4
+
+# LLM-driven目录/章节识别（pass 0.5）。默认 true；失败时安全降级，仅一次额外 LLM 调用。
+refine_toc: true
 
 window:
   before: 3

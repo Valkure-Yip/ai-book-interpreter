@@ -63,6 +63,13 @@ class RunConfig(FrozenModel):
     max_retries: int = 3
     dry_run: bool = False
     force_rerun: bool = False
+    # When True (default), run the LLM-based TOC refiner between Pass 0 (ingest)
+    # and Pass 1 (survey). The refiner asks the model to identify the book's
+    # real chapter/section structure, replacing the heuristic ingest output.
+    # Disable with ``--no-refine-toc`` / ``ABI_TOC_REFINE=0`` for offline tests
+    # or to save one LLM call when the heuristic structure is already correct.
+    refine_toc: bool = True
+    # (refine_toc declared above near force_rerun)
     # Pass 2 paragraphs-per-LLM-call. 1 = one paragraph per request (legacy);
     # >1 = pack K consecutive paragraphs into one prompt and parse a JSON array
     # of K translations. Larger values reduce wall time but lose intra-batch

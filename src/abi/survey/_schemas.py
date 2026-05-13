@@ -51,3 +51,22 @@ class HeadingTranslationItem(BaseModel):
 
 class HeadingTranslationsOutput(BaseModel):
     items: list[HeadingTranslationItem] = Field(default_factory=list)
+
+
+class TocDetectorItem(BaseModel):
+    """One detected chapter in the TOC-refinement response."""
+
+    anchor_id: str
+    title: str
+    level: int = 2
+
+
+class TocDetectorOutput(BaseModel):
+    """LLM-reconstructed chapter structure.
+
+    Each item points at one candidate (by ``anchor_id`` echoed from the prompt)
+    that the model claims is a real chapter/section heading, with a cleaned
+    title and a level (1=part, 2=chapter, 3=sub-section).
+    """
+
+    chapters: list[TocDetectorItem] = Field(default_factory=list)

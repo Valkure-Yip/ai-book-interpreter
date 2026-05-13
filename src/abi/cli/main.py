@@ -36,6 +36,7 @@ def _build_overrides(
     concurrency: int | None,
     dry_run: bool,
     force_rerun: bool,
+    refine_toc: bool | None = None,
 ) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
     if target:
@@ -55,6 +56,8 @@ def _build_overrides(
         overrides["dry_run"] = True
     if force_rerun:
         overrides["force_rerun"] = True
+    if refine_toc is not None:
+        overrides["refine_toc"] = refine_toc
     return overrides
 
 
@@ -83,6 +86,12 @@ def translate(
     concurrency: int | None = typer.Option(None, "--concurrency"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run only survey pass."),
     force_rerun: bool = typer.Option(False, "--force-rerun", help="Ignore checkpoints."),
+    no_refine_toc: bool = typer.Option(
+        False,
+        "--no-refine-toc",
+        help="Skip the LLM-based TOC refiner before survey. By default the "
+        "refiner runs once per book and rewrites chapter boundaries.",
+    ),
     title: str | None = typer.Option(None, "--title", help="Override detected title."),
     chapters: str | None = typer.Option(
         None,
@@ -123,6 +132,7 @@ def translate(
         concurrency=concurrency,
         dry_run=dry_run,
         force_rerun=force_rerun,
+        refine_toc=False if no_refine_toc else None,
     )
     config = build_run_config(
         user_config_path=default_user_config_path(),
@@ -229,6 +239,14 @@ def _print_result(result: Any) -> None:
     console.print(f"  paragraphs:     {result.units_translated}")
     console.print(f"  flagged:        {result.flagged_count}")
     console.print(f"  estimated cost: ${result.cost_usd:.4f}")
+    if (r := getattr(result, "toc_refinement", None)) is not None:
+        if r.method == "llm":
+            console.print(
+                f"  toc refine:     {r.top_level_before} → {r.top_level_after} "
+                f"top-level chapters (from {r.candidates} candidates)"
+            )
+        elif r.reason:
+            console.print(f"  toc refine:     fallback ({r.reason})")
     if result.assemble:
         for mode, path in result.assemble.output_paths.items():
             console.print(f"  [{mode}]: {path}")

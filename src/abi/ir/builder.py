@@ -39,6 +39,11 @@ _NON_CONTENT_TOP_LEVEL_HEADINGS: frozenset[str] = frozenset(
 
 
 def _is_non_content_heading(heading: str) -> bool:
+    return is_non_content_heading(heading)
+
+
+def is_non_content_heading(heading: str) -> bool:
+    """Public alias used by :mod:`abi.survey.toc_refiner` for post-LLM filtering."""
     return re.sub(r"\s+", " ", heading.strip().lower()) in _NON_CONTENT_TOP_LEVEL_HEADINGS
 
 

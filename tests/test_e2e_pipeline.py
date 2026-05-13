@@ -86,6 +86,22 @@ def _handle_request(request: httpx.Request) -> httpx.Response:
                 for sid in ids
             ]
         }
+    elif "reconstructing the chapter / section structure" in text:
+        # toc_detector: pick every "heading" kind candidate. This keeps the
+        # heuristic structure intact while still exercising the LLM path.
+        import re
+
+        # Each candidate line looks like:
+        # [C0001] kind=heading text="Chapter X"
+        #   next: "..."
+        cands = re.findall(
+            r"\[([A-Z0-9]+)\] kind=(\w+) text=\"([^\"]+)\"", text
+        )
+        items = []
+        for anchor, kind, title in cands:
+            if kind == "heading":
+                items.append({"anchor_id": anchor, "title": title, "level": 2})
+        payload = {"chapters": items}
     elif "Translate this paragraph" in text or "professional academic translator" in text:
         # paragraph translator
         payload = {
@@ -172,6 +188,152 @@ def test_full_pipeline_end_to_end(tmp_path: Path, monkeypatch) -> None:
     report = (out / "report.md").read_text(encoding="utf-8")
     assert "翻译报告" in report
     assert "Confidence" in report
+
+
+@respx.mock
+def test_toc_refiner_repairs_misclassified_chapters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A file where heuristic ingest dumps everything into "Front Matter" should
+    be repaired by the refiner: top-level chapters appear in the final TOC.
+    """
+    import re
+
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("ABI_RUNS_DIR", str(tmp_path / "runs"))
+
+    # Build a minimal "Manifesto-shaped" fixture: Roman-numeral two-line
+    # chapter headings. The heuristic parser joins each pair into a single
+    # prose paragraph instead of recognizing them as headings, putting all
+    # content into a synthetic "Front Matter" wrapper.
+    fixture = tmp_path / "manifesto_like.txt"
+    fixture.write_text(
+        "Preamble paragraph about the manifesto.\n"
+        "\n"
+        "I.\n"
+        "BOURGEOIS AND PROLETARIANS\n"
+        "\n"
+        "The history of all hitherto existing societies is the history "
+        "of class struggles.\n"
+        "\n"
+        "Freeman and slave, patrician and plebeian, lord and serf.\n"
+        "\n"
+        "II.\n"
+        "PROLETARIANS AND COMMUNISTS\n"
+        "\n"
+        "In what relation do the Communists stand to the proletarians?\n"
+        "\n"
+        "The Communists do not form a separate party opposed to other "
+        "working-class parties.\n",
+        encoding="utf-8",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        text = "\n".join(m.get("content", "") for m in body.get("messages", []))
+
+        if "reconstructing the chapter / section structure" in text:
+            # Pick the two Roman-numeral paragraph anchors.
+            cands = re.findall(
+                r"\[([A-Z0-9]+)\] kind=(\w+) text=\"([^\"]+)\"", text
+            )
+            items = []
+            for anchor, _kind, t in cands:
+                if t.startswith("I.") and "BOURGEOIS" in t:
+                    items.append(
+                        {"anchor_id": anchor, "title": "I. Bourgeois and Proletarians", "level": 1}
+                    )
+                elif t.startswith("II.") and "PROLETARIANS" in t:
+                    items.append(
+                        {"anchor_id": anchor, "title": "II. Proletarians and Communists", "level": 1}
+                    )
+            return httpx.Response(
+                200,
+                json=_fake_completion(json.dumps({"chapters": items}, ensure_ascii=False)),
+            )
+
+        # Reuse the shared dispatcher for everything else (survey, translation,
+        # heading_translator, etc.).
+        return _handle_request(request)
+
+    respx.post("https://mock.local/v1/chat/completions").mock(side_effect=_handler)
+
+    config = RunConfig(
+        target_language="zh",
+        modes=["translated"],
+        llm=LLMConfig(
+            base_url="https://mock.local/v1",
+            model="test-model",
+            max_concurrency=2,
+        ),
+        langfuse=LangfuseConfig(enabled=False),
+    )
+
+    out = tmp_path / "out"
+    result = asyncio.run(run_pipeline(input_path=fixture, config=config, output_dir=out))
+
+    # The refined book.json on disk must reflect the LLM's TOC, not the
+    # heuristic "Front Matter" wrapper.
+    from abi.types.book import Book
+
+    refined = Book.model_validate_json(
+        (result.run_dir / "ir" / "book.json").read_text(encoding="utf-8")
+    )
+    headings = [s.heading for s in refined.toc]
+    assert "I. Bourgeois and Proletarians" in headings
+    assert "II. Proletarians and Communists" in headings
+
+    # Metadata artifact records that the refiner ran via LLM.
+    refinement_path = result.run_dir / "ir" / "toc-refinement.json"
+    assert refinement_path.exists()
+    meta = json.loads(refinement_path.read_text(encoding="utf-8"))
+    assert meta["method"] == "llm"
+    assert meta["detected"] == 2
+
+
+@respx.mock
+def test_no_refine_toc_skips_refiner(tmp_path: Path, monkeypatch) -> None:
+    """``refine_toc=False`` must skip the LLM call and keep heuristic TOC."""
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    monkeypatch.setenv("ABI_RUNS_DIR", str(tmp_path / "runs"))
+    route = respx.post("https://mock.local/v1/chat/completions").mock(
+        side_effect=_handle_request
+    )
+
+    config = RunConfig(
+        target_language="zh",
+        modes=["translated"],
+        refine_toc=False,
+        llm=LLMConfig(
+            base_url="https://mock.local/v1",
+            model="test-model",
+            max_concurrency=2,
+        ),
+        langfuse=LangfuseConfig(enabled=False),
+    )
+
+    result = asyncio.run(
+        run_pipeline(input_path=FIXTURE, config=config, output_dir=tmp_path / "out")
+    )
+
+    # No toc_detector LLM call should have been issued.
+    for call in route.calls:
+        body = json.loads(call.request.content)
+        msgs = "\n".join(m.get("content", "") for m in body.get("messages", []))
+        assert "reconstructing the chapter / section structure" not in msgs, (
+            "toc_detector must not be invoked when refine_toc=False"
+        )
+
+    # And the toc-refinement.json artifact must NOT be written.
+    assert not (result.run_dir / "ir" / "toc-refinement.json").exists()
+
+    # The events log records the explicit skip reason.
+    events_text = (result.run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert "disabled_by_config" in events_text
 
 
 @respx.mock

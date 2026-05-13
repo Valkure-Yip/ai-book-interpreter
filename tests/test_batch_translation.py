@@ -77,6 +77,18 @@ def _handle_request(request: httpx.Request) -> httpx.Response:
                 {"section_id": sid, "translated": f"译-{sid[:6]}"} for sid in ids
             ]
         }
+    elif "reconstructing the chapter / section structure" in text:
+        # Echo back the heading-kind candidates so refinement is a no-op rewrite.
+        cands = re.findall(
+            r"\[([A-Z0-9]+)\] kind=(\w+) text=\"([^\"]+)\"", text
+        )
+        payload = {
+            "chapters": [
+                {"anchor_id": a, "title": t, "level": 2}
+                for a, k, t in cands
+                if k == "heading"
+            ]
+        }
     elif "Paragraphs to translate (THIS BATCH)" in text:
         # Batch path: extract paragraph_ids and answer each.
         ids = re.findall(r"paragraph_id: ([0-9a-f-]+)", text)

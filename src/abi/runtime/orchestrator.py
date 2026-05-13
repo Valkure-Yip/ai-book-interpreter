@@ -22,7 +22,9 @@ from abi.runtime.manifest import (
 )
 from abi.runtime.selection import filter_book_by_chapters
 from abi.survey import SurveyResult, run_survey
+from abi.survey.toc_refiner import TocRefinement, refine_book_toc
 from abi.translate import run_translation
+from abi.types.book import Book
 from abi.types.glossary import Glossary
 from abi.types.run import RunConfig
 
@@ -38,6 +40,7 @@ class OrchestrationResult:
     flagged_count: int
     cost_usd: float
     langfuse_status: LangfuseStatus | None = None
+    toc_refinement: TocRefinement | None = None
 
 
 async def run_pipeline(
@@ -55,11 +58,8 @@ async def run_pipeline(
     if warnings:
         _log.warning("ingest warnings: %s", warnings)
 
-    if chapter_selection:
-        book, sel_warnings = filter_book_by_chapters(book, chapter_selection)
-        warnings.extend(sel_warnings)
-        for w in sel_warnings:
-            _log.info("selection: %s", w)
+    # NOTE: chapter_selection is applied AFTER TOC refinement so that "chapter 1"
+    # refers to the model-corrected structure, not the heuristic ingest output.
 
     resumed = False
     if resume:
@@ -85,10 +85,19 @@ async def run_pipeline(
 
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "ir").mkdir(exist_ok=True)
-    # Don't overwrite the pristine ir/book.json on resume — keeps audit trail.
     book_json = run_dir / "ir" / "book.json"
-    if not resumed or not book_json.exists():
-        book_json.write_text(book.model_dump_json(indent=2), encoding="utf-8")
+
+    # On resume, the persisted book.json IS the source of truth — it captured
+    # the post-refinement TOC from the prior invocation. Reload it so we don't
+    # re-run the refiner and so downstream agents see the same section_ids.
+    toc_already_refined = False
+    if resumed and book_json.exists():
+        try:
+            book = Book.model_validate_json(book_json.read_text(encoding="utf-8"))
+            toc_already_refined = True
+            _log.info("loaded persisted refined book from %s", book_json)
+        except Exception as exc:
+            _log.warning("could not reload persisted book (%s); re-ingesting", exc)
 
     events = EventLogger(run_dir / "events.jsonl", run_id=run_id)
     metrics = MetricsAggregator(run_dir / "metrics.json", run_id=run_id,
@@ -112,7 +121,31 @@ async def run_pipeline(
     units: dict[str, Any] = {}
     assemble_result: AssembleResult | None = None
     cost = 0.0
+    toc_refinement: TocRefinement | None = None
     try:
+        # Pass 0.5: LLM-driven TOC refinement (runs once per book). Skipped on
+        # resume because the persisted book.json already has the refined TOC.
+        if config.refine_toc and not toc_already_refined:
+            book, toc_refinement = await refine_book_toc(
+                book=book, router=router, events=events
+            )
+        elif not config.refine_toc:
+            events.event("toc.refinement.skipped", reason="disabled_by_config")
+
+        # Now that the TOC is final, apply --chapters selection and persist.
+        if chapter_selection:
+            book, sel_warnings = filter_book_by_chapters(book, chapter_selection)
+            warnings.extend(sel_warnings)
+            for w in sel_warnings:
+                _log.info("selection: %s", w)
+
+        if not resumed or not book_json.exists():
+            book_json.write_text(book.model_dump_json(indent=2), encoding="utf-8")
+        if toc_refinement is not None:
+            (run_dir / "ir" / "toc-refinement.json").write_text(
+                _toc_refinement_to_json(toc_refinement), encoding="utf-8"
+            )
+
         survey_result = await run_survey(
             book=book, config=config, router=router, events=events, out_dir=run_dir
         )
@@ -177,4 +210,22 @@ async def run_pipeline(
         flagged_count=flagged_count,
         cost_usd=cost,
         langfuse_status=router.langfuse_status,
+        toc_refinement=toc_refinement,
+    )
+
+
+def _toc_refinement_to_json(r: TocRefinement) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "method": r.method,
+            "candidates": r.candidates,
+            "detected": r.detected,
+            "top_level_before": r.top_level_before,
+            "top_level_after": r.top_level_after,
+            "reason": r.reason,
+        },
+        ensure_ascii=False,
+        indent=2,
     )
