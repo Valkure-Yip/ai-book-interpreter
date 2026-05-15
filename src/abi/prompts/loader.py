@@ -21,6 +21,9 @@ DEFAULT_VERSIONS: dict[str, str] = {
     "heading_translator": "v1",
     "paragraph_batch_translator": "v1",
     "toc_detector": "v1",
+    "baseline_translator": "v1",
+    "eval_judge_likert": "v1",
+    "eval_judge_pairwise": "v1",
 }
 
 

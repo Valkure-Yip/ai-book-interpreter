@@ -211,6 +211,130 @@ def survey(
     _print_result(result)
 
 
+@app.command("eval")
+def eval_cmd(
+    input_path: Path = typer.Argument(
+        ..., exists=True, help="Input file (same file you previously translated)."
+    ),
+    output: Path | None = typer.Option(None, "-o", "--output", help="Eval output dir."),
+    abi_run: str | None = typer.Option(
+        None,
+        "--abi-run",
+        help='ABI run_id to evaluate (default: latest run for this book).',
+    ),
+    samples: int = typer.Option(30, "--samples", help="Number of paragraphs to judge."),
+    judge_model: str | None = typer.Option(
+        None,
+        "--judge-model",
+        help="Override LLM_MODEL for the judge (defaults to same model as translation).",
+    ),
+    judge_base_url: str | None = typer.Option(
+        None,
+        "--judge-base-url",
+        help="Override LLM_BASE_URL for the judge (use a separate provider).",
+    ),
+    baseline_chunk_tokens: int = typer.Option(
+        50_000,
+        "--baseline-chunk-tokens",
+        help="Per-chunk token budget for the baseline single-prompt translator.",
+    ),
+    skip_baseline: bool = typer.Option(
+        False,
+        "--skip-baseline",
+        help="Reuse a previously generated baseline if present.",
+    ),
+    max_cost_usd: float | None = typer.Option(None, "--max-cost-usd"),
+    seed: int = typer.Option(1729, "--seed", help="RNG seed for sampling + A/B label flips."),
+    base_url: str | None = typer.Option(None, "--base-url"),
+    model: str | None = typer.Option(None, "--model"),
+    config_file: Path | None = typer.Option(None, "--config"),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Evaluate ABI translation quality vs a naive single-prompt baseline."""
+    from abi.eval import run_eval
+    from abi.types.eval import EvalConfig
+
+    _setup_logging(verbose)
+    overrides = _build_overrides(
+        target=None,
+        modes=None,
+        base_url=base_url,
+        model=model,
+        max_cost_usd=max_cost_usd,
+        concurrency=None,
+        dry_run=False,
+        force_rerun=False,
+    )
+    config = build_run_config(
+        user_config_path=default_user_config_path(),
+        project_config_path=config_file or default_project_config_path(),
+        cli_overrides=overrides,
+    )
+    eval_config = EvalConfig(
+        samples=samples,
+        judge_model=judge_model,
+        judge_base_url=judge_base_url,
+        baseline_chunk_tokens=baseline_chunk_tokens,
+        skip_baseline=skip_baseline,
+        random_seed=seed,
+    )
+
+    console.print(f"[bold]Evaluating[/] [cyan]{input_path}[/]")
+    console.print(f"  endpoint:    {config.llm.base_url}")
+    console.print(f"  model:       {config.llm.model}")
+    console.print(
+        f"  judge:       {eval_config.judge_model or config.llm.model}"
+    )
+    console.print(f"  samples:     {samples}")
+    console.print(f"  skip base:   {skip_baseline}")
+
+    artifacts = asyncio.run(
+        run_eval(
+            source_path=input_path,
+            config=config,
+            eval_config=eval_config,
+            abi_run_id=abi_run,
+            output_dir=output,
+        )
+    )
+    _print_eval_result(artifacts)
+
+
+def _print_eval_result(artifacts: Any) -> None:
+    r = artifacts.report
+    console.print()
+    console.print("[bold green]✓ Eval done[/]")
+    console.print(f"  eval dir:    {artifacts.eval_dir}")
+    console.print(f"  abi run:     {r.abi_run_id}")
+    console.print(f"  alignment:   {r.alignment.strategy} "
+                  f"({r.alignment.aligned_pairs}/{r.alignment.source_paragraphs} pairs)")
+    console.print(f"  baseline:    {r.baseline.chunks} chunk(s), "
+                  f"${r.baseline.cost_usd:.4f}, {r.baseline.latency_ms / 1000:.1f}s")
+    m = r.mechanical
+    console.print(
+        f"  glossary:    abi={m.abi.glossary_compliance:.2f} "
+        f"baseline={m.baseline.glossary_compliance:.2f} "
+        f"Δ={m.abi.glossary_compliance - m.baseline.glossary_compliance:+.2f}"
+    )
+    console.print(
+        f"  completeness: abi={m.abi.completeness:.2f} "
+        f"baseline={m.baseline.completeness:.2f}"
+    )
+    j = r.judge
+    if j.samples:
+        console.print(
+            f"  likert mean: abi={j.likert_abi.get('mean', 0):.2f} "
+            f"baseline={j.likert_baseline.get('mean', 0):.2f} "
+            f"Δ={j.likert_delta.get('mean', 0):+.2f}"
+        )
+        console.print(
+            f"  pairwise:    abi {j.pairwise_abi_wins} wins / "
+            f"{j.pairwise_baseline_wins} losses / {j.pairwise_ties} ties "
+            f"(winrate {j.pairwise_abi_winrate:.1%})"
+        )
+    console.print(f"  report:      {artifacts.eval_dir / 'report.md'}")
+
+
 @app.command("runs")
 def runs_list(book_id: str | None = typer.Argument(None)) -> None:
     """List runs, optionally for a specific book_id."""

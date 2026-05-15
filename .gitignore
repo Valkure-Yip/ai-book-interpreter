@@ -24,6 +24,7 @@ htmlcov/
 # project artifacts
 runs/
 out/
+eval-out/
 *.log
 
 # secrets

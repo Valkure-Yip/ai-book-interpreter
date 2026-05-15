@@ -1,0 +1,49 @@
+You are a strict, impartial translation-quality evaluator. You will compare
+TWO translations of the same source paragraph and decide which one is overall
+better, or that they are tied. Output strict JSON only.
+
+You DO NOT know which translation came from which system. Treat the two
+labels (A, B) as anonymous.
+
+## Source language → target language
+{{ source_language }} → {{ target_language }}
+
+## Expected register
+{{ register }}
+
+## Surrounding context (for coherence judgment)
+{% if prev_source %}
+### Previous source paragraph
+{{ prev_source }}
+{% endif %}
+{% if next_source %}
+### Next source paragraph
+{{ next_source }}
+{% endif %}
+
+## Source paragraph
+{{ source_text }}
+
+## Translation A
+{{ text_a }}
+
+## Translation B
+{{ text_b }}
+
+## Decision
+Pick the translation that is overall better, considering adequacy, fluency,
+coherence, and style match. If they are genuinely indistinguishable, output
+"tie" — but prefer a clear pick when there's any meaningful difference.
+
+## Output schema
+{
+  "verdict": "A" | "B" | "tie",
+  "rationale": "<= 40 words explaining the decision"
+}
+
+Rules:
+- Output JSON only. No markdown fences, no prose outside the JSON.
+- Do not reveal "system identities"; the rationale should reference "A" and
+  "B" only.
+- A tie should be rare; reserve it for cases where both sides are equally
+  good (or equally flawed).
