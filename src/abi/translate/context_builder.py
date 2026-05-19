@@ -123,18 +123,45 @@ def build_context(
     positions = sorted(by_position)
     idx_in_order = positions.index(target.position) if target.position in by_position else -1
 
-    prev_paragraphs: list[Paragraph] = []
-    for off in range(1, window_config.before + 1):
-        if idx_in_order - off < 0:
-            break
-        prev_paragraphs.append(by_position[positions[idx_in_order - off]])
-    prev_paragraphs.reverse()  # earliest first
+    # If the target's chapter is short enough, override the sliding window
+    # with the FULL chapter (prev = everything before target, next = everything
+    # after target) so each paragraph sees the same global context that a naive
+    # single-prompt baseline would have. This eliminates ABI's structural
+    # disadvantage on short documents (news commentary, essays, short stories)
+    # without affecting full-length book translation behavior.
+    section_for_target = _find_section_for(book, target.section_id)
+    chapter_paragraphs_full = (
+        section_for_target.paragraphs if section_for_target else []
+    )
+    use_full_chapter = (
+        window_config.short_chapter_threshold > 0
+        and 0 < len(chapter_paragraphs_full) <= window_config.short_chapter_threshold
+    )
 
+    trimmed_reasons: list[str] = []
+    prev_paragraphs: list[Paragraph] = []
     next_paragraphs: list[Paragraph] = []
-    for off in range(1, window_config.after + 1):
-        if idx_in_order + off >= len(positions):
-            break
-        next_paragraphs.append(by_position[positions[idx_in_order + off]])
+    if use_full_chapter:
+        try:
+            i_in_chapter = chapter_paragraphs_full.index(target)
+        except ValueError:
+            i_in_chapter = 0
+        prev_paragraphs = list(chapter_paragraphs_full[:i_in_chapter])
+        next_paragraphs = list(chapter_paragraphs_full[i_in_chapter + 1 :])
+        trimmed_reasons.append(
+            f"short_chapter:full_context({len(chapter_paragraphs_full)})"
+        )
+    else:
+        for off in range(1, window_config.before + 1):
+            if idx_in_order - off < 0:
+                break
+            prev_paragraphs.append(by_position[positions[idx_in_order - off]])
+        prev_paragraphs.reverse()  # earliest first
+
+        for off in range(1, window_config.after + 1):
+            if idx_in_order + off >= len(positions):
+                break
+            next_paragraphs.append(by_position[positions[idx_in_order + off]])
 
     crossed_boundary = any(p.section_id != target.section_id for p in prev_paragraphs)
 
@@ -156,11 +183,13 @@ def build_context(
             WindowParagraph(offset=off, id=p.paragraph_id, source=p.source_text, translated=None)
         )
 
-    section = _find_section_for(book, target.section_id)
+    # We already resolved the target's section above (for the full-chapter
+    # override). Reuse it here.
+    section = section_for_target
     heading_trail = section.heading_trail if section else []
     chapter_abstract = (chapter_summary.abstract[: window_config.chapter_abstract_max_chars]
                         if chapter_summary else "")
-    chapter_paragraphs = section.paragraphs if section else []
+    chapter_paragraphs = chapter_paragraphs_full
     chapter_length = max(1, len(chapter_paragraphs))
     try:
         position_in_chapter = chapter_paragraphs.index(target) + 1
@@ -191,7 +220,7 @@ def build_context(
         position_in_chapter=position_in_chapter,
         crossed_chapter_boundary=crossed_boundary,
         anchors=anchors,
-        trimmed_reasons=[],
+        trimmed_reasons=trimmed_reasons,
         target_language=glossary.target_language,
         source_language=book.meta.source_language,
         register=style_guide.register,  # type: ignore[arg-type]

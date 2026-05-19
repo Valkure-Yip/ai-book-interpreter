@@ -111,6 +111,21 @@ prev.reverse()
 **注意**：跨章节边界时，前文窗口可能取自上一章节末尾。这是**有意为之**——很多书的章节衔接处有指代回指。
 但若跨章节边界，会附加一行 `[Chapter boundary]` 提示。
 
+### 2b. 短章节覆盖（Short-Chapter Override）
+
+当章节段落数 ≤ `window.short_chapter_threshold`（默认 15）时，**忽略** `before` / `after` 参数，直接：
+
+- `prev_window` = 该段在本章中之前的**全部**段落（带已有译文）
+- `next_window` = 该段在本章中之后的**全部**段落（仅源文）
+
+理由：在 news commentary、随笔、短篇博客等场景，整章只有 8-15 段。让模型只看 3 段前 + 2 段后 ≠ 让 baseline 把整章一次塞进 prompt 看到的全局上下文。短章节覆盖把这道结构性鸿沟抹平。
+
+**关键性质**：短章节模式下 `prev_window` 永不跨章。整章本就是模型的"全局上下文"，跨章节抓内容只会引入歧义。`crossed_chapter_boundary` 在此模式下永远为 `False`。
+
+`trimmed_reasons` 里会记录 `"short_chapter:full_context(N)"`，N 为章节段落数，留作 audit 痕迹。
+
+环境变量 `ABI_SHORT_CHAPTER_THRESHOLD=0` 可关闭该行为，恢复纯滑窗。
+
 ### 3. Up Next（后 J 段）
 
 ```python
@@ -123,6 +138,25 @@ for i in range(1, J+1):
 ```
 
 后文窗口**不**用译文（因为还没翻），仅用源文做"预读"。
+
+### 3b. 批量翻译时的窗口去重
+
+`paragraph_batch_translator` 一次翻译 K 段（受 `ABI_BATCH_SIZE` 控制）。其上下文以 `batch[0]` 为锚点构造，意味着 `prev_window` / `next_window` 描绘的是 **leader 周围**的段落 — 但 `batch[1..K-1]` 同时出现在 `next_window` 与 `targets`（待翻译列表）中。
+
+这种重复会让模型混淆：同一段被"已展示作为上下文"和"请翻译这段"两层语义同时引用。在 batch_size=5、章节 12 段、短章节覆盖三者叠加时尤为明显（曾在 news_commentary eval 中观测到）。
+
+**修复**：批量调用在 `build_context` 之后会**剔除 batch 内段落 ID** 出 prev / next 两侧：
+
+```python
+batch_ids = {p.paragraph_id for p in batch}
+context = dataclasses.replace(
+    context,
+    prev_window=[wp for wp in context.prev_window if wp.id not in batch_ids],
+    next_window=[wp for wp in context.next_window if wp.id not in batch_ids],
+)
+```
+
+结果：`prev_window` = batch 前的段（不含 batch 自身），`next_window` = batch 后的段。Batch 内段落的相互上下文通过它们同处一个 `targets` 列表中自然获得。
 
 ### 4. Chapter Scaffold
 
@@ -200,7 +234,8 @@ window:
   glossary_max: 40
   chapter_abstract_max_chars: 600
   token_budget: 6000
+  short_chapter_threshold: 15
   trim_order: [j_after, glossary_max, chapter_abstract, k_before]
 ```
 
-用户可在 CLI 用 `--window.before=5` 之类的语法覆盖。
+用户可在 CLI 用 `--window.before=5` 之类的语法覆盖，或通过 `ABI_WINDOW_BEFORE` / `ABI_WINDOW_AFTER` / `ABI_SHORT_CHAPTER_THRESHOLD` 等环境变量调节。

@@ -98,6 +98,14 @@ def _make_style() -> StyleGuide:
     )
 
 
+# The legacy windowing tests pin the prev/next math directly and must not
+# accidentally trip the short-chapter override (threshold=15 by default, our
+# test book uses 5-paragraph chapters → would always trigger). Setting
+# ``short_chapter_threshold=0`` disables the override for those tests.
+def _legacy_window(**kw: int) -> WindowConfig:
+    return WindowConfig(short_chapter_threshold=0, **kw)
+
+
 class TestContextBuilder:
     def test_window_basic(self) -> None:
         book = _make_book()
@@ -111,7 +119,7 @@ class TestContextBuilder:
             overview=_make_overview(),
             style_guide=_make_style(),
             chapter_summary=None,
-            window_config=WindowConfig(before=2, after=2, glossary_max=10),
+            window_config=_legacy_window(before=2, after=2, glossary_max=10),
         )
         assert len(ctx.prev_window) == 2
         assert len(ctx.next_window) == 2
@@ -130,7 +138,7 @@ class TestContextBuilder:
             overview=_make_overview(),
             style_guide=_make_style(),
             chapter_summary=None,
-            window_config=WindowConfig(before=3, after=2, glossary_max=10),
+            window_config=_legacy_window(before=3, after=2, glossary_max=10),
         )
         assert ctx.crossed_chapter_boundary
         # All 3 prior come from chapter 1
@@ -161,7 +169,7 @@ class TestContextBuilder:
             overview=_make_overview(),
             style_guide=_make_style(),
             chapter_summary=None,
-            window_config=WindowConfig(before=2, after=0, glossary_max=10),
+            window_config=_legacy_window(before=2, after=0, glossary_max=10),
         )
         # The translation should be in prev_window
         match = [p for p in ctx.prev_window if p.id == prev.paragraph_id]
@@ -182,7 +190,7 @@ class TestContextBuilder:
             overview=_make_overview(),
             style_guide=_make_style(),
             chapter_summary=None,
-            window_config=WindowConfig(before=1, after=1, glossary_max=5),
+            window_config=_legacy_window(before=1, after=1, glossary_max=5),
         )
         assert any(e.term == "embodiment" for e in ctx.glossary_slice)
 
@@ -210,6 +218,118 @@ def test_window_at_boundaries_does_not_crash(position: int) -> None:
         overview=_make_overview(),
         style_guide=_make_style(),
         chapter_summary=None,
-        window_config=WindowConfig(before=3, after=3, glossary_max=10),
+        window_config=_legacy_window(before=3, after=3, glossary_max=10),
     )
     assert ctx.target.id == target.paragraph_id
+
+
+class TestShortChapterOverride:
+    """When a chapter is short, ABI should hand the WHOLE chapter to the model
+    instead of just k-before / j-after, so it isn't structurally disadvantaged
+    versus a naive single-prompt baseline on short documents."""
+
+    def test_short_chapter_expands_to_full_context(self) -> None:
+        """A 5-paragraph chapter at threshold=15 → prev+next covers all 4
+        siblings regardless of WindowConfig.before / .after."""
+        book = _make_book()
+        all_paras = book.iter_paragraphs()
+        target = all_paras[2]  # middle of chapter 1
+        ctx = build_context(
+            book=book, target=target,
+            paragraphs_in_order=all_paras,
+            translations={},
+            glossary=_make_glossary(),
+            overview=_make_overview(),
+            style_guide=_make_style(),
+            chapter_summary=None,
+            window_config=WindowConfig(
+                before=1, after=1, glossary_max=10, short_chapter_threshold=15
+            ),
+        )
+        # Even though before=after=1, we should see ALL siblings (2 prev + 2 next).
+        assert len(ctx.prev_window) == 2
+        assert len(ctx.next_window) == 2
+        # Audit trail must record the override.
+        assert any(r.startswith("short_chapter:") for r in ctx.trimmed_reasons)
+
+    def test_short_chapter_first_paragraph_gets_full_next(self) -> None:
+        book = _make_book()
+        all_paras = book.iter_paragraphs()
+        target = all_paras[0]  # first of chapter 1
+        ctx = build_context(
+            book=book, target=target,
+            paragraphs_in_order=all_paras,
+            translations={},
+            glossary=_make_glossary(),
+            overview=_make_overview(),
+            style_guide=_make_style(),
+            chapter_summary=None,
+            window_config=WindowConfig(
+                before=3, after=1, glossary_max=10, short_chapter_threshold=15
+            ),
+        )
+        assert len(ctx.prev_window) == 0
+        # All four remaining siblings should land in next_window.
+        assert len(ctx.next_window) == 4
+
+    def test_short_chapter_never_crosses_chapter_boundary(self) -> None:
+        """First paragraph of chapter 2 should NOT pull context from chapter 1
+        when full-chapter mode is active — its 'global context' is chapter 2."""
+        book = _make_book()
+        all_paras = book.iter_paragraphs()
+        target = all_paras[5]
+        ctx = build_context(
+            book=book, target=target,
+            paragraphs_in_order=all_paras,
+            translations={},
+            glossary=_make_glossary(),
+            overview=_make_overview(),
+            style_guide=_make_style(),
+            chapter_summary=None,
+            window_config=WindowConfig(
+                before=3, after=2, glossary_max=10, short_chapter_threshold=15
+            ),
+        )
+        assert ctx.prev_window == []
+        assert not ctx.crossed_chapter_boundary
+
+    def test_threshold_zero_disables_override(self) -> None:
+        book = _make_book()
+        all_paras = book.iter_paragraphs()
+        target = all_paras[2]
+        ctx = build_context(
+            book=book, target=target,
+            paragraphs_in_order=all_paras,
+            translations={},
+            glossary=_make_glossary(),
+            overview=_make_overview(),
+            style_guide=_make_style(),
+            chapter_summary=None,
+            window_config=WindowConfig(
+                before=1, after=1, glossary_max=10, short_chapter_threshold=0
+            ),
+        )
+        # With override disabled, legacy ``before`` / ``after`` apply.
+        assert len(ctx.prev_window) == 1
+        assert len(ctx.next_window) == 1
+        assert not any(r.startswith("short_chapter:") for r in ctx.trimmed_reasons)
+
+    def test_threshold_below_chapter_size_keeps_legacy_window(self) -> None:
+        """Chapter has 5 paragraphs but threshold is 3 → override skipped."""
+        book = _make_book()
+        all_paras = book.iter_paragraphs()
+        target = all_paras[2]
+        ctx = build_context(
+            book=book, target=target,
+            paragraphs_in_order=all_paras,
+            translations={},
+            glossary=_make_glossary(),
+            overview=_make_overview(),
+            style_guide=_make_style(),
+            chapter_summary=None,
+            window_config=WindowConfig(
+                before=1, after=1, glossary_max=10, short_chapter_threshold=3
+            ),
+        )
+        assert len(ctx.prev_window) == 1
+        assert len(ctx.next_window) == 1

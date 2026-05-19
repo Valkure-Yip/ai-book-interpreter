@@ -65,6 +65,8 @@ def _env_overrides() -> dict[str, Any]:
         out.setdefault("window", {})["before"] = n
     if (n := _env_int("ABI_WINDOW_AFTER")) is not None:
         out.setdefault("window", {})["after"] = n
+    if (n := _env_int("ABI_SHORT_CHAPTER_THRESHOLD")) is not None:
+        out.setdefault("window", {})["short_chapter_threshold"] = n
     if (n := _env_int("ABI_BATCH_SIZE")) is not None and n >= 1:
         out["batch_size"] = n
     if (n := _env_int("ABI_CONCURRENCY")) is not None and n >= 1:

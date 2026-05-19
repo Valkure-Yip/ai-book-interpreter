@@ -211,9 +211,19 @@ class TermUsage(BaseModel):
     compliant: bool     # 是否符合 glossary.target
 
 class QualityFlag(BaseModel):
-    code: Literal["term_drift", "length_ratio_outlier",
-                  "schema_error", "refusal_detected",
-                  "low_confidence", "untranslated_residue"]
+    code: Literal[
+        "term_drift", "length_ratio_outlier",
+        "schema_error", "refusal_detected",
+        "low_confidence", "untranslated_residue",
+        "anchor_missing",
+        # 合法的非翻译：code block / equation / 空段。translated_text == source_text。
+        "passthrough",
+        # 硬失败：translator 抛异常或 JSON 解析失败。translated_text == "" (绝不
+        # 回填源文 — 那样会让 English-in-Chinese 蒙混过 completeness 检查)。
+        # 同时带 schema_error 给出原因。
+        "translation_failed",
+        "skipped",
+    ]
     detail: str
 
 class TokenUsage(BaseModel):

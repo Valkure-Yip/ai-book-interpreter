@@ -45,7 +45,7 @@
 | `glossary_compliance` | 译文是否使用 ABI 锁定术语的官方目标语 | 扫描每个样本译文，统计核心术语命中 / 命中正确 |
 | `length_ratio` | 译文 / 源文字符比是否落在合理区间 | 与 `translate/validator.py` 相同区间（en→zh: 0.22-0.55） |
 | `anchor_preservation` | 数字、年份、专名、URL、引号内字符串保留率 | 抽取源文中的正则 anchors → 检查译文是否完整出现 |
-| `completeness` | 段落级别是否漏译 | baseline 段落与源段落对齐失败 / 译文为空 / passthrough |
+| `completeness` | 段落级别是否漏译 | 对齐失败 / 译文为空 / `translation_failed` flag。**注意**：ABI 翻译失败时（schema_error / 超时）`translated_text` 是**空字符串**而非源文回填 — 这样 `completeness` 能立即抓到，不会被 "看起来像通过了" 的 English-in-Chinese 输出蒙混过去。 |
 
 ### LLM-as-Judge（每样本一次 likert + 一次 pairwise 调用）
 

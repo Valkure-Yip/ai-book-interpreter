@@ -81,6 +81,8 @@ LLM 自评。仅作弱信号（已知不可信），权重低。
 | `refusal_detected` | no_refusal_no_residue == 0 |
 | `low_confidence` | 总分 < 0.7 |
 | `untranslated_residue` | 残留检测命中 |
+| `passthrough` | 合法跳过翻译：code block / equation / 空段。`translated_text == source_text`，confidence=1.0。 |
+| `translation_failed` | 翻译器硬失败（异常或 JSON 解析失败）。`translated_text == ""`（绝不回填源文）。永远与 `schema_error` 共存；通过缺少 `passthrough` 与合法跳过区分。 |
 
 ## 章节级聚合
 

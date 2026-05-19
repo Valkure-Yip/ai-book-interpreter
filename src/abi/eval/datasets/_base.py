@@ -42,7 +42,18 @@ class DatasetParagraph:
 
 @dataclass(frozen=True)
 class EvalDataset:
-    """Adapter output: an ordered list of paragraphs grouped by document."""
+    """Adapter output: an ordered list of paragraphs grouped by document.
+
+    ``doc_titles`` maps each ``document_id`` to a human-readable title that
+    will be used as the ``Chapter N: <title>`` heading in the materialized
+    ``.txt`` file. Adapters should populate this whenever they have a clean
+    natural-language title for the document (e.g. the first row of a
+    news-commentary article). When a doc_id has no entry the doc_id itself
+    is used as the heading — fine for already-clean ids (wmt24pp's
+    ``document_id`` columns) but ugly for slugged ids
+    (``"What_Failed_in_2008"``) which the downstream LLM TOC refiner can
+    mangle (observed: ``"What Failed in 2008WhatFailedin"``).
+    """
 
     book_id: str
     title: str
@@ -51,6 +62,7 @@ class EvalDataset:
     register: str
     paragraphs: list[DatasetParagraph]
     doc_to_paragraphs: dict[str, list[DatasetParagraph]] = field(default_factory=dict)
+    doc_titles: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -174,7 +186,13 @@ def materialize_to_book_file(ds: EvalDataset, out_dir: Path) -> Path:
     # the EvalDataset metadata, not in the materialized file body.
     lines: list[str] = []
     for chapter_n, (doc_id, paras) in enumerate(ds.doc_to_paragraphs.items(), start=1):
-        lines.append(f"Chapter {chapter_n}: {doc_id}")
+        # Prefer the human-readable title when the adapter supplied one. Slugged
+        # ids (e.g. "What_Failed_in_2008") confuse the downstream LLM TOC
+        # refiner, which has been observed to emit malformed titles like
+        # "What Failed in 2008WhatFailedin" by half-de-slugging and then
+        # accidentally concatenating fragments.
+        display = ds.doc_titles.get(doc_id) or doc_id
+        lines.append(f"Chapter {chapter_n}: {display}")
         lines.append("")
         for p in paras:
             lines.append(_sanitize_paragraph(p.source_text))

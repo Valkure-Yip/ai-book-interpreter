@@ -50,7 +50,8 @@ abi translate <input> [-o OUTPUT] [options]
 | --- | --- | --- |
 | `ABI_WINDOW_BEFORE` | `3` | 滑动窗口的"前若干段"数量 |
 | `ABI_WINDOW_AFTER` | `2` | 滑动窗口的"后若干段"数量 |
-| `ABI_BATCH_SIZE` | `1` | 单次 LLM 请求翻译多少段。> 1 时启用批量翻译模板，显著降低请求数。代价：同一批次内的段落彼此看不到对方译文。 |
+| `ABI_BATCH_SIZE` | `1` | 单次 LLM 请求翻译多少段。> 1 时启用批量翻译模板，显著降低请求数。代价：同一批次内的段落彼此看不到对方译文。批量模式下 `prev_window` / `next_window` 自动剔除 batch 内段落，避免上下文与目标段重复。 |
+| `ABI_SHORT_CHAPTER_THRESHOLD` | `15` | 当章节段落数 ≤ N 时，忽略上面的 `ABI_WINDOW_*`，把**整章作为上下文**喂给每一段（即 `prev_window` = 该段之前的同章全部段，`next_window` = 之后的同章全部段，永不跨章）。消除短文（新闻评论、随笔、博客）场景下 naive single-prompt baseline 的结构优势。设为 `0` 关闭。 |
 | `ABI_CONCURRENCY` | `4` | 章节并行度（等价于 `--concurrency`） |
 | `ABI_TOC_REFINE` | `1` | 是否启用 ingest 后的 LLM 目录重建（pass 0.5）。`0` 跳过。CLI `--no-refine-toc` 等价。失败/超时会安全降级回 heuristic 切章。 |
 
@@ -67,8 +68,8 @@ abi translate <input> [-o OUTPUT] [options]
 
 | 参数 | 说明 |
 | --- | --- |
-| `--register` | 强制覆盖自动检测（`academic-formal` 等） |
-| `--quote-style` | `「」` / `“”` / `""` |
+| `--register` | 强制覆盖自动检测（`academic-formal` / `academic-accessible` / `popular-science` / `textbook` / `literary`） |
+| `--quote-style` | `「」` / `"…"` / `""`。**注意**：这里设定的是 _源文本身出现引号_ 时翻译应使用的引号样式 — prompt 显式告诉模型不要给术语 / 概念 / 专名包引号，除非源文也包了。 |
 | `--punctuation` | `full` / `half` / `preserve` |
 
 ### 高级

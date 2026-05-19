@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections import defaultdict
 from pathlib import Path
 
@@ -38,6 +39,42 @@ def _save_unit(out_dir: Path, unit: TranslationUnit) -> None:
     tmp = target_file.with_suffix(target_file.suffix + ".tmp")
     tmp.write_text(unit.model_dump_json(indent=2), encoding="utf-8")
     tmp.replace(target_file)
+
+
+def build_error_unit(
+    *,
+    paragraph: Paragraph,
+    exc: BaseException,
+    target_language: str,
+    model: str,
+) -> TranslationUnit:
+    """Build a hard-failure TranslationUnit when the translator can't produce
+    valid output.
+
+    Critically, ``translated_text`` is the **empty string** — never the source
+    text. Echoing the source produced English-in-Chinese output downstream
+    (assemble/eval) and made schema_errors look like legitimate passthroughs.
+    With an empty body the gap is unambiguous: consumers can decide whether to
+    retry, skip, or insert a placeholder.
+
+    Exposed at module level so the regression test for this behavior doesn't
+    have to drive a full ``run_translation`` flow.
+    """
+    return TranslationUnit(
+        paragraph_id=paragraph.paragraph_id,
+        kind=paragraph.kind,
+        source_text=paragraph.source_text,
+        translated_text="",
+        target_language=target_language,
+        confidence=0.0,
+        flags=[
+            QualityFlag(code="schema_error", detail=str(exc)[:200]),
+            QualityFlag(code="translation_failed", detail="error fallback"),
+        ],
+        notes=f"error fallback: {type(exc).__name__}",
+        model=model,
+        provider="openai-compatible",
+    )
 
 
 async def run_translation(
@@ -81,7 +118,7 @@ async def run_translation(
         _save_unit(out_dir, unit)
         async with units_lock:
             units[unit.paragraph_id] = unit
-        flag_codes = [f.code for f in unit.flags]
+        flag_codes: list[str] = [f.code for f in unit.flags]
         if any(f.code != "passthrough" for f in unit.flags):
             with flagged_path.open("a", encoding="utf-8") as fh:
                 fh.write(unit.model_dump_json() + "\n")
@@ -101,20 +138,11 @@ async def run_translation(
         metrics.flush()
 
     def _error_unit(p: Paragraph, exc: BaseException) -> TranslationUnit:
-        return TranslationUnit(
-            paragraph_id=p.paragraph_id,
-            kind=p.kind,
-            source_text=p.source_text,
-            translated_text=p.source_text,
+        return build_error_unit(
+            paragraph=p,
+            exc=exc,
             target_language=config.target_language,
-            confidence=0.0,
-            flags=[
-                QualityFlag(code="schema_error", detail=str(exc)[:200]),
-                QualityFlag(code="passthrough", detail="error fallback"),
-            ],
-            notes=f"error fallback: {type(exc).__name__}",
             model=router.model,
-            provider="openai-compatible",
         )
 
     async def _translate_one(
@@ -176,6 +204,23 @@ async def run_translation(
             style_guide=style_guide,
             chapter_summary=chapter_sum,
             window_config=config.window,
+        )
+        # ``build_context`` is anchored to batch[0], so its prev/next windows
+        # describe paragraphs around the LEADER. The prompt header says
+        # "AFTER this batch" though, and the LLM treats those as distinct
+        # context — anything we ship in next_window that the model also sees
+        # under "Paragraphs to translate" causes confusing duplication
+        # (observed on news_commentary where the 12-paragraph chapter +
+        # short-chapter override + batch_size=5 made paragraphs 13-16 appear
+        # in BOTH next_window and the target list of the same prompt).
+        # Strip batch members from both windows so they only appear in the
+        # target list. The same fix also covers the pre-existing case where
+        # batch_size > window.after even without the short-chapter override.
+        batch_ids = {p.paragraph_id for p in batch}
+        context = dataclasses.replace(
+            context,
+            prev_window=[wp for wp in context.prev_window if wp.id not in batch_ids],
+            next_window=[wp for wp in context.next_window if wp.id not in batch_ids],
         )
         try:
             batch_units = await translate_paragraph_batch(

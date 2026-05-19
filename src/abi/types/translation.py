@@ -19,6 +19,10 @@ QualityFlagCode = Literal[
     "untranslated_residue",
     "anchor_missing",
     "passthrough",
+    # Hard failure: translator raised / returned malformed JSON and we could
+    # not recover. Emitted instead of "passthrough" so consumers don't confuse
+    # legitimate non-translation (code blocks, equations) with a real failure.
+    "translation_failed",
     "skipped",
 ]
 

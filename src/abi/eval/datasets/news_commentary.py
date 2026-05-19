@@ -171,6 +171,7 @@ def _build_dataset(
 
     paragraphs: list[DatasetParagraph] = []
     doc_to_paragraphs: dict[str, list[DatasetParagraph]] = defaultdict(list)
+    doc_titles: dict[str, str] = {}
     position = 0
     used_doc_ids: set[str] = set()
     for r_idx, (start, end) in enumerate(doc_ranges):
@@ -182,6 +183,15 @@ def _build_dataset(
             doc_id = f"{base_doc_id}__{suffix}"
             suffix += 1
         used_doc_ids.add(doc_id)
+        # Keep the natural-language title (the title row's English text) so
+        # ``materialize_to_book_file`` writes a clean ``Chapter N: <title>``
+        # heading instead of an ugly slug. Falls back gracefully when the
+        # synthetic boundary at index 0 has no real title row.
+        first_en = (
+            (filtered[start].get("translation") or {}).get(source_lang) or ""
+        ).strip()
+        if first_en:
+            doc_titles[doc_id] = first_en
 
         for j in range(start, end):
             row = filtered[j]
@@ -213,6 +223,7 @@ def _build_dataset(
         register=spec.register,
         paragraphs=paragraphs,
         doc_to_paragraphs=dict(doc_to_paragraphs),
+        doc_titles=doc_titles,
     )
 
 

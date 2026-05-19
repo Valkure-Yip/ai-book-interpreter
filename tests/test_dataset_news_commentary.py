@@ -202,6 +202,33 @@ class TestMaterialize:
         assert "Chapter 1:" in body
         assert "Chapter 2:" in body
 
+    def test_chapter_headings_use_natural_titles_not_slugs(
+        self, tmp_path: Path
+    ) -> None:
+        """REGRESSION: previously the chapter heading was the slugged doc_id
+        (``1929_or_1989``), which the downstream LLM TOC refiner mangled into
+        ``"1929 or 1989WhatFailedin"``-style garbage. The materialized file
+        must use the natural-language title (``"1929 or 1989?"``)."""
+        ds = load_eval_dataset(SPEC)
+        path = materialize_to_book_file(ds, tmp_path)
+        body = path.read_text(encoding="utf-8")
+        assert "Chapter 1: 1929 or 1989?" in body
+        assert "Chapter 2: What Failed in 2008?" in body
+        # And the slug form must NOT appear as a chapter heading.
+        assert "Chapter 1: 1929_or_1989" not in body
+        assert "Chapter 2: What_Failed_in_2008" not in body
+
+    def test_doc_titles_populated_on_adapter_output(self) -> None:
+        ds = load_eval_dataset(SPEC)
+        # Every detected document should have a natural title from its first
+        # row's English text.
+        assert ds.doc_titles
+        assert set(ds.doc_titles.keys()) == set(ds.doc_to_paragraphs.keys())
+        for title in ds.doc_titles.values():
+            assert title.strip()
+            # The natural title is the title row's English text, not a slug.
+            assert "_" not in title or " " in title
+
 
 class TestSpecRoundTrip:
     def test_unknown_option_does_not_crash(self) -> None:

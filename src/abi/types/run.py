@@ -19,6 +19,12 @@ class WindowConfig(FrozenModel):
     glossary_max: int = 40
     token_budget: int = 6000
     chapter_abstract_max_chars: int = 600
+    # When a chapter has at most this many paragraphs, expand prev/next windows
+    # to cover the WHOLE chapter (not just ``before``/``after``). Removes the
+    # structural disadvantage versus naive single-prompt baselines on short
+    # documents (news commentaries, blog posts, individual essays) where the
+    # baseline gets full global context for free. Set to 0 to disable.
+    short_chapter_threshold: int = 15
 
 
 class StyleConfig(FrozenModel):
