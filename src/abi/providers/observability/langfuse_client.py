@@ -69,8 +69,8 @@ def build_langfuse_handler(config: LangfuseConfig) -> tuple[Any | None, Langfuse
         )
 
     try:
-        from langfuse import Langfuse  # type: ignore[import-not-found]
-        from langfuse.callback import CallbackHandler  # type: ignore[import-not-found]
+        from langfuse import Langfuse
+        from langfuse.callback import CallbackHandler
     except Exception as exc:  # pragma: no cover
         return None, LangfuseStatus(False, False, config.host, reason=f"import failed: {exc}")
 
@@ -114,3 +114,25 @@ def flush_handler(handler: Any | None) -> None:
             client.flush()
     except Exception as exc:  # pragma: no cover
         _log.debug("langfuse flush ignored: %s", exc)
+
+
+def get_langfuse_client(config: LangfuseConfig) -> Any | None:
+    """Return a low-level :class:`langfuse.Langfuse` client or ``None``.
+
+    Used by the eval pipeline for Dataset / Score / Dataset-Run APIs that
+    the LangChain ``CallbackHandler`` doesn't expose. Reuses the same env
+    vars and host as :func:`build_langfuse_handler` and returns ``None``
+    when keys are missing — observability must never break the run.
+    """
+    if not config.enabled:
+        return None
+    public_key = os.environ.get(config.public_key_env, "")
+    secret_key = os.environ.get(config.secret_key_env, "")
+    if not public_key or not secret_key:
+        return None
+    try:
+        from langfuse import Langfuse
+        return Langfuse(public_key=public_key, secret_key=secret_key, host=config.host)
+    except Exception as exc:  # pragma: no cover
+        _log.warning("langfuse client init failed: %s", exc)
+        return None

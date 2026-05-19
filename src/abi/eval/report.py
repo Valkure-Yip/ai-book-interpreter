@@ -1,22 +1,39 @@
-"""Render eval results as human-readable Markdown."""
+"""Render eval results as human-readable Markdown.
+
+Two render paths sharing the same skeleton:
+
+- ``2-way`` (no human reference): ABI vs Baseline only.
+- ``3-way`` (dataset with references): adds Reference columns to the
+  mechanical table, a third Likert row, and two extra pairwise sections.
+"""
 
 from __future__ import annotations
 
-from abi.types.eval import EvalReport
+from abi.types.eval import EvalReport, MechanicalScore
 
 
 def render_markdown(r: EvalReport) -> str:
     out: list[str] = []
     add = out.append
+    has_ref = r.mechanical.reference is not None and r.reference_paragraphs > 0
 
     add(f"# Evaluation report — {r.book_id}")
     add("")
     add(f"- eval_id: `{r.eval_id}`")
     add(f"- abi_run_id: `{r.abi_run_id}`")
     add(f"- created_at: {r.created_at.isoformat()}")
+    add(f"- translate model: `{r.translate_model or '?'}`")
     add(f"- judge model: `{r.judge_model}`")
+    if r.dataset_spec:
+        add(f"- dataset: `{r.dataset_spec}`")
+    if r.langfuse_dataset_run_url:
+        add(f"- langfuse run: <{r.langfuse_dataset_run_url}>")
+    elif r.langfuse_dataset_name:
+        add(f"- langfuse dataset: `{r.langfuse_dataset_name}`")
     add(f"- samples: {r.judge.samples}")
     add(f"- source paragraphs: {r.source_paragraphs}")
+    if has_ref:
+        add(f"- reference paragraphs: {r.reference_paragraphs}")
     add("")
 
     add("## Alignment")
@@ -25,6 +42,8 @@ def render_markdown(r: EvalReport) -> str:
     add(f"- source paragraphs: {a.source_paragraphs}")
     add(f"- ABI paragraphs: {a.abi_paragraphs}")
     add(f"- baseline paragraphs: {a.baseline_paragraphs}")
+    if has_ref:
+        add(f"- reference paragraphs: {a.reference_paragraphs}")
     add(f"- aligned pairs: {a.aligned_pairs}")
     add(f"- unaligned: {a.unaligned_pairs}")
     add("")
@@ -40,19 +59,38 @@ def render_markdown(r: EvalReport) -> str:
 
     add("## Mechanical metrics")
     add("")
-    add("| metric | ABI | Baseline | Δ (abi - base) |")
-    add("|---|---:|---:|---:|")
-    abi = r.mechanical.abi
-    base = r.mechanical.baseline
-    rows = [
-        ("glossary compliance", abi.glossary_compliance, base.glossary_compliance),
-        ("length-ratio in band", abi.length_ratio_ok, base.length_ratio_ok),
-        ("length-ratio mean", abi.length_ratio_mean, base.length_ratio_mean),
-        ("anchor preservation", abi.anchor_preservation, base.anchor_preservation),
-        ("completeness", abi.completeness, base.completeness),
-    ]
-    for label, x, y in rows:
-        add(f"| {label} | {x:.3f} | {y:.3f} | {x - y:+.3f} |")
+    if has_ref:
+        ref: MechanicalScore = r.mechanical.reference  # type: ignore[assignment]
+        add("| metric | ABI | Baseline | Reference | Δ(abi - base) | Δ(abi - ref) |")
+        add("|---|---:|---:|---:|---:|---:|")
+        abi = r.mechanical.abi
+        base = r.mechanical.baseline
+        rows = [
+            ("glossary compliance", abi.glossary_compliance, base.glossary_compliance, ref.glossary_compliance),
+            ("length-ratio in band", abi.length_ratio_ok, base.length_ratio_ok, ref.length_ratio_ok),
+            ("length-ratio mean", abi.length_ratio_mean, base.length_ratio_mean, ref.length_ratio_mean),
+            ("anchor preservation", abi.anchor_preservation, base.anchor_preservation, ref.anchor_preservation),
+            ("completeness", abi.completeness, base.completeness, ref.completeness),
+        ]
+        for label, x, y, z in rows:
+            add(
+                f"| {label} | {x:.3f} | {y:.3f} | {z:.3f} | "
+                f"{x - y:+.3f} | {x - z:+.3f} |"
+            )
+    else:
+        add("| metric | ABI | Baseline | Δ (abi - base) |")
+        add("|---|---:|---:|---:|")
+        abi = r.mechanical.abi
+        base = r.mechanical.baseline
+        rows2 = [
+            ("glossary compliance", abi.glossary_compliance, base.glossary_compliance),
+            ("length-ratio in band", abi.length_ratio_ok, base.length_ratio_ok),
+            ("length-ratio mean", abi.length_ratio_mean, base.length_ratio_mean),
+            ("anchor preservation", abi.anchor_preservation, base.anchor_preservation),
+            ("completeness", abi.completeness, base.completeness),
+        ]
+        for label, x, y in rows2:
+            add(f"| {label} | {x:.3f} | {y:.3f} | {x - y:+.3f} |")
     add("")
     add(
         f"- glossary checked / violations — ABI: {abi.glossary_checked}/"
@@ -71,25 +109,42 @@ def render_markdown(r: EvalReport) -> str:
 
     add("## LLM-as-Judge — Likert (1-5, 5 = best)")
     add("")
-    add("| dimension | ABI | Baseline | Δ |")
-    add("|---|---:|---:|---:|")
     j = r.judge
-    for dim in ("adequacy", "fluency", "coherence", "style", "mean"):
-        a_v = j.likert_abi.get(dim, 0.0)
-        b_v = j.likert_baseline.get(dim, 0.0)
-        d_v = j.likert_delta.get(dim, 0.0)
-        bold_open = "**" if dim == "mean" else ""
-        bold_close = "**" if dim == "mean" else ""
-        add(
-            f"| {bold_open}{dim}{bold_close} | "
-            f"{bold_open}{a_v:.2f}{bold_close} | "
-            f"{bold_open}{b_v:.2f}{bold_close} | "
-            f"{bold_open}{d_v:+.2f}{bold_close} |"
-        )
+    if has_ref:
+        add("| dimension | ABI | Baseline | Reference | Δ(abi - base) |")
+        add("|---|---:|---:|---:|---:|")
+        for dim in ("adequacy", "fluency", "coherence", "style", "mean"):
+            a_v = j.likert_abi.get(dim, 0.0)
+            b_v = j.likert_baseline.get(dim, 0.0)
+            ref_v = j.likert_reference.get(dim, 0.0)
+            d_v = j.likert_delta.get(dim, 0.0)
+            bold = "**" if dim == "mean" else ""
+            add(
+                f"| {bold}{dim}{bold} | "
+                f"{bold}{a_v:.2f}{bold} | "
+                f"{bold}{b_v:.2f}{bold} | "
+                f"{bold}{ref_v:.2f}{bold} | "
+                f"{bold}{d_v:+.2f}{bold} |"
+            )
+    else:
+        add("| dimension | ABI | Baseline | Δ |")
+        add("|---|---:|---:|---:|")
+        for dim in ("adequacy", "fluency", "coherence", "style", "mean"):
+            a_v = j.likert_abi.get(dim, 0.0)
+            b_v = j.likert_baseline.get(dim, 0.0)
+            d_v = j.likert_delta.get(dim, 0.0)
+            bold = "**" if dim == "mean" else ""
+            add(
+                f"| {bold}{dim}{bold} | "
+                f"{bold}{a_v:.2f}{bold} | "
+                f"{bold}{b_v:.2f}{bold} | "
+                f"{bold}{d_v:+.2f}{bold} |"
+            )
     add("")
 
     add("## LLM-as-Judge — Pairwise preference")
     add("")
+    add("### ABI vs Baseline")
     add(f"- ABI wins: **{j.pairwise_abi_wins}**")
     add(f"- Baseline wins: {j.pairwise_baseline_wins}")
     add(f"- Ties: {j.pairwise_ties}")
@@ -98,12 +153,34 @@ def render_markdown(r: EvalReport) -> str:
         f"of {j.samples} samples"
     )
     add("")
+    if has_ref:
+        add("### ABI vs Reference")
+        add(f"- ABI wins: {j.pairwise_abi_vs_ref_wins}")
+        add(f"- Reference wins: {j.pairwise_abi_vs_ref_losses}")
+        add(f"- Ties: {j.pairwise_abi_vs_ref_ties}")
+        add(
+            f"- ABI win-rate vs reference (ties = ½): "
+            f"**{j.pairwise_abi_vs_ref_winrate:.1%}**"
+        )
+        add("")
+        add("### Baseline vs Reference")
+        add(f"- Baseline wins: {j.pairwise_baseline_vs_ref_wins}")
+        add(f"- Reference wins: {j.pairwise_baseline_vs_ref_losses}")
+        add(f"- Ties: {j.pairwise_baseline_vs_ref_ties}")
+        add(
+            f"- Baseline win-rate vs reference (ties = ½): "
+            f"**{j.pairwise_baseline_vs_ref_winrate:.1%}**"
+        )
+        add("")
 
     add("## Interpretation")
     delta_mean = j.likert_delta.get("mean", 0.0)
     winrate = j.pairwise_abi_winrate
     verdict = _verdict(delta_mean, winrate)
     add(verdict)
+    if has_ref:
+        add("")
+        add(_reference_verdict(j.pairwise_abi_vs_ref_winrate, j.pairwise_baseline_vs_ref_winrate))
     add("")
 
     if r.notes:
@@ -136,3 +213,36 @@ def _verdict(delta_mean: float, winrate: float) -> str:
         "Baseline is winning. Inspect samples and glossary handling — likely "
         "either the test corpus is too easy or ABI is over-constraining."
     )
+
+
+def _reference_verdict(abi_vs_ref: float, base_vs_ref: float) -> str:
+    """Comment on the ABI / Baseline distance to the human reference."""
+    closeness_abi = abi_vs_ref  # winrate vs reference. 0.5 = parity.
+    closeness_base = base_vs_ref
+    if closeness_abi >= 0.45:
+        ref_phrase = (
+            "ABI reaches **near-parity with the human reference** on this "
+            "subset — the judge can't reliably tell them apart."
+        )
+    elif closeness_abi >= 0.35:
+        ref_phrase = (
+            "ABI is **within striking distance** of the human reference; "
+            "the gap is visible but narrow."
+        )
+    elif closeness_abi >= 0.20:
+        ref_phrase = (
+            "The human reference still **clearly outperforms ABI**. There "
+            "is real headroom in adequacy / style for the multi-pass pipeline."
+        )
+    else:
+        ref_phrase = (
+            "ABI is **far below** the human reference on this subset. "
+            "Inspect prompts, glossary, and rendering of literary devices."
+        )
+
+    if closeness_base >= closeness_abi + 0.05:
+        ref_phrase += (
+            " Note: baseline is currently *closer* to the reference than ABI "
+            "— this is a regression signal worth investigating."
+        )
+    return ref_phrase

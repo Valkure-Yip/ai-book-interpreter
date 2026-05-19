@@ -213,8 +213,10 @@ def survey(
 
 @app.command("eval")
 def eval_cmd(
-    input_path: Path = typer.Argument(
-        ..., exists=True, help="Input file (same file you previously translated)."
+    input_path: Path | None = typer.Argument(
+        None,
+        exists=True,
+        help="Input file (same file you previously translated). Omit when using --dataset.",
     ),
     output: Path | None = typer.Option(None, "-o", "--output", help="Eval output dir."),
     abi_run: str | None = typer.Option(
@@ -226,12 +228,9 @@ def eval_cmd(
     judge_model: str | None = typer.Option(
         None,
         "--judge-model",
-        help="Override LLM_MODEL for the judge (defaults to same model as translation).",
-    ),
-    judge_base_url: str | None = typer.Option(
-        None,
-        "--judge-base-url",
-        help="Override LLM_BASE_URL for the judge (use a separate provider).",
+        help="Override the judge LLM model name (defaults to EVAL_JUDGE_MODEL "
+        "env var, then to LLM_MODEL). Endpoint and API key are always reused "
+        "from LLM_BASE_URL / LLM_API_KEY.",
     ),
     baseline_chunk_tokens: int = typer.Option(
         50_000,
@@ -243,6 +242,29 @@ def eval_cmd(
         "--skip-baseline",
         help="Reuse a previously generated baseline if present.",
     ),
+    dataset: str | None = typer.Option(
+        None,
+        "--dataset",
+        help='HF dataset spec, e.g. "wmt24pp:en-zh_CN:literary". When set, '
+        "the eval pulls source + human references from the dataset instead "
+        "of a local book file.",
+    ),
+    limit_docs: int | None = typer.Option(
+        None,
+        "--limit-docs",
+        help="Take only the first N documents from --dataset (smoke mode).",
+    ),
+    auto_translate: bool = typer.Option(
+        False,
+        "--auto-translate",
+        help="When --dataset is set and no ABI run exists for it yet, run "
+        "`abi translate` automatically before evaluating.",
+    ),
+    no_langfuse_experiment: bool = typer.Option(
+        False,
+        "--no-langfuse-experiment",
+        help="Skip Langfuse Dataset Run integration even when keys are set.",
+    ),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd"),
     seed: int = typer.Option(1729, "--seed", help="RNG seed for sampling + A/B label flips."),
     base_url: str | None = typer.Option(None, "--base-url"),
@@ -250,11 +272,15 @@ def eval_cmd(
     config_file: Path | None = typer.Option(None, "--config"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
-    """Evaluate ABI translation quality vs a naive single-prompt baseline."""
+    """Evaluate ABI translation quality vs a naive baseline (+ optional human reference)."""
     from abi.eval import run_eval
     from abi.types.eval import EvalConfig
 
     _setup_logging(verbose)
+    if dataset is None and input_path is None:
+        console.print("[bold red]error:[/] either INPUT_PATH or --dataset is required")
+        raise typer.Exit(code=2)
+
     overrides = _build_overrides(
         target=None,
         modes=None,
@@ -273,20 +299,40 @@ def eval_cmd(
     eval_config = EvalConfig(
         samples=samples,
         judge_model=judge_model,
-        judge_base_url=judge_base_url,
         baseline_chunk_tokens=baseline_chunk_tokens,
         skip_baseline=skip_baseline,
         random_seed=seed,
+        dataset_spec=dataset,
+        limit_docs=limit_docs,
+        auto_translate=auto_translate,
+        langfuse_experiment=not no_langfuse_experiment,
     )
 
-    console.print(f"[bold]Evaluating[/] [cyan]{input_path}[/]")
-    console.print(f"  endpoint:    {config.llm.base_url}")
-    console.print(f"  model:       {config.llm.model}")
-    console.print(
-        f"  judge:       {eval_config.judge_model or config.llm.model}"
+    # Compute final judge model name purely for display.
+    import os
+    effective_judge_model = (
+        eval_config.judge_model
+        or os.environ.get("EVAL_JUDGE_MODEL", "").strip()
+        or config.llm.model
     )
-    console.print(f"  samples:     {samples}")
-    console.print(f"  skip base:   {skip_baseline}")
+
+    if dataset:
+        console.print(f"[bold]Evaluating dataset[/] [cyan]{dataset}[/]")
+        if limit_docs:
+            console.print(f"  limit_docs:  {limit_docs}")
+        if auto_translate:
+            console.print("  auto_translate: enabled")
+    else:
+        console.print(f"[bold]Evaluating[/] [cyan]{input_path}[/]")
+    console.print(f"  endpoint:        {config.llm.base_url}")
+    console.print(f"  translate model: {config.llm.model}")
+    console.print(f"  judge model:     {effective_judge_model}")
+    console.print(f"  samples:         {samples}")
+    console.print(f"  skip baseline:   {skip_baseline}")
+    if eval_config.langfuse_experiment and config.langfuse.enabled:
+        console.print(
+            f"  langfuse exp:    enabled (host={config.langfuse.host})"
+        )
 
     artifacts = asyncio.run(
         run_eval(
@@ -302,36 +348,78 @@ def eval_cmd(
 
 def _print_eval_result(artifacts: Any) -> None:
     r = artifacts.report
+    has_ref = r.reference_paragraphs > 0 and r.mechanical.reference is not None
     console.print()
     console.print("[bold green]✓ Eval done[/]")
     console.print(f"  eval dir:    {artifacts.eval_dir}")
     console.print(f"  abi run:     {r.abi_run_id}")
+    console.print(f"  translate:   {r.translate_model}")
+    console.print(f"  judge:       {r.judge_model}")
     console.print(f"  alignment:   {r.alignment.strategy} "
                   f"({r.alignment.aligned_pairs}/{r.alignment.source_paragraphs} pairs)")
+    if has_ref:
+        console.print(
+            f"  reference:   {r.reference_paragraphs} paragraphs"
+        )
     console.print(f"  baseline:    {r.baseline.chunks} chunk(s), "
                   f"${r.baseline.cost_usd:.4f}, {r.baseline.latency_ms / 1000:.1f}s")
     m = r.mechanical
-    console.print(
-        f"  glossary:    abi={m.abi.glossary_compliance:.2f} "
-        f"baseline={m.baseline.glossary_compliance:.2f} "
-        f"Δ={m.abi.glossary_compliance - m.baseline.glossary_compliance:+.2f}"
-    )
-    console.print(
-        f"  completeness: abi={m.abi.completeness:.2f} "
-        f"baseline={m.baseline.completeness:.2f}"
-    )
+    if has_ref:
+        ref = m.reference  # type: ignore[assignment]
+        console.print(
+            f"  glossary:    abi={m.abi.glossary_compliance:.2f} "
+            f"baseline={m.baseline.glossary_compliance:.2f} "
+            f"reference={ref.glossary_compliance:.2f}"
+        )
+        console.print(
+            f"  completeness: abi={m.abi.completeness:.2f} "
+            f"baseline={m.baseline.completeness:.2f} "
+            f"reference={ref.completeness:.2f}"
+        )
+    else:
+        console.print(
+            f"  glossary:    abi={m.abi.glossary_compliance:.2f} "
+            f"baseline={m.baseline.glossary_compliance:.2f} "
+            f"Δ={m.abi.glossary_compliance - m.baseline.glossary_compliance:+.2f}"
+        )
+        console.print(
+            f"  completeness: abi={m.abi.completeness:.2f} "
+            f"baseline={m.baseline.completeness:.2f}"
+        )
     j = r.judge
     if j.samples:
-        console.print(
-            f"  likert mean: abi={j.likert_abi.get('mean', 0):.2f} "
-            f"baseline={j.likert_baseline.get('mean', 0):.2f} "
-            f"Δ={j.likert_delta.get('mean', 0):+.2f}"
-        )
-        console.print(
-            f"  pairwise:    abi {j.pairwise_abi_wins} wins / "
-            f"{j.pairwise_baseline_wins} losses / {j.pairwise_ties} ties "
-            f"(winrate {j.pairwise_abi_winrate:.1%})"
-        )
+        if has_ref:
+            console.print(
+                f"  likert mean: abi={j.likert_abi.get('mean', 0):.2f} "
+                f"baseline={j.likert_baseline.get('mean', 0):.2f} "
+                f"reference={j.likert_reference.get('mean', 0):.2f}"
+            )
+            console.print(
+                f"  pairwise A/B:  abi {j.pairwise_abi_wins} wins / "
+                f"{j.pairwise_baseline_wins} losses / {j.pairwise_ties} ties "
+                f"(winrate {j.pairwise_abi_winrate:.1%})"
+            )
+            console.print(
+                f"  pairwise A/Ref: abi vs reference winrate "
+                f"{j.pairwise_abi_vs_ref_winrate:.1%}"
+            )
+            console.print(
+                f"  pairwise B/Ref: baseline vs reference winrate "
+                f"{j.pairwise_baseline_vs_ref_winrate:.1%}"
+            )
+        else:
+            console.print(
+                f"  likert mean: abi={j.likert_abi.get('mean', 0):.2f} "
+                f"baseline={j.likert_baseline.get('mean', 0):.2f} "
+                f"Δ={j.likert_delta.get('mean', 0):+.2f}"
+            )
+            console.print(
+                f"  pairwise:    abi {j.pairwise_abi_wins} wins / "
+                f"{j.pairwise_baseline_wins} losses / {j.pairwise_ties} ties "
+                f"(winrate {j.pairwise_abi_winrate:.1%})"
+            )
+    if r.langfuse_dataset_run_url:
+        console.print(f"  langfuse:    {r.langfuse_dataset_run_url}")
     console.print(f"  report:      {artifacts.eval_dir / 'report.md'}")
 
 

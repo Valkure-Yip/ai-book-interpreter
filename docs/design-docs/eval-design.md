@@ -8,9 +8,33 @@
 
 ## 评测对象
 
+支持 **2-way** 与 **3-way** 两种比较：
+
 - **A 系统（ABI）**：本仓库 `abi translate` 的产物（per-paragraph `TranslationUnit`，含 confidence、flags、glossary 合规等）。
-- **B 系统（Baseline）**：把全书源文直接塞进单条 prompt，要求模型一次性输出译文。当书超出上下文窗口时，按固定大块（默认 50K input tokens / 块）顺序翻译并拼接。除分块外不做任何 ABI 风格的预处理（无 survey、无 glossary、无 sliding window、无 anchor 保留指令）。
-- **共同输入**：同一份源文件、同一个目标语言、同一个 LLM 模型（默认与 `LLM_MODEL` 一致；可通过 `--judge-model` 显式指定 judge 用更强模型）。
+- **B 系统（Baseline）**：把全书源文直接塞进单条 prompt，要求模型一次性输出译文。当书超出上下文窗口时，按固定大块（默认 50K input tokens / 块）顺序翻译并拼接。除分块外不做任何 ABI 风格的预处理。
+- **C 系统（Human Reference）**：仅当输入来自带人工参考译文的数据集（当前支持 [`google/wmt24pp`](https://huggingface.co/datasets/google/wmt24pp) literary 子集与 [`Helsinki-NLP/news_commentary`](https://huggingface.co/datasets/Helsinki-NLP/news_commentary)）时启用。
+- **共同输入**：同一份源文（来自本地文件 _或_ 数据集 spec）、同一目标语言、同一翻译模型（`LLM_MODEL`）。
+- **Judge 模型**：默认与翻译模型一致；可通过 `EVAL_JUDGE_MODEL` 环境变量或 `--judge-model` 切换为更强模型。**Judge 与 agent 共用同一 `LLM_BASE_URL` 与 `LLM_API_KEY`**，只换模型名。
+
+## 输入源
+
+| 模式 | 触发方式 | 备注 |
+| --- | --- | --- |
+| 本地文件 | `abi eval <path>` | 与 `abi translate` 相同的 ingester（txt / epub） |
+| 数据集 | `abi eval --dataset <spec>` | spec 形如 `wmt24pp:en-zh_CN:literary` 或加 `:stub=true`（本地测试） |
+
+数据集模式下，adapter 将 dataset 物化为一个临时 `.txt` 文件（每 `document_id` 一章）走标准 ingest，从而保留 1:1 段落对齐。`--auto-translate` 会在缺少 ABI run 时自动跑一次 `abi translate`。
+
+### 已接入数据集
+
+| Spec | 来源 | 语种 | 主要用途 | 段落规模 | 文档边界 |
+| --- | --- | --- | --- | --- | --- |
+| `wmt24pp:en-zh_CN:literary` | `google/wmt24pp` | en → zh_CN | 文学类（literary register）judge 校准 | ~数千 (literary subset) | 数据集自带 `document_id` |
+| `news_commentary:en-zh:academic-accessible` | `Helsinki-NLP/news_commentary` | en → zh | 学术可读类（academic-accessible register） — 经济、政治、政策类专家评论 | ~69k 行 | **启发式重建**：长度 < 90 字符且下一行 ≥ 150 字符的行视为标题，作为新文档起点 |
+
+`news_commentary` 没有原始 document boundary，启发式在 200 行随机样本上无误报；少量漏报会把两篇文章合并，对 judge 的 `coherence` 维度只产生轻微干扰。可通过 `:title_max_chars=N:body_min_chars=M` 调整阈值。
+
+通用选项：`limit_docs=N`（仅取前 N 个文档）、`stub=true`（adapter 内置的离线 fixture，供 CI 使用）。
 
 ## 维度
 
@@ -23,7 +47,7 @@
 | `anchor_preservation` | 数字、年份、专名、URL、引号内字符串保留率 | 抽取源文中的正则 anchors → 检查译文是否完整出现 |
 | `completeness` | 段落级别是否漏译 | baseline 段落与源段落对齐失败 / 译文为空 / passthrough |
 
-### LLM-as-Judge（每样本一次或两次调用）
+### LLM-as-Judge（每样本一次 likert + 一次 pairwise 调用）
 
 | 维度 | 提示 | 输出 |
 | --- | --- | --- |
@@ -31,9 +55,16 @@
 | `fluency` | "Is the translation natural and grammatical in the target language?" | Likert 1-5 |
 | `coherence` | "Does the translation read coherently in context (prev/next 2 paragraphs given)?" | Likert 1-5 |
 | `style` | "Does the translation match the expected register (academic-formal here)?" | Likert 1-5 |
-| `pairwise` | 同时给出 A、B 两条译文（**随机化 A/B 标签消除位置偏置**），要求 judge 选偏好侧并给理由 | `prefer ∈ {A, B, tie}` + 简短 rationale |
+| `pairwise` | 给出全部参与系统的译文（**随机化 A/B/C 槽位消除位置偏置**），要求 judge 选偏好侧并给理由 | 2-way: `prefer ∈ {A, B, tie}`；3-way: 三组 `{a_vs_b, a_vs_c, b_vs_c}` |
 
-Judge 在同一个 prompt 中同时打 A 和 B 两套 Likert 分数，避免分别打分时的"绝对值漂移"。Pairwise 单独一次调用，A/B 顺序随机翻转。
+Judge 在同一个 prompt 中同时给全部系统打 Likert 分数（2-way 给 A/B；3-way 给 A/B/C），避免分别打分时的"绝对值漂移"。Pairwise 单独一次调用：2-way A/B 顺序随机翻转，3-way A/B/C 槽位随机置换。
+
+Prompt 模板：
+
+- 2-way: `eval_judge_likert/v1` + `eval_judge_pairwise/v1`
+- 3-way: `eval_judge_likert_3way/v1` + `eval_judge_pairwise_3way/v1`
+
+`triple.has_reference` 决定走哪条路径。
 
 ## 采样策略
 
@@ -58,24 +89,29 @@ baseline 是单条长文本输出，需要回到与 ABI 等价的段落粒度才
 ## 流水线
 
 ```
-abi eval <source>
-    [--abi-run <run_id>|latest]   # 默认使用最近一次 run；要求 source 与 run 的 book_id 一致
+abi eval [<source>]
+    [--dataset <spec>]            # e.g. wmt24pp:en-zh_CN:literary[:stub=true]
+    [--limit-docs N]              # only first N documents of the dataset
+    [--auto-translate]            # run `abi translate` first if no ABI run exists
+    [--abi-run <run_id>|latest]   # 默认使用最近一次 run
     [--samples 30]
-    [--judge-model <name>]        # 默认与 LLM_MODEL 相同
+    [--judge-model <name>]        # CLI > EVAL_JUDGE_MODEL env > LLM_MODEL
     [--baseline-chunk-tokens 50000]
     [--skip-baseline]              # 复用已有 baseline 翻译
+    [--no-langfuse-experiment]     # 关闭 Langfuse experiment（默认开）
     [-o eval-out/]
 ```
 
 执行顺序：
 
-1. 加载 ABI run（`runs/<book_id>/<run_id>/`）→ `book`、`units`、`glossary`、`headings`
-2. 生成 baseline（若 `--skip-baseline` 且文件存在则复用）
-3. 对齐 baseline 段落 ↔ ABI 段落 ↔ source 段落
-4. 抽样
-5. 计算机械指标（ABI 全集 + baseline 全集 + 抽样集）
-6. LLM judge：每个样本一次 likert（A+B 同时打分）+ 一次 pairwise
-7. 聚合并渲染报告
+1. 解析输入：本地文件 _或_ dataset → 物化为 `.txt`（必要时 `auto_translate` 跑一次 `abi translate`）
+2. 加载 ABI run（`runs/<book_id>/<run_id>/`）→ `book`、`units`、`glossary`、`headings`
+3. 生成 baseline（若 `--skip-baseline` 且文件存在则复用）
+4. 对齐 source ↔ ABI ↔ baseline（+ reference if any）
+5. 抽样（按章节分层 + 首末段强制纳入）
+6. 计算机械指标（ABI 全集 + baseline 全集 + reference 抽样集 + 抽样 ABI/baseline）
+7. LLM judge：每个样本一次 likert（同时给 A/B 或 A/B/C 打分）+ 一次 pairwise
+8. 聚合并渲染报告；可选写入 Langfuse Experiment
 
 ## 产物布局
 
@@ -106,15 +142,30 @@ eval-out/<book_id>/<eval_id>/
 
 Eval pipeline 自身的事件用 `eval.*` 前缀（`eval.start`、`eval.baseline.start`、`eval.sample`、`eval.judge.likert`、`eval.judge.pairwise`、`eval.aggregate`、`eval.end`）。
 
+### Langfuse Experiments
+
+数据集模式下，pipeline 自动维护一个 Langfuse Dataset：
+
+| Langfuse 概念 | 对应 ABI 概念 |
+| --- | --- |
+| Dataset name | `<adapter>-<lang_pair>-<register>-v1`（可被 `--langfuse-dataset` 覆盖） |
+| Dataset item | 每个数据集段落（`paragraph_id` 为稳定哈希，多次 push 是幂等的） |
+| Dataset run id | `eval_id`（每次 `abi eval` 一个新 run） |
+| Trace | 每个抽样段落一个 trace（包含该段所有 LLM 调用） |
+| Score | 机械 + likert + pairwise + 聚合 |
+
+无 Langfuse 密钥时自动跳过；`--no-langfuse-experiment` 强制关闭。
+
 ## 安全 & 限速
 
 - Judge 调用与 baseline 翻译共用同一个 `LLMRouter`，受 `cost.hard_cap_usd` 约束。
 - 抽样默认上限 30 + 全书 baseline 拼接，预算超限时 graceful stop（已完成的样本仍写入 `samples.jsonl` 与 `judge/*.jsonl`）。
 - judge prompt 不会把"哪一侧是 ABI"信息透露给模型；A/B 标签随机化，对应关系记录在 `alignment.json` / `samples.jsonl` 内部，不出现在 prompt 中。
 
-## 不在 0.1 范围内（后续）
+## 不在当前范围（后续）
 
-- BLEU/COMET/BERTScore（需要参考译本，academic books 很少有）
-- 多 judge 投票（cost × 3）
+- 自动 BLEU/COMET/BERTScore（有 reference 时可以加，目前先靠 LLM judge）
+- 多 judge 投票（cost × N）
 - Inter-annotator agreement（需要人工 + judge 联合）
 - 翻译错误类型学（MQM）
+- 学术书完整冷启动数据集（目前仅有 WMT24++ literary 与 News-Commentary，长篇 academic books 仍需人工收集）

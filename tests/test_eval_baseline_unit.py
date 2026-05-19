@@ -58,3 +58,45 @@ class TestSaveLoad:
 
     def test_load_returns_none_when_missing(self, tmp_path: Path) -> None:
         assert load_baseline(tmp_path) is None
+
+
+class TestBaselineChunkSchema:
+    """Regression: deepseek-v4-flash and others sometimes emit ``translation``
+    or ``text`` instead of ``translated_text``. The schema must accept these
+    aliases without falling back to retry-and-pray."""
+
+    def test_canonical_field(self) -> None:
+        from abi.eval._schemas import BaselineChunkOutput
+
+        out = BaselineChunkOutput.model_validate({"translated_text": "hello"})
+        assert out.translated_text == "hello"
+
+    def test_translation_alias(self) -> None:
+        from abi.eval._schemas import BaselineChunkOutput
+
+        out = BaselineChunkOutput.model_validate({"translation": "hello"})
+        assert out.translated_text == "hello"
+
+    def test_text_alias(self) -> None:
+        from abi.eval._schemas import BaselineChunkOutput
+
+        out = BaselineChunkOutput.model_validate({"text": "hello"})
+        assert out.translated_text == "hello"
+
+    def test_output_alias(self) -> None:
+        from abi.eval._schemas import BaselineChunkOutput
+
+        out = BaselineChunkOutput.model_validate({"output": "hello"})
+        assert out.translated_text == "hello"
+
+    def test_unknown_extra_still_rejected(self) -> None:
+        """The alias should not let arbitrary extra fields through."""
+        import pytest
+        from pydantic import ValidationError
+
+        from abi.eval._schemas import BaselineChunkOutput
+
+        with pytest.raises(ValidationError):
+            BaselineChunkOutput.model_validate(
+                {"translated_text": "ok", "some_random_field": "bad"}
+            )

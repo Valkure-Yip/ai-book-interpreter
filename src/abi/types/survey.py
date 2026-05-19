@@ -30,7 +30,12 @@ class ChapterSummary(FrozenModel):
 
 
 Register = Literal[
-    "academic-formal", "academic-accessible", "popular-science", "textbook", "unknown"
+    "academic-formal",
+    "academic-accessible",
+    "popular-science",
+    "textbook",
+    "literary",
+    "unknown",
 ]
 
 

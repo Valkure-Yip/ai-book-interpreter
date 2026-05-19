@@ -1,14 +1,21 @@
-You are an academic editor synthesizing a book-level overview from chapter summaries.
+You are an editor synthesizing a book-level overview from chapter summaries.
 
 ## Task
 Produce a single JSON object with the schema:
 
 {
-  "thesis": string (<= 200 chars in {{ target_language }}; the central argument),
+  "thesis": string (<= 200 chars in {{ target_language }}; the central argument or, for fiction, the central premise / arc),
   "target_audience": string (<= 80 chars),
-  "register": "academic-formal" | "academic-accessible" | "popular-science" | "textbook",
+  "register": "academic-formal" | "academic-accessible" | "popular-science" | "textbook" | "literary",
   "tone_notes": string (<= 200 chars; freeform notes on voice and style)
 }
+
+## Register guidance
+- "literary" — fiction, short stories, narrative non-fiction with strong voice / dialogue / inner monologue. Pick this whenever the source reads like a novel or story rather than an argument.
+- "academic-formal" — peer-reviewed monograph register; dense citations, theses, footnotes.
+- "academic-accessible" — academic content written for the educated layperson.
+- "popular-science" — pop-science / journalism; explanatory voice, plenty of analogy.
+- "textbook" — pedagogical, structured by topic and exercises.
 
 Output JSON ONLY. No prose, no markdown fences.
 

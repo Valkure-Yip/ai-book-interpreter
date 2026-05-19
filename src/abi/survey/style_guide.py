@@ -29,6 +29,20 @@ _DEFAULT_DIRECTIVES_ZH = {
         "保留教材的循序渐进风格",
         "重要定义、定理、公式严格直译",
     ],
+    # Literary fiction / short stories / narrative non-fiction. The goal is a
+    # natural, expressive target text in the genre's voice — NOT an academic
+    # rewrite. Directives below were tuned against wmt24pp literary samples
+    # where the academic-formal defaults made dialogue sound like a public
+    # notice (e.g. translating "I" as 「本人」).
+    "literary": [
+        "使用文学化、有表现力的汉语，符合小说 / 叙事文体，避免学术腔与公文体",
+        "第一人称统一用「我」，禁用「本人」「鄙人」「在下」等过度正式自称",
+        "对话用中文直角引号「」或全角双引号 \u201c\u201d，遵循目标语言常见的小说排版习惯；保留原文的语气、停顿与省略号",
+        "保留人物口吻差异（粗鄙、温柔、冷漠、戏谑等）；不要把所有角色都改写成同一种文绉绉的腔调",
+        "保留比喻、意象、节奏感；不要把生动短句改写成冗长的从句",
+        "专有名词（人名、地名、虚构造词）首次出现可在括号中标注原文，之后沿用译名；保持全篇一致",
+        "不要为求行文通顺而补充原文未明示的解释、背景或心理活动",
+    ],
 }
 
 
@@ -40,7 +54,7 @@ async def derive_style_guide(
     target_language: str,
 ) -> StyleGuide:
     registry = get_registry()
-    register = style.register_override or overview.register  # type: ignore[arg-type]
+    register = style.register_override or overview.register
     prompt = registry.render(
         "style_guide_deriver",
         target_language=target_language,
@@ -77,7 +91,7 @@ async def derive_style_guide(
     return StyleGuide(
         book_id=overview.book_id,
         target_language=target_language,
-        register=register,  # type: ignore[arg-type]
+        register=register,
         register_directives=register_directives,
         forbidden_patterns=forbidden,
         preferred_patterns=preferred,

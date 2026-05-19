@@ -61,10 +61,20 @@ def _length_band(src: str, tgt: str) -> tuple[float, float]:
     return _LENGTH_RATIOS.get((src, tgt), (0.4, 2.0))
 
 
+def _pick_text(t: AlignedTriple, system: str) -> str:
+    if system == "abi":
+        return t.abi_text
+    if system == "baseline":
+        return t.baseline_text
+    if system == "reference":
+        return t.reference_text
+    raise ValueError(f"unknown system: {system!r}")
+
+
 def _glossary_compliance(
     triples: list[AlignedTriple],
     glossary: Glossary,
-    pick_abi: bool,
+    system: str,
 ) -> tuple[int, int, float]:
     """Return ``(checked, violations, score)``.
 
@@ -83,7 +93,7 @@ def _glossary_compliance(
     checked = 0
     violations = 0
     for t in triples:
-        translated = (t.abi_text if pick_abi else t.baseline_text).strip()
+        translated = _pick_text(t, system).strip()
         if not translated:
             continue
         haystack = t.source_text.lower()
@@ -104,7 +114,7 @@ def _length_ratio(
     triples: list[AlignedTriple],
     source_lang: str,
     target_lang: str,
-    pick_abi: bool,
+    system: str,
 ) -> tuple[float, float]:
     """Return ``(fraction_in_band, mean_ratio)``."""
     lo, hi = _length_band(source_lang, target_lang)
@@ -112,7 +122,7 @@ def _length_ratio(
     total = 0
     ratios: list[float] = []
     for t in triples:
-        translated = (t.abi_text if pick_abi else t.baseline_text).strip()
+        translated = _pick_text(t, system).strip()
         if not translated or not t.source_text:
             continue
         ratio = len(translated) / len(t.source_text)
@@ -127,7 +137,7 @@ def _length_ratio(
 
 def _anchor_preservation(
     triples: list[AlignedTriple],
-    pick_abi: bool,
+    system: str,
 ) -> tuple[int, float]:
     """Return ``(checked_paragraphs, score)``.
 
@@ -139,7 +149,7 @@ def _anchor_preservation(
         anchors = _extract_eval_anchors(t.source_text)
         if not anchors:
             continue
-        translated = (t.abi_text if pick_abi else t.baseline_text)
+        translated = _pick_text(t, system)
         if not translated:
             rates.append(0.0)
             continue
@@ -150,7 +160,7 @@ def _anchor_preservation(
     return len(rates), sum(rates) / len(rates)
 
 
-def _completeness(triples: list[AlignedTriple], pick_abi: bool) -> tuple[int, float]:
+def _completeness(triples: list[AlignedTriple], system: str) -> tuple[int, float]:
     """Return ``(missing_count, score)``.
 
     A paragraph is "complete" if its translation has at least a few non-space
@@ -159,13 +169,10 @@ def _completeness(triples: list[AlignedTriple], pick_abi: bool) -> tuple[int, fl
     """
     missing = 0
     for t in triples:
-        translated = (t.abi_text if pick_abi else t.baseline_text).strip()
+        translated = _pick_text(t, system).strip()
         if not translated:
             missing += 1
             continue
-        # Heuristic: if the translation is < 5% of source length, treat as
-        # truncated/missing too (catches cases where the LLM emitted "..." or
-        # an ellipsis or one stray word).
         if t.source_text and len(translated) < max(2, int(0.05 * len(t.source_text))):
             missing += 1
     score = 1.0 - missing / max(1, len(triples))
@@ -180,20 +187,21 @@ def compute_mechanical(
     target_language: str,
     system: str,
 ) -> MechanicalScore:
-    """Compute one :class:`MechanicalScore` for either ABI or baseline."""
-    pick_abi = system == "abi"
+    """Compute one :class:`MechanicalScore` for ABI / baseline / reference."""
+    if system not in ("abi", "baseline", "reference"):
+        raise ValueError(f"unknown system: {system!r}")
 
     gloss_checked, gloss_viol, gloss_score = _glossary_compliance(
-        triples, glossary, pick_abi
+        triples, glossary, system
     )
     length_ok, length_mean = _length_ratio(
-        triples, source_language, target_language, pick_abi
+        triples, source_language, target_language, system
     )
-    anchor_checked, anchor_score = _anchor_preservation(triples, pick_abi)
-    missing, completeness_score = _completeness(triples, pick_abi)
+    anchor_checked, anchor_score = _anchor_preservation(triples, system)
+    missing, completeness_score = _completeness(triples, system)
 
     return MechanicalScore(
-        system=system,  # type: ignore[arg-type]
+        system=system,
         n_paragraphs=len(triples),
         glossary_compliance=gloss_score,
         glossary_checked=gloss_checked,

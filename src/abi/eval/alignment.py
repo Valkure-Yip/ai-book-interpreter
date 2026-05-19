@@ -16,6 +16,16 @@ Strategy (in order):
 The output is a list of :class:`AlignedTriple` covering every source paragraph
 in order. When alignment is missing for an index, ``aligned=False`` and
 ``baseline_text=""``.
+
+Reference handling
+------------------
+
+When a dataset adapter (e.g. wmt24pp) supplies a per-paragraph human
+reference, ``align`` accepts an optional ``references`` list and a
+``document_ids`` list — both positional and the same length as the source
+paragraphs. Each reference is attached to its source paragraph directly;
+because the adapter already produces a 1:1 source↔reference mapping, no
+DP is needed for the reference column.
 """
 
 from __future__ import annotations
@@ -138,15 +148,31 @@ def align(
     units: dict[str, TranslationUnit],
     baseline_paragraphs: list[str],
     soft_threshold: float = 0.1,
+    references: list[str] | None = None,
+    document_ids: list[str] | None = None,
 ) -> tuple[list[AlignedTriple], AlignmentReport]:
     """Align ABI source paragraphs with baseline output paragraphs.
 
     ``soft_threshold`` is the maximum allowed |Δlen| / len(source) before we
     fall back to "failed" mode.
+
+    ``references`` and ``document_ids``, when provided, are positional —
+    ``references[i]`` is the human reference for the i-th source paragraph
+    in book order, ``document_ids[i]`` its source document. Both must match
+    ``len(source_paras)`` if non-None.
     """
     source_paras = _flat_source(book)
     n_src = len(source_paras)
     n_base = len(baseline_paragraphs)
+
+    if references is not None and len(references) != n_src:
+        raise ValueError(
+            f"references length {len(references)} != source paragraphs {n_src}"
+        )
+    if document_ids is not None and len(document_ids) != n_src:
+        raise ValueError(
+            f"document_ids length {len(document_ids)} != source paragraphs {n_src}"
+        )
 
     if n_src == 0:
         return [], AlignmentReport(
@@ -156,6 +182,7 @@ def align(
             baseline_paragraphs=n_base,
             aligned_pairs=0,
             unaligned_pairs=0,
+            reference_paragraphs=len(references) if references else 0,
         )
 
     if n_src == n_base:
@@ -173,6 +200,7 @@ def align(
 
     triples: list[AlignedTriple] = []
     aligned_count = 0
+    ref_count = 0
     for i, p in enumerate(source_paras):
         j = mapping[i] if i < len(mapping) else -1
         baseline_text = (
@@ -183,6 +211,9 @@ def align(
         aligned = baseline_text != ""
         if aligned:
             aligned_count += 1
+        ref_text = (references[i].strip() if references is not None else "")
+        if ref_text:
+            ref_count += 1
         triples.append(
             AlignedTriple(
                 paragraph_id=p.paragraph_id,
@@ -193,16 +224,20 @@ def align(
                 abi_text=_abi_text_for(p, units),
                 baseline_text=baseline_text,
                 aligned=aligned,
+                reference_text=ref_text,
+                has_reference=bool(ref_text),
+                document_id=document_ids[i] if document_ids is not None else "",
             )
         )
 
     report = AlignmentReport(
-        strategy=strategy,  # type: ignore[arg-type]
+        strategy=strategy,
         source_paragraphs=n_src,
         abi_paragraphs=len(units),
         baseline_paragraphs=n_base,
         aligned_pairs=aligned_count,
         unaligned_pairs=n_src - aligned_count,
+        reference_paragraphs=ref_count,
     )
     return triples, report
 

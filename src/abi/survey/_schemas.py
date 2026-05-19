@@ -21,7 +21,11 @@ class BookOverviewOutput(BaseModel):
     thesis: str
     target_audience: str = ""
     register: Literal[
-        "academic-formal", "academic-accessible", "popular-science", "textbook"
+        "academic-formal",
+        "academic-accessible",
+        "popular-science",
+        "textbook",
+        "literary",
     ] = "academic-formal"
     tone_notes: str = ""
 

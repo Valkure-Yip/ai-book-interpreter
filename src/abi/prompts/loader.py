@@ -24,6 +24,8 @@ DEFAULT_VERSIONS: dict[str, str] = {
     "baseline_translator": "v1",
     "eval_judge_likert": "v1",
     "eval_judge_pairwise": "v1",
+    "eval_judge_likert_3way": "v1",
+    "eval_judge_pairwise_3way": "v1",
 }
 
 

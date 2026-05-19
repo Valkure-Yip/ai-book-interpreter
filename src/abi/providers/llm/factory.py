@@ -42,7 +42,7 @@ def _build_transient_error_tuple() -> tuple[type[BaseException], ...]:
     """
     out: list[type[BaseException]] = [asyncio.TimeoutError, TimeoutError, ConnectionError]
     try:
-        import openai  # type: ignore[import-not-found]
+        import openai
 
         for name in (
             "APITimeoutError",
@@ -91,6 +91,7 @@ class LLMRouter:
         sem: asyncio.Semaphore,
     ) -> None:
         self._config = config
+        self._api_key = api_key
         self._budget = budget
         self._events = events
         self._metrics = metrics
@@ -106,6 +107,9 @@ class LLMRouter:
             timeout=config.request_timeout_s,
             max_retries=0,  # we handle retries ourselves at a coarser level
         )
+        # Cache of (model_name -> ChatOpenAI) for ``model_override`` calls,
+        # so per-call swaps don't pay reconstruction cost on every invocation.
+        self._chat_by_model: dict[str, BaseChatModel] = {config.model: self._chat}
 
     @property
     def model(self) -> str:
@@ -136,8 +140,15 @@ class LLMRouter:
         prompt_version: str = "v1",
         metadata: dict[str, Any] | None = None,
         max_retries: int = 2,
+        model_override: str | None = None,
     ) -> tuple[T, LLMResponse]:
-        """Call the model and parse output into ``schema``. Retries on parse failure."""
+        """Call the model and parse output into ``schema``. Retries on parse failure.
+
+        ``model_override``, if given, swaps the chat model's ``model`` field
+        for this call only. The base_url and API key are reused — this is
+        the path used by eval judges to point at a stronger model than the
+        translator without reconfiguring the rest of the pipeline.
+        """
         # Try built-in structured output first, fall back to JSON mode + manual parse.
         last_err: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -145,6 +156,7 @@ class LLMRouter:
                 parsed, resp = await self._call_with_schema(
                     schema, messages, agent_name=agent_name,
                     prompt_version=prompt_version, metadata=metadata, attempt=attempt,
+                    model_override=model_override,
                 )
                 return parsed, resp
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
@@ -167,6 +179,25 @@ class LLMRouter:
         )
         raise last_err
 
+    def _chat_for(self, model_override: str | None) -> BaseChatModel:
+        """Return a chat model bound to ``model_override`` or the default."""
+        if model_override is None or model_override == self._config.model:
+            return self._chat
+        cached = self._chat_by_model.get(model_override)
+        if cached is not None:
+            return cached
+        chat = ChatOpenAI(
+            base_url=self._config.base_url,
+            api_key=self._api_key,
+            model=model_override,
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_output_tokens,
+            timeout=self._config.request_timeout_s,
+            max_retries=0,
+        )
+        self._chat_by_model[model_override] = chat
+        return chat
+
     async def _call_with_schema(
         self,
         schema: type[T],
@@ -176,11 +207,14 @@ class LLMRouter:
         prompt_version: str,
         metadata: dict[str, Any] | None,
         attempt: int,
+        model_override: str | None = None,
     ) -> tuple[T, LLMResponse]:
+        active_model = model_override or self._config.model
+        chat = self._chat_for(model_override)
         # Pre-flight budget check (cheap estimate based on input length).
         est_in = self._estimate_tokens(messages)
         est_cost = estimate_cost_usd(
-            self._config.model, tokens_in=est_in, tokens_out=self._config.max_output_tokens
+            active_model, tokens_in=est_in, tokens_out=self._config.max_output_tokens
         )
         self._budget.admit(est_cost)
 
@@ -191,7 +225,7 @@ class LLMRouter:
         # Wrap with ``with_retry`` so transient infra errors (timeout / 5xx / rate-limit)
         # are retried with exponential backoff before bubbling up. Parse failures are
         # handled by the outer ``invoke_structured`` loop instead, on different criteria.
-        structured = self._chat.with_structured_output(schema, method="json_mode").with_retry(
+        structured = chat.with_structured_output(schema, method="json_mode").with_retry(
             retry_if_exception_type=_TRANSIENT_LLM_ERRORS,
             wait_exponential_jitter=True,
             stop_after_attempt=3,
@@ -228,7 +262,7 @@ class LLMRouter:
         tokens_in = est_in
         tokens_out = max(50, self._estimate_text_tokens(str(result.model_dump())))
         cost = estimate_cost_usd(
-            self._config.model, tokens_in=tokens_in, tokens_out=tokens_out
+            active_model, tokens_in=tokens_in, tokens_out=tokens_out
         )
         self._budget.record(cost)
         self._metrics.record_llm_call(
@@ -239,6 +273,7 @@ class LLMRouter:
             agent=agent_name,
             prompt_version=prompt_version,
             prompt_hash=prompt_hash,
+            model=active_model,
             tokens={"input": tokens_in, "output": tokens_out},
             cost_usd=round(cost, 6),
             latency_ms=latency_ms,
