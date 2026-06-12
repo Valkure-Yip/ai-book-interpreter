@@ -1,0 +1,28 @@
+# Stage 05 — A/B/C/D pretranslation trials (GATE)
+
+Read `metadata/book_specific_translation_research.md` and `metadata/style_profile.md`.
+Follow `skills/expert-translation-quality/SKILL.md`.
+
+Pick 3-5 representative source passages (per the sample plan). For each, write
+`qa/pretranslation/source_NN.md` (the passage) and `qa/pretranslation/trial_NN.md`
+containing:
+1. source text
+2. function/intent of the passage
+3. literal-translation risks
+4. key term choices
+5. variant A — faithful
+6. variant B — readable {{ target_lang }}
+7. variant C — literary polish
+8. variant D — final candidate
+9. why D is best for the body
+10. PASS or FAIL
+
+Then write `qa/pretranslation/pretranslation_report.md` with an overall
+conclusion line `result: PASS` or `result: FAIL`, and refine `style_profile.md`
+with anything learned.
+
+Gate: call `record_gate('pretranslation', 'PASS')` ONLY if the report concludes
+PASS, then `set_state` -> `PRETRANSLATION_PASS`. If FAIL, record the gate as FAIL,
+revise the trials, and retry — do NOT proceed to translation.
+
+Exit condition: report concludes PASS, gate recorded PASS, state PRETRANSLATION_PASS.

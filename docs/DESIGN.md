@@ -10,15 +10,22 @@
 ### 规则 D1: 单向依赖
 
 ```
-types → config → ir → survey → translate → assemble → runtime → cli
-providers ← 任何业务层（但 providers 不依赖业务）
+types → config → ir → project → epub → qa → release → tools → stages → orchestrator → cli
+providers (llm, agent_runtime, observability) ← 任何业务层（但 providers 不依赖业务）
 ```
+
+- `project`：书籍工程目录合约 + `pipeline_state.json` 状态机（替代旧 `runs/<book_id>/<run_id>` 布局）。
+- `epub` / `qa` / `release`：确定性产物层（EPUB 构建、出版 lint、随机抽检、版本发布），不调用 LLM，只被 `tools` 调用。
+- `tools`：暴露给 agent 的工具带（文件读写、ingest、门禁脚本、子 agent），是业务确定性层与 agent 运行时之间的唯一桥梁。
+- `stages`：00→19 各阶段的 agent 调用 + 确定性门禁校验。
+- `orchestrator`：驱动 28 态状态机，按阶段顺序自循环到 `DONE`。
 
 **Lint**：`tools/lint/layered_imports.py` 解析 import 图，违反时报错并指出修复方法。
 
 ### 规则 D2: 业务层不直接 import SDK
 
-`openai`, `anthropic`, `ebooklib`, `fitz` 等只能在 `src/providers/**` 中 import。
+`openai`, `anthropic`, `ebooklib`, `fitz`, `langchain*`, `langgraph*`, `langfuse*` 等只能在 `src/abi/providers/**` 中 import。
+其中 agent 运行时（LangGraph tool-calling loop）集中在 `providers/agent_runtime`；业务层只通过 `providers.llm` 的 `LLMRouter` 或 `providers.agent_runtime` 的 agent 接口触达模型，所有 LLM 调用因此自动接入 Langfuse trace + `events.jsonl` + `BudgetGate` 成本上限。
 
 **Lint**：`tools/lint/no_direct_sdk.py`，白名单驱动。
 
@@ -85,31 +92,31 @@ log.event("paragraph.translated", paragraph_id=pid, tokens=tu, cost_usd=c)
 
 ## 5. Prompt 工程
 
-### 规则 D10: Prompt 有版本
+### 规则 D10: 阶段提示集中且参数化
 
-`src/prompts/<agent>/v<N>.j2` + `current` 符号链接。
-没有 `current` 链接的 agent 目录视为损坏。
+00→19 阶段提示位于 `src/abi/prompts/stages/*.md.j2`，由 `src/abi/prompts/stages.py` 的
+`STAGE_SEQUENCE` 绑定到状态、门禁、工具子集与迭代上限，并以 `{source}-{target}` /
+`{target}` 参数化。全局编排守则（含 forbidden 列表）在 `_system.md.j2`。
 
-### 规则 D11: Prompt 渲染测试
+### 规则 D11: 阶段链可渲染
 
-每个 agent 至少 3 个 fixture 测试 prompt 渲染输出字节级稳定。
-**Test**：`tests/prompts/test_render.py`。
+每个 `StageSpec` 的模板必须能用标准上下文变量渲染（CI 中遍历 `STAGE_SEQUENCE` 渲染断言）。
 
 ## 6. 输出与装配
 
-### 规则 D12: 装配前 lint
+### 规则 D12: 构建前门禁
 
-Pass 3 前必须通过：
-- `glossary_lint`：所有 source 中出现的 locked term 在译文中按 `target` 出现
-- `anchor_lint`：所有 anchor 解析成功
-- `markdown_lint`：`markdown-it` 解析无错
-- `mermaid_lint`：mermaid 代码块语法正确
+全书 EPUB 构建前必须通过确定性门禁（`src/abi/epub/`）：
+- `publication_lint`：无本机绝对路径 / mojibake / BOM、围栏配平、目标语言排版基本检查
+- `asset_manifest_check`：所有被引用图片均为本地且存在
+- `epubcheck`：EPUBCheck（Java jar）无 fatal / error
 
-违反 lint 时仍可产出 `*.draft.md`（用于调试），但**不**产出非 draft 版本。
+任一 FAIL 即阻断；门禁结果写入 `output/*.json`，由 stage validator 复核。
 
-### 规则 D13: 段落-译文对应完整
+### 规则 D13: 章节-译文对应完整
 
-每个源段落要么有 `TranslationUnit`，要么有显式 `SkipRecord`。装配时缺一即失败。
+`chapters/src/` 中每个章节都必须在 `chapters/translated/` 有对应译文，并在章节门禁
+PASS 后进入 `chapters/final/`；缺一即 stage validator 失败，不得进入构建。
 
 ## 7. 文档与代码同步
 

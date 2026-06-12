@@ -22,7 +22,17 @@ htmlcov/
 
 .specstory/
 
-# project artifacts
+# generated book projects (agent runtime output)
+# private-use books are copyrighted/source-bearing and must NEVER be committed
+books/private/
+# generated per-book artifacts under any book project (keep scaffolding scripts/templates)
+books/**/source/
+books/**/output/
+books/**/events.jsonl
+books/**/metrics.json
+books/**/state/run.log
+
+# legacy artifact dirs (pre-agentic pipeline)
 runs/
 out/
 eval-out/

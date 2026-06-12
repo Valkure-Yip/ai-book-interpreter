@@ -1,0 +1,16 @@
+# Stage 15 — Full EPUB build (GATE)
+
+Build the full book only after the sample PASSed.
+
+1. Call `publication_lint`. If FAIL, fix the flagged files in chapters/final/,
+   frontmatter, or metadata, and re-run until PASS.
+2. Call `asset_manifest_check`. Fix any missing/absolute asset references; re-run
+   until PASS.
+3. Call `build_epub` to produce `output/book.epub` from chapters/final/.
+4. Call `epubcheck` on `output/book.epub`. Fix any fatal/error and rebuild.
+
+When publication lint + asset manifest + EPUBCheck all pass and `output/book.epub`
+exists, call `record_gate('epub_build', 'PASS')` then `set_state` -> `EPUB_BUILT`,
+step `15_full_book_production`.
+
+Exit condition: output/book.epub exists; lint + assets + EPUBCheck all clean.

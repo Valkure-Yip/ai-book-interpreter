@@ -1,7 +1,7 @@
 [project]
 name = "ai-book-interpreter"
-version = "0.1.0"
-description = "An AI agent that translates academic books with sliding-window context and term locking."
+version = "0.2.0"
+description = "A self-contained autonomous agent that translates public-domain books into versioned, quality-gated EPUBs."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -12,6 +12,7 @@ dependencies = [
   "langchain>=0.3,<0.4",
   "langchain-openai>=0.2,<0.3",
   "langchain-core>=0.3,<0.4",
+  "langgraph>=0.2,<1",
   "langfuse>=2.50,<3",
   "typer>=0.12,<1",
   "rich>=13,<14",
@@ -29,6 +30,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# EPUBCheck is a Java tool. This extra installs the PyPI wrapper that bundles
+# the jar, but a JRE (``java`` on PATH) is still required at runtime. The
+# epubcheck gate also accepts a standalone jar via ``ABI_EPUBCHECK_JAR`` or an
+# ``epubcheck`` CLI on PATH.
+epub = ["epubcheck>=5,<6"]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",

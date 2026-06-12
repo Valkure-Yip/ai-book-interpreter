@@ -7,7 +7,9 @@
 
 ## 项目一句话
 
-输入学术书籍（txt/epub/pdf），输出 Markdown 译本 + 可选的章节摘要、思维导图。三遍流水线：**survey → translate → assemble**。
+一个**自包含的自主翻译 agent**：输入公版书（txt/epub），按编号阶段提示 `00→19` 驱动
+**28 态状态机**，调用工具、自循环过质量门禁，输出版本化、经质量门禁的 EPUB 译本。
+（这是 `public-domain-books-translation` 工作流的进程内独立 agent 化实现。）
 
 ## 仓库布局
 
@@ -36,27 +38,27 @@ ai-book-interpreter/
 | 我想…… | 去看…… |
 | --- | --- |
 | 理解整体架构与分层 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) |
-| 看 v0.1 用了什么框架/库（LangChain、Langfuse、OpenAI-compatible） | [`docs/design-docs/tech-stack.md`](./docs/design-docs/tech-stack.md) |
-| 理解三遍流水线 | [`docs/design-docs/pipeline.md`](./docs/design-docs/pipeline.md) |
-| 理解滑动窗口上下文 | [`docs/design-docs/sliding-window.md`](./docs/design-docs/sliding-window.md) |
-| 看数据结构（Book IR） | [`docs/design-docs/data-model.md`](./docs/design-docs/data-model.md) |
-| 看翻译智能体如何工作 | [`docs/design-docs/agent-architecture.md`](./docs/design-docs/agent-architecture.md) |
-| 加一种输入/输出格式 | [`docs/product-specs/io-formats.md`](./docs/product-specs/io-formats.md) |
-| 接入新的 OpenAI 兼容端点 | [`docs/design-docs/tech-stack.md`](./docs/design-docs/tech-stack.md#2-为什么用-openai-compatible-统一接入) |
-| 加一个非兼容的 LLM provider | [`docs/design-docs/agent-architecture.md`](./docs/design-docs/agent-architecture.md#provider-接口) |
-| 改 CLI 命令或参数 | [`docs/product-specs/cli-and-config.md`](./docs/product-specs/cli-and-config.md) |
-| 检查/调整质量评分逻辑 | [`docs/QUALITY_SCORE.md`](./docs/QUALITY_SCORE.md) |
-| 处理重试、限流、断点 | [`docs/RELIABILITY.md`](./docs/RELIABILITY.md) |
+| 看强制不变量与分层规则 | [`docs/DESIGN.md`](./docs/DESIGN.md) |
+| 理解 28 态状态机与阶段链 | `src/abi/project/state.py` + `src/abi/prompts/stages.py` |
+| 看阶段提示（00→19） | `src/abi/prompts/stages/*.md.j2` |
+| 看 agent 工具带 | `src/abi/tools/` |
+| 看 agent 运行时（LangGraph） | `src/abi/providers/agent_runtime/` |
+| 看 EPUB 构建 / 门禁 | `src/abi/epub/` |
+| 看随机抽检 / 卓越线 | `src/abi/qa/` + `src/abi/assets/references/stratified_random_spotcheck.md` |
+| 看版本化发布 / 私人自用 | `src/abi/release/` + `src/abi/assets/references/release_versioning.md` |
+| 改 CLI 命令或参数 | `src/abi/cli/main.py` |
+| 处理重试、限流、断点 | [`docs/RELIABILITY.md`](./docs/RELIABILITY.md) + `state/pipeline_state.json` |
 | 现在该干什么？ | [`docs/exec-plans/active/`](./docs/exec-plans/active/) |
 
 ## 核心不变量（违反就是 bug，由 linter 强制）
 
-1. **分层依赖单向**：`types → config → ir → survey → translate → assemble → runtime → cli`，横切只能走 `providers`。详见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
+1. **分层依赖单向**：`types → config → ir → project → epub → qa → release → tools → stages → orchestrator → cli`，横切只能走 `providers`。详见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
 2. **边界处解析数据形状**：所有外部输入（LLM 响应、文件、CLI 参数）必须用 `pydantic` 在边界处解析为强类型，不允许 dict 透传。
-3. **段落 ID 稳定**：段落 ID = `sha1(normalize(content))[:12] + position_suffix`，**纯函数**，不随运行变化。
-4. **LLM 调用必须可观测**：所有 LLM 调用走 `providers.llm.get_chat_model()`，自动接入 Langfuse trace + 本地 `events.jsonl`，自动累计 token/cost。业务层禁止直接构造 `ChatOpenAI` 或 import `langchain*` / `langfuse*`（lint 强制）。
-5. **结构化日志**：禁止 `print` / 裸 `logging.info(str)`；必须 `log.event("name", **fields)`。
-6. **段落-译文一一对应**：Pass 3 装配时，源 IR 中每个 `paragraph_id` 都必须有对应译文或显式的"跳过"记录。
+3. **状态机是唯一真相**：流程进度只由 `state/pipeline_state.json`（28 态）决定；门禁结果由确定性 validator 判定，agent 不得自行宣布 PASS。
+4. **LLM 调用必须可观测**：所有 LLM 调用（含子 agent）走 `providers.llm` 的 `LLMRouter` 或 `providers.agent_runtime` 的 `AgentRuntime`，自动接入 Langfuse trace + `events.jsonl` + `BudgetGate`。业务层禁止直接 import `langchain*` / `langgraph*` / `langfuse*`。
+5. **结构化日志**：禁止 `print` / 裸 `logging.info(str)`；事件走 `events.jsonl`。
+6. **翻译调用精简**：每章翻译只喂原文 + 5-8 条文体规则 + 命中术语，只输出译文；不混入 QA / EPUB / release 规则。
+7. **不写回模板/原文**：`src/abi/assets/` 是模板源；具体书籍产物只写入书籍工程目录。
 
 ## 工作风格
 

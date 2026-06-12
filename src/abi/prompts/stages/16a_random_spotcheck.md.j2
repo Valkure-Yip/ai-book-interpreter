@@ -1,0 +1,28 @@
+# Stage 16a — Stratified random spot-check (GATE)
+
+Read `references/stratified_random_spotcheck.md`.
+
+1. Call `select_random_review_passages` (agents=2). It creates a new
+   `reviews/random_spotcheck/round_XXX/` with a seed, manifest, strata, and
+   per-agent stratified samples (paragraph/table/figure/formula/caption_note).
+2. For each of the two agents, call `spawn_review_agent` with an isolated
+   instruction telling it which `round_XXX/samples/agent_X/samples.md` to review,
+   to score every sample 0-100 with problem type/priority/rework, to write its
+   prose review to `round_XXX/reviews/agent_X_review.md`, AND to write a
+   machine-readable `round_XXX/reviews/agent_X_summary.json`:
+   `{"average_score": .., "lowest_score": .., "open_p0_p1_p2": 0, "confidence": 0.0-1.0,
+   "samples": [{"unit_id": "..", "score": .., "priority": "", "rework": false}]}`.
+   The two agents must not see each other.
+3. If any issue is found, treat it as a defect family: do a book-wide similar-issue
+   audit (low-token first: grep, glossary, forbidden renderings), fix all hits,
+   and record it in `round_XXX/fixes/fix_log.md` +
+   `round_XXX/verification/closure_check.md` (including the skill backfill fields).
+   Then rebuild and resample with a NEW seed.
+4. Call `validate_random_spotcheck(require_pass=true)`. It enforces
+   release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
+
+On validator PASS, call `record_gate('random_spotcheck', 'PASS')` then `set_state`
+-> `RANDOM_SPOTCHECK_PASS`, step `16a_stratified_random_spotcheck`. On FAIL, fix
+and loop.
+
+Exit condition: validator PASS, gate + state set.

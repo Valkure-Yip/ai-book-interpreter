@@ -1,0 +1,16 @@
+# Stage 16 — Independent dual review (GATE)
+
+Spawn two independent reviewers over the finished book (separate from 16a):
+- `spawn_review_agent('agent_a', ...)`: translation & content review -> writes
+  `reviews/agent_a/review.md` with per-area scores and a final PASS/FAIL.
+- `spawn_review_agent('agent_b', ...)`: EPUB engineering & typography review ->
+  writes `reviews/agent_b/review.md` with scores and PASS/FAIL.
+
+If either FAILs, write `reviews/revision_route.md` routing the problem to the
+correct earlier stage, fix, and re-review. Do not explain-away findings.
+
+When both reviews exist and conclude PASS, call
+`record_gate('independent_review', 'PASS')` then `set_state` ->
+`INDEPENDENT_REVIEW_PASS`, step `16_independent_review_agents`.
+
+Exit condition: both reviews PASS; gate + state set.

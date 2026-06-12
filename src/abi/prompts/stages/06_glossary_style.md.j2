@@ -1,0 +1,19 @@
+# Stage 06 — Glossary + style guide
+
+Build the persistent cross-chapter artifacts that replace any sliding-window
+context.
+
+Tasks:
+1. Write `glossary/terms.csv` with a header row and one row per term:
+   `term,target,status,display_policy,forbidden_body_renderings,note`
+   - `status` is one of: locked | preferred | avoid | note_only
+   - `forbidden_body_renderings` lists renderings that must NOT appear in body
+     text (e.g. raw source-term parentheses), separated by `;`
+   Seed it from the trial term choices and a skim of `source/source_text.txt`.
+2. Write `glossary/style_guide.md`: the finalized, concrete style rules (derived
+   from `metadata/style_profile.md` + trials) that reviewers will enforce.
+
+Then `set_state` -> `GLOSSARY_STYLE_DONE`, step `06_glossary_style`.
+
+Exit condition: `glossary/terms.csv` (with header + rows) and
+`glossary/style_guide.md` exist; state is GLOSSARY_STYLE_DONE.

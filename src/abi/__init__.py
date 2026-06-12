@@ -1,4 +1,5 @@
-"""AI Book Interpreter — translate academic books with sliding-window context."""
+"""AI Book Interpreter — a self-contained autonomous agent that translates
+public-domain books into versioned, quality-gated EPUBs."""
 
 from __future__ import annotations
 
@@ -14,4 +15,4 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

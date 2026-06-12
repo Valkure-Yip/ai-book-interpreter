@@ -1,0 +1,32 @@
+# Stage 08a — Per-chapter post-translation control (GATE)
+
+Follow `skills/expert-translation-quality/SKILL.md` and
+`skills/translation-quality-defect-families/SKILL.md`.
+
+For EACH translated chapter, run a FULL-CHAPTER (not sampled) post-translation
+control and write `qa/chapter_controls/{NNN_slug}.control.md`. The check must cover
+body text, notes, terminology, reader-facing wording, readability, polish,
+plain-language clarity (without flattening specialist quality), title handling,
+and text interfaces for any figures/tables/formulas/images.
+
+Include a Chinese-only readability pass (read the translation without the source
+first). Fix any issue found IN the translated chapter file, then append a fresh
+recheck round. A round where issues were fixed is `FIXED_RECHECK_REQUIRED`, not PASS.
+
+Each control file's latest round must end with these machine-readable fields:
+```
+scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+```
+
+When every translated chapter has a zero-issue PASS control file, call
+`record_gate('chapter_controls', 'PASS')` then `set_state` ->
+`CHAPTER_POST_CONTROL_PASS`, step `08a_chapter_post_translation_control`.
+
+Exit condition: all control files are zero-issue PASS; gate + state set.

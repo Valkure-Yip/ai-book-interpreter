@@ -1,0 +1,20 @@
+# Stage 13 — Preproduction stage 1 spec
+
+Read `references/epub_assets_figures_tables.md`, `references/chapter_title_policy.md`,
+and (for cover/frontmatter) any private_use overlay references if present.
+
+Write `preproduction/stage1/production_spec.md` covering:
+- cover plan (producer line: `LifeBook 书坊 译制`, or the private-use producer line
+  if `publication_mode=private_use`)
+- book-info / frontmatter page plan
+- fonts, headings hierarchy, body typography
+- figures/tables handling and asset inventory
+- OPF metadata (title, author, language={{ target_lang }}, identifier, rights)
+- chapter navigation labels (short nav titles per the title policy)
+
+Also write `frontmatter/` pages (e.g. title page, translator note) as needed and
+fill `metadata/book.yaml` completely.
+
+Then `set_state` -> `PREPRODUCTION_SPEC_DONE`, step `13_preproduction_stage1_spec`.
+
+Exit condition: `preproduction/stage1/production_spec.md` exists; book.yaml complete.

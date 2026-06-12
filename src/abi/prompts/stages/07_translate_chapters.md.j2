@@ -1,0 +1,21 @@
+# Stage 07 — Translate chapters (slim calls)
+
+Translate every `chapters/src/{NNN_slug}.md` into `chapters/translated/{NNN_slug}.md`.
+
+For each not-yet-translated chapter, in order:
+1. Read the source chapter.
+2. Build a SLIM translation context: the source passage (chapter or block group),
+   the top 5-8 rules from `glossary/style_guide.md`, and ONLY the glossary terms
+   actually hit in this chapter (grep `glossary/terms.csv` against the source).
+   Do NOT load the whole glossary, full skills, or any EPUB/release rules.
+3. Produce natural, faithful {{ target_lang }} prose. Output translation ONLY —
+   no QA notes, no explanations, no source-term parentheses for ordinary nouns.
+4. Write `chapters/translated/{NNN_slug}.md`.
+
+Process chapters one at a time. Use `glob chapters/src/*.md` and
+`glob chapters/translated/*.md` to track progress.
+
+When all chapters in `chapters/src/` have a counterpart in `chapters/translated/`,
+call `set_state` -> `TRANSLATED`, step `07_translate_chapters`.
+
+Exit condition: every source chapter has a translated counterpart; state TRANSLATED.

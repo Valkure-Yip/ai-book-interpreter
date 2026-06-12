@@ -1,0 +1,17 @@
+# Stage 14 — Sample EPUB (GATE)
+
+Build a sample-chapter EPUB and validate it before the full book.
+
+1. Choose at least one representative chapter (if the book has figures/tables,
+   include a chapter that has them).
+2. Call `build_sample_epub` with the chosen `chapter_slugs`.
+3. Call `epubcheck` on `preproduction/stage2_sample/sample_book.epub`.
+4. Write `preproduction/stage2_sample/sample_review.md` with a checklist
+   (EPUBCheck result, cover, fonts, figure/table handling, nav labels) and a final
+   `sample_review_status: PASS` or `FAIL`.
+
+If anything FAILs, fix the spec/frontmatter/assets and rebuild. On PASS, call
+`record_gate('sample', 'PASS')` then `set_state` -> `PREPRODUCTION_SAMPLE_PASS`,
+step `14_preproduction_stage2_sample`.
+
+Exit condition: sample EPUB built, EPUBCheck clean, sample_review_status PASS.

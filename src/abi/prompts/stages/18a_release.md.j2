@@ -1,0 +1,18 @@
+# Stage 18a — Versioned release (GATE)
+
+Read `references/release_versioning.md`.
+
+Call `create_release`. It refuses unless the latest random spot-check validation
+PASSed, then writes (for public_domain/licensed) `output/release/{title}_vX.X.X.epub`,
+`release_notes.md`, `release_state.json`, `release_index.md` — or, for
+`private_use`, the equivalents under `output/private_artifacts/`.
+
+After it succeeds, open the produced release notes and ensure the top (newest)
+entry records: reason, issues, fixes, QA evidence (spot-check round,
+release_confidence, EPUBCheck, publication lint), risks, and next iteration.
+
+On success, call `record_gate('release', 'PASS')` then `set_state` ->
+`RELEASE_PASS`, step `18a_release_versioning`.
+
+Exit condition: versioned artifact + notes + state.json (latest_status==PASS) exist;
+gate + state set.

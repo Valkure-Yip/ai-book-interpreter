@@ -43,7 +43,7 @@ def _is_non_content_heading(heading: str) -> bool:
 
 
 def is_non_content_heading(heading: str) -> bool:
-    """Public alias used by :mod:`abi.survey.toc_refiner` for post-LLM filtering."""
+    """True for top-level scaffolding headings (Index, Guide, etc.) to drop."""
     return re.sub(r"\s+", " ", heading.strip().lower()) in _NON_CONTENT_TOP_LEVEL_HEADINGS
 
 

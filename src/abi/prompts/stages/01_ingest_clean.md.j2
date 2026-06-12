@@ -1,0 +1,18 @@
+# Stage 01 — Ingest & clean
+
+The raw source is already placed at `source/source_text_raw.txt` (or an `.epub`
+under `source/`).
+
+Tasks:
+1. Call `ingest_source` to parse it into `source/source_text.txt` and
+   `source/source_manifest.json`.
+2. Read `source/source_manifest.json`. Fill in `metadata/book.yaml` (title,
+   authors, language, identifier) from the detected metadata.
+3. Complete `metadata/rights_checklist.md`: set `publication_mode={{ publication_mode }}`
+   and a status. For public_domain/licensed you must record source evidence in
+   `metadata/source_evidence.md`. If rights are unclear, set status `BLOCKED` and
+   stop.
+
+Exit condition: `source/source_text.txt` + `source/source_manifest.json` exist and
+`metadata/rights_checklist.md` status is a PASS (PUBLICATION_PASS / LICENSED_PASS /
+PRIVATE_USE_PASS). `ingest_source` already advances state to SOURCE_INGESTED.

@@ -1,5 +1,15 @@
-"""Versioned Jinja prompt templates. Loaded by name + version."""
+"""Staged prompt chain (00->19) for the agentic pipeline."""
 
-from abi.prompts.loader import PromptRegistry, get_registry
+from abi.prompts.stages import (
+    STAGE_SEQUENCE,
+    StagePromptRegistry,
+    StageSpec,
+    get_stage_registry,
+)
 
-__all__ = ["PromptRegistry", "get_registry"]
+__all__ = [
+    "STAGE_SEQUENCE",
+    "StagePromptRegistry",
+    "StageSpec",
+    "get_stage_registry",
+]

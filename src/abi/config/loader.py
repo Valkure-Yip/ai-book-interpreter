@@ -11,6 +11,36 @@ import yaml
 from abi.types.run import RunConfig
 
 
+def load_dotenv(paths: list[Path] | None = None) -> list[Path]:
+    """Load ``.env`` files into ``os.environ`` (without overriding existing vars).
+
+    Looks at ``./.env`` and the repo-root ``.env`` by default. Minimal parser:
+    ``KEY=VALUE`` lines, ``#`` comments, optional surrounding quotes. Returns the
+    files that were loaded so the CLI can report them.
+    """
+    if paths is None:
+        cwd = Path.cwd()
+        paths = [cwd / ".env"]
+        repo_env = Path(__file__).resolve().parents[3] / ".env"
+        if repo_env not in paths:
+            paths.append(repo_env)
+    loaded: list[Path] = []
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        loaded.append(path)
+    return loaded
+
+
 def load_yaml_config(path: Path | None) -> dict[str, Any]:
     if path is None or not path.exists():
         return {}
@@ -46,10 +76,9 @@ def _env_int(name: str) -> int | None:
 def _env_overrides() -> dict[str, Any]:
     """Map well-known environment variables into config keys.
 
-    Tuning knobs:
-        ABI_WINDOW_BEFORE / ABI_WINDOW_AFTER : sliding-window paragraph counts
-        ABI_BATCH_SIZE                       : paragraphs per LLM call (1 = legacy)
-        ABI_CONCURRENCY                      : top-level task concurrency
+    Endpoint:      LLM_BASE_URL, LLM_MODEL
+    Observability: LANGFUSE_HOST, LANGFUSE_FULL_PAYLOAD
+    Tuning:        ABI_MAX_CONCURRENCY, ABI_MAX_STAGE_ATTEMPTS
     """
     out: dict[str, Any] = {}
     if base := os.environ.get("LLM_BASE_URL"):
@@ -61,18 +90,10 @@ def _env_overrides() -> dict[str, Any]:
     if os.environ.get("LANGFUSE_FULL_PAYLOAD") == "1":
         out.setdefault("langfuse", {})["upload_full_payload"] = True
 
-    if (n := _env_int("ABI_WINDOW_BEFORE")) is not None:
-        out.setdefault("window", {})["before"] = n
-    if (n := _env_int("ABI_WINDOW_AFTER")) is not None:
-        out.setdefault("window", {})["after"] = n
-    if (n := _env_int("ABI_SHORT_CHAPTER_THRESHOLD")) is not None:
-        out.setdefault("window", {})["short_chapter_threshold"] = n
-    if (n := _env_int("ABI_BATCH_SIZE")) is not None and n >= 1:
-        out["batch_size"] = n
-    if (n := _env_int("ABI_CONCURRENCY")) is not None and n >= 1:
-        out["concurrency"] = n
-    if (flag := os.environ.get("ABI_TOC_REFINE")) is not None and flag != "":
-        out["refine_toc"] = flag not in {"0", "false", "False", "no", "off"}
+    if (n := _env_int("ABI_MAX_CONCURRENCY")) is not None and n >= 1:
+        out.setdefault("llm", {})["max_concurrency"] = n
+    if (n := _env_int("ABI_MAX_STAGE_ATTEMPTS")) is not None and n >= 1:
+        out["max_stage_attempts"] = n
     return out
 
 
