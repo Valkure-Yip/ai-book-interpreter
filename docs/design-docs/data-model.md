@@ -202,7 +202,7 @@ class TranslationUnit(BaseModel):
     latency_ms: int
     retries: int
 
-    context_window: ContextWindowMeta  # 见 sliding-window.md
+    context_window: ContextWindowMeta  # v0.1 字段；v0.2 由 providers 记录
     created_at: datetime
 
 class TermUsage(BaseModel):

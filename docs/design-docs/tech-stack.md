@@ -229,9 +229,9 @@ LangChain 在 0.3 之后 LCEL API 稳定；pin 到 0.3.x 兼容范围。
 
 | 已有文档 | 本文件如何影响它 |
 |---|---|
-| `agent-architecture.md` §2 Provider 接口 | v0.1 实现具体化：`LLMClient` = `langchain.BaseChatModel`；`ChatResponse` = LangChain 的 `AIMessage` + 解析后的 pydantic 实例 |
-| `RELIABILITY.md` §2 重试 | tenacity 替换为 `Runnable.with_retry`；业务语义重试（带错误反馈）仍走 RevisionTranslator |
+| `agentic-pipeline.md` §1 providers | `LLMClient` = `langchain.BaseChatModel`；`ChatResponse` = LangChain 的 `AIMessage` + 解析后的 pydantic 实例 |
+| `RELIABILITY.md` §2 重试 | tenacity 替换为 `Runnable.with_retry`；业务语义重试（带错误反馈）走阶段 runner 的校验回灌 |
 | `RELIABILITY.md` §7 可观测性 | events.jsonl 仍主导业务事件；LLM 链路改由 Langfuse 提供 |
-| `agent-architecture.md` §3 Prompt 工程 | 本地 Jinja2 仍是真相源；Langfuse Prompt Mgmt 是可选镜像（同步推送） |
+| `agentic-pipeline.md` §3 Prompt 设计 | 本地 Jinja2 仍是真相源；Langfuse Prompt Mgmt 是可选镜像（同步推送） |
 | `SECURITY.md` §1 API key | 新增"Langfuse keys 也走 env，绝不入仓" |
 | `product-specs/cli-and-config.md` | provider 列表收敛为"OpenAI-compatible"；增加 `LLM_BASE_URL` 环境变量与 `--base-url` flag |

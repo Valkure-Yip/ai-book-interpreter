@@ -155,8 +155,8 @@ CI 中跑 `tools/codegen/dump_*.py`，diff 非空即失败。
 
 ### 规则 D20: Token 预算有上限
 
-任何 LLM 调用前必须经过 token 估算 + 预算 gate。
-超预算时按 `sliding-window.md` 的 trim_order 裁剪，仍超则 raise。
+任何 LLM 调用前必须经过 token 估算 + 预算 gate（`providers/llm/budget.py` 的 `BudgetGate`）。
+超预算时按 gate 的裁剪/降级策略处理，仍超则 raise。
 
 ### 规则 D21: 成本 hard cap 默认开启
 
