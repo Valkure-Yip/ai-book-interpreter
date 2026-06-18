@@ -5,6 +5,7 @@
 | 文档 | 一句话定位 | 前置 |
 | --- | --- | --- |
 | [`agentic-pipeline.md`](./agentic-pipeline.md) | **权威总览**：架构图 + 28 态流程图 + prompt/翻译方法论 | core-beliefs, tech-stack |
+| [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md) | LangGraph ReAct 单元如何组建 28 态流水线 + 三层持久化（checkpointer/store 取舍） | agentic-pipeline, tech-stack |
 | [`core-beliefs.md`](./core-beliefs.md) | 项目设计哲学，影响所有取舍 | 无 |
 | [`tech-stack.md`](./tech-stack.md) | 技术选型（LangChain/LangGraph / OpenAI-compatible / Langfuse）与取舍 | core-beliefs |
 | [`data-model.md`](./data-model.md) | Book IR 等数据契约 | 无 |
