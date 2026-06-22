@@ -172,6 +172,83 @@ def state_cmd(
         console.print("Gates: " + ", ".join(f"{k}={v}" for k, v in st.gates.items()))
 
 
+eval_app = typer.Typer(
+    add_completion=False,
+    help="Evaluation: calibrate length-ratio bands + replay process conformance "
+    "(see docs/design-docs/eval-standard.md).",
+    no_args_is_help=True,
+)
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("calibrate")
+def eval_calibrate_cmd(
+    dataset: str = typer.Option(
+        ..., "--dataset", "-d",
+        help="Dataset spec, e.g. 'wmt24pp:en-zh_CN:literary' (add ':stub=true' offline).",
+    ),
+    out_dir: Path = typer.Option(Path("eval-out"), "--out", "-o", help="Output root."),
+    min_samples: int = typer.Option(
+        50, "--min-samples", help="Min samples before a pair's band is emitted."
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Derive length-ratio bands from a reference dataset (no LLM calls)."""
+    from abi.eval.pipeline import run_calibration
+
+    _setup_logging(verbose)
+    results, bands = run_calibration(dataset, out_dir=out_dir, min_samples=min_samples)
+    if not results:
+        console.print("[yellow]no reference pairs found for this spec[/]")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Length-ratio calibration — {dataset}")
+    for col in ("pair", "n", "p10", "p50", "p90", "suggested", "current"):
+        table.add_column(col)
+    for r in results:
+        table.add_row(
+            r.source_target, str(r.n), f"{r.ratio_p10}", f"{r.ratio_p50}",
+            f"{r.ratio_p90}", f"[{r.suggested_lo}, {r.suggested_hi}]",
+            f"[{r.current_lo}, {r.current_hi}]",
+        )
+    console.print(table)
+    emitted = ", ".join(bands) if bands else "(none — all pairs below --min-samples)"
+    console.print(f"[green]bands written[/] (>= {min_samples} samples): {emitted}")
+
+
+@eval_app.command("trace")
+def eval_trace_cmd(
+    project_root: Path = typer.Argument(..., help="Book-project directory."),
+    out_dir: Path | None = typer.Option(None, "--out", "-o", help="Write reports here."),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Replay L1 gate integrity + path conformance + system metrics for a project."""
+    from abi.eval.pipeline import run_trace
+
+    _setup_logging(verbose)
+    report = run_trace(project_root, out_dir=out_dir)
+    color = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(report.verdict, "white")
+    console.print(f"[bold]{report.book}[/]  status={report.status}  "
+                  f"verdict=[{color}]{report.verdict}[/]")
+    console.print(
+        f"  gate_integrity={report.gate_integrity_ok}  "
+        f"reached_states={report.reached_states_ok}  "
+        f"path_conformance={report.path_conformance_ok}"
+    )
+    for g in report.gate_integrity:
+        if not g.consistent:
+            console.print(f"  [red]✗ {g.gate}[/]: recorded={g.recorded} "
+                          f"replay_ok={g.replay_ok} — {g.replay_reason}")
+    if report.skipped_states:
+        console.print(f"  [yellow]skipped:[/] {', '.join(report.skipped_states)}")
+    console.print(
+        f"  cost=${report.cost_usd} tokens(in/out)={report.tokens_in}/{report.tokens_out} "
+        f"first_pass_rate={report.first_pass_rate}"
+    )
+    if report.verdict == "FAIL":
+        raise typer.Exit(code=1)
+
+
 def _print_result(project: BookProject, result: Any) -> None:
     console.print()
     icon = "[bold green]✓[/]" if result.final_status == Status.DONE else "[bold yellow]…[/]"

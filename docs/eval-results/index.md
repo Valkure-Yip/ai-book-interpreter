@@ -13,4 +13,5 @@
 
 | 日期 | Tag | 数据集 | 主要 finding |
 | --- | --- | --- | --- |
+| 2026-06 | [wmt24pp length calibration](./2026-06_wmt24pp_length_calibration.md) | `wmt24pp:en-{zh,ja,es,fr,de}:literary` | 5 方向 length_ratio 校准；en→ja 旧默认 [0.6,1.4] 大幅纠偏为 [0.39,0.62] |
 | 2026-05 | [news_commentary smoke](./2026-05_news_commentary_smoke.md) | `news_commentary:en-zh:academic-accessible:limit_docs=2` | 短文场景五项修复，ABI 胜率 31.2% → 45.0% |

@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "source": "google/wmt24pp (domain=literary)",
+    "derived": "2026-06-22",
+    "samples_per_pair": 206,
+    "suggested_band": "[p10, p90] of len(post_edit_reference)/len(source) by character",
+    "note": "Aggregate length-ratio statistics only (no source text). Calibration, not a regression gate. Pairs absent here fall back to DEFAULT_LENGTH_BANDS (QUALITY_SCORE.md)."
+  },
+  "en-zh": { "lo": 0.2697, "hi": 0.4282, "n": 206, "method": "calibrated" },
+  "en-ja": { "lo": 0.3922, "hi": 0.6172, "n": 206, "method": "calibrated" },
+  "en-es": { "lo": 0.9618, "hi": 1.2122, "n": 206, "method": "calibrated" },
+  "en-fr": { "lo": 0.9711, "hi": 1.3028, "n": 206, "method": "calibrated" },
+  "en-de": { "lo": 0.9714, "hi": 1.3142, "n": 206, "method": "calibrated" }
+}
