@@ -1,7 +1,7 @@
 # Eval Results — Index
 
 > 真实评测的产物日志：每次跑过的数据集 / 配置 / 报告 / finding / 后续 action。
-> 区别于 `design-docs/eval-design.md`（讲架构，不变）与 `runs/` + `eval-out/`
+> 区别于 `design-docs/eval-standard.md`（讲标准/指标/判据，不变）与 `eval/<eval_id>/`
 > （讲产物，可弃）。这里讲**结论**，是接下来"该改什么"的依据。
 
 写法约定：

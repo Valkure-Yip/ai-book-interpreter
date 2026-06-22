@@ -10,6 +10,7 @@
 | [`tech-stack.md`](./tech-stack.md) | 技术选型（LangChain/LangGraph / OpenAI-compatible / Langfuse）与取舍 | core-beliefs |
 | [`data-model.md`](./data-model.md) | Book IR 等数据契约 | 无 |
 | [`ingest-design.md`](./ingest-design.md) | epub/pdf/txt 各自的解析策略 | data-model |
+| [`eval-standard.md`](./eval-standard.md) | 三平面 eval 标准：L1 流程可信度 / L2 中间产物+逐章译文 / L3 最终产物 + 指标与判据 | agentic-pipeline, QUALITY_SCORE |
 
 > v0.1 的三遍流水线文档（pipeline / sliding-window / agent-architecture /
 > survey-design / assembly-design）已随 v0.2 agentic 重构删除，整体设计以

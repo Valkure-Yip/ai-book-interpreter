@@ -49,6 +49,7 @@ ai-book-interpreter/
 | 看版本化发布 / 私人自用 | `src/abi/release/` + `src/abi/assets/references/release_versioning.md` |
 | 改 CLI 命令或参数 | `src/abi/cli/main.py` |
 | 处理重试、限流、断点 | [`docs/RELIABILITY.md`](./docs/RELIABILITY.md) + `state/pipeline_state.json` |
+| 看 eval 标准 / 该衡量哪些指标 | [`docs/design-docs/eval-standard.md`](./docs/design-docs/eval-standard.md)（L1 流程可信度 / L2 中间产物+逐章译文 / L3 最终产物） |
 | 现在该干什么？ | [`docs/exec-plans/active/`](./docs/exec-plans/active/) |
 
 ## 核心不变量（违反就是 bug，由 linter 强制）
