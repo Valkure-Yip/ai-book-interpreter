@@ -91,7 +91,7 @@ async def make_book(
     _place_source(project, source)
 
     services = _services_for(project, config)
-    ctx = ToolContext(project=project, services=services)
+    ctx = ToolContext(project=project, services=services, config=config)
     orch = Orchestrator(ctx, max_stage_attempts=max_stage_attempts)
     result = await orch.run(until=until)
     return project, result
@@ -111,7 +111,7 @@ async def resume(
             f"no project state at {project.state_path}. Run `abi make-book` first."
         )
     services = _services_for(project, config)
-    ctx = ToolContext(project=project, services=services)
+    ctx = ToolContext(project=project, services=services, config=config)
     orch = Orchestrator(ctx, max_stage_attempts=max_stage_attempts)
     result = await orch.run(until=until)
     return project, result

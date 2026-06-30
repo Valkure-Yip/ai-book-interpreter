@@ -4,9 +4,14 @@ The agentic pipeline emits plain-markdown translations (no runtime
 ``TranslationUnit``), so paragraph-level scoring must align source paragraphs to
 translated paragraphs *after the fact*. Strategy:
 
-1. equal length        -> position alignment
-2. within 10% length   -> Needleman-Wunsch on paragraph character lengths
-3. larger gap          -> mark every unit ``align_failed`` (chapter-level only)
+1. equal length            -> position alignment
+2. otherwise               -> Needleman-Wunsch on paragraph character lengths
+3. low match rate          -> ``chapter_align_failed`` (caller falls back to
+   chapter-level mechanical scoring, which is robust to paragraph merging/splitting)
+
+Real translations routinely merge boilerplate or split long paragraphs, so a raw
+count difference is *not* treated as failure: NW handles insertions/deletions via
+gaps, and only a genuinely low match rate trips the chapter-level fallback.
 """
 
 from __future__ import annotations
@@ -89,25 +94,30 @@ def _nw_align(src: list[str], tgt: list[str]) -> list[int | None]:
     return matches
 
 
+# Below this fraction of source paragraphs matched, per-paragraph alignment is
+# untrustworthy and the caller should score the chapter as a single unit.
+_MIN_MATCH_RATE = 0.9
+
+
 def align_paragraphs(source_md: str, target_md: str) -> Alignment:
     """Align source paragraphs to translated paragraphs (see module docstring)."""
     src = split_paragraphs(source_md)
     tgt = split_paragraphs(target_md)
     if not src:
         return Alignment(pairs=[], chapter_align_failed=False)
+    if not tgt:
+        pairs = [AlignedPair(i, s, None) for i, s in enumerate(src)]
+        return Alignment(pairs=pairs, chapter_align_failed=True)
 
     if len(src) == len(tgt):
         pairs = [AlignedPair(i, s, t) for i, (s, t) in enumerate(zip(src, tgt, strict=True))]
         return Alignment(pairs=pairs, chapter_align_failed=False)
 
-    if abs(len(src) - len(tgt)) <= max(1, int(0.1 * len(src))):
-        matches = _nw_align(src, tgt)
-        pairs = [
-            AlignedPair(i, s, tgt[mi] if mi is not None else None)
-            for i, (s, mi) in enumerate(zip(src, matches, strict=True))
-        ]
-        return Alignment(pairs=pairs, chapter_align_failed=False)
-
-    # Gap too large: chapter-level degraded mode.
-    pairs = [AlignedPair(i, s, None) for i, s in enumerate(src)]
-    return Alignment(pairs=pairs, chapter_align_failed=True)
+    matches = _nw_align(src, tgt)
+    pairs = [
+        AlignedPair(i, s, tgt[mi] if mi is not None else None)
+        for i, (s, mi) in enumerate(zip(src, matches, strict=True))
+    ]
+    matched = sum(1 for m in matches if m is not None)
+    match_rate = matched / len(src)
+    return Alignment(pairs=pairs, chapter_align_failed=match_rate < _MIN_MATCH_RATE)

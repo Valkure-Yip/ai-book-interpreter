@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from abi.eval import FORMULA_VERSION
+from abi.eval.book import BookEvalReport, eval_book, render_book_md
 from abi.eval.calibration import bands_from_calibration, calibrate
 from abi.eval.datasets import load_triples, parse_dataset_spec
 from abi.eval.judge import JudgeResult, judge_triple
@@ -46,6 +47,27 @@ def run_trace(project_root: Path, *, out_dir: Path | None = None) -> TraceReport
         d = out_dir / project.root.name / _eval_id()
         write_json(d / "trace_report.json", report.model_dump())
         (d / "trace_report.md").write_text(render_trace_md(report), encoding="utf-8")
+    return report
+
+
+def run_book_eval(
+    project_root: Path,
+    *,
+    out_dir: Path | None = None,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
+) -> BookEvalReport:
+    """Run the full three-plane (L1+L2+L3) deterministic eval for a book project."""
+    project = BookProject(Path(project_root).expanduser().resolve())
+    if not project.exists():
+        raise FileNotFoundError(
+            f"no project state at {project.state_path}. Run `abi make-book` first."
+        )
+    report = eval_book(project, source_lang=source_lang, target_lang=target_lang)
+    if out_dir is not None:
+        d = out_dir / project.root.name / _eval_id()
+        write_json(d / "book_eval.json", report.model_dump())
+        (d / "book_eval.md").write_text(render_book_md(report), encoding="utf-8")
     return report
 
 

@@ -25,12 +25,8 @@ htmlcov/
 # generated book projects (agent runtime output)
 # private-use books are copyrighted/source-bearing and must NEVER be committed
 books/private/
-# generated per-book artifacts under any book project (keep scaffolding scripts/templates)
-books/**/source/
-books/**/output/
-books/**/events.jsonl
-books/**/metrics.json
-books/**/state/run.log
+# all per-book runtime artifacts (chapters, source, output, qa, glossary, state, etc.)
+books/**/[0-9]*_*/
 
 # legacy artifact dirs (pre-agentic pipeline)
 runs/

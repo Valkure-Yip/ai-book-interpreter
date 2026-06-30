@@ -15,33 +15,44 @@ Pass 0 仍按下述启发式规则切章并赋稳定 ID；得到 `Book` 之后�
 
 下游所有阶段（survey/translate/assemble）看到的都是 LLM 修正后的 `book.toc`。
 
-## Pass 0.5: LLM TOC refinement
+## Pass 0.5: LLM TOC refinement（已实现）
 
 | 字段 | 说明 |
 | --- | --- |
-| 触发条件 | `RunConfig.refine_toc=True`（默认），且非 `--resume` 续跑 |
-| 候选构造 | 把 heuristic 产出的所有 heading 与短而无终结符的 prose 段落作为候选（≤250 条） |
-| LLM 输出 | `{chapters: [{anchor_id, title, level}]}` —— 标题保留源语言，仅做轻量清洗 |
-| 失败兜底 | LLM 报错 / 输出空 / anchor 全部不合法 → 返回原 Book，metadata.method="heuristic_fallback" |
-| 产物 | `runs/<book>/<run>/ir/toc-refinement.json`（候选数、检测数、调用方法） |
-| 持久化 | LLM-corrected `Book` 写到 `runs/<book>/<run>/ir/book.json`；`--resume` 时直接复用 |
-
-事件：`toc.refinement.start` / `toc.refinement.applied` / `toc.refinement.failed` / `toc.refinement.skipped`。
-
-`--no-refine-toc` 或 `ABI_TOC_REFINE=0` 关闭整个 Pass 0.5（适合离线测试 / 已确认 heuristic 结果正确的批量任务）。
+| 实现 | `abi.ir.toc_refiner` |
+| 触发条件 | `RunConfig.refine_toc=True`（默认）且 `needs_refinement()` 为真：`no_explicit_chapter_detected` warning，或 ≤1 个 section 含 >30 段落 |
+| 候选构造 | `extract_candidates(raw_text)`: 从原始文本提取 ≤120 字符、不以句末标点结尾、与空行相邻的短行（≤250 条）|
+| LLM 输出 | `TOCResponse{chapters: [{line_number, title, level}]}` — `invoke_structured` 调用，Pydantic 强类型解析 |
+| 重建逻辑 | `_rebuild_book()`: 按 `line_number` 定位 heading 在原文中的位置，将段落流分配到对应 section；支持层级嵌套（level>1 挂载到前一个 level=1 下）|
+| 失败兜底 | LLM 报错 / 输出空 / `line_number` 全部不合法 / 精修后 section 数未增加 → 返回原 Book 不变 |
+| 集成点 | `content.py` 的 `split_chapters()` 在 `ingest()` 后、`split_book_to_chapters()` 前调用 `_maybe_refine_toc()` |
+| 事件 | `toc.refinement.applied`（精修成功）/ `toc.refinement.skipped`（未改善）|
+| 关闭方式 | `--no-refine-toc` CLI flag 或 `ABI_TOC_REFINE=0` 环境变量 |
 
 ## TXT
 
-### 章节识别启发式
+### 章节识别启发式（Pass 0）
 
-按以下规则的优先级匹配标题：
+按以下优先级匹配标题（`CHAPTER_PATTERNS` → 结构性检测 → 词汇检测）：
 
-1. 全大写整行且长度 < 80（`THE STRUCTURE OF MIND`）
-2. 形如 `Chapter N`、`第N章`、`Part N` 开头
-3. 编号 + 句号或制表符（`1.`、`2.1 `、`3.1.2 `）
-4. 紧邻其前后有空行（标题通常被空行包围）
+1. **显式模式** (`CHAPTER_PATTERNS`):
+   - `PART IV`、`Part 3`（level 1）
+   - `Chapter N`、`Chapter XIV`、`第N章`、`第N部分`（level 2）
+   - 罗马数字独立行 `III.`、`XIV.`（level 1）
+   - 编号前缀 `1.` / `1.1` / `1.1.1`（level 3）
+   - 数字 + 大写标题 `5 The X`（level 2）
 
-未命中 → 全书视为单章。落 `structure-warnings.json` 但不阻塞。
+2. **双行标题合并**: 当 *marker 行*（罗马数字 / 阿拉伯数字 / `Chapter N`）后紧跟全大写或首字母大写的标题行（最多 2 行），且前后均有空行 → 合并为一个 heading。典型 Gutenberg 格式：
+   ```
+   I.
+   BOURGEOIS AND PROLETARIANS
+   ```
+
+3. **全大写独立行**: ≤120 字符，前后有空行（level 2）
+
+4. **常见标题词**: `Preamble`、`Introduction`、`Epilogue`、`Contents` 等独立出现在空行之间（level 2）
+
+未命中 → 全书视为单章。落 `no_explicit_chapter_detected` warning 但不阻塞；如启用 Pass 0.5 则触发 LLM 精修。
 
 ### 段落分割
 

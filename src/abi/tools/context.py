@@ -13,12 +13,14 @@ from pathlib import Path
 from abi.project.layout import BookProject
 from abi.project.state import PipelineState
 from abi.providers.services import RunServices
+from abi.types.run import RunConfig
 
 
 @dataclass
 class ToolContext:
     project: BookProject
     services: RunServices
+    config: RunConfig | None = None
 
     def state(self) -> PipelineState:
         return self.project.load_state()

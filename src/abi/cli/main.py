@@ -249,6 +249,66 @@ def eval_trace_cmd(
         raise typer.Exit(code=1)
 
 
+@eval_app.command("book")
+def eval_book_cmd(
+    project_root: Path = typer.Argument(..., help="Book-project directory."),
+    out_dir: Path | None = typer.Option(
+        Path("eval-out"), "--out", "-o", help="Write reports here (set '' to skip)."
+    ),
+    source_lang: str | None = typer.Option(
+        None, "--source-lang", help="Override source lang (default from pipeline_state)."
+    ),
+    target_lang: str | None = typer.Option(
+        None, "--target-lang", help="Override target lang (default from pipeline_state)."
+    ),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Full three-plane eval: L1 process + L2 per-chapter quality + L3 final product."""
+    from abi.eval.pipeline import run_book_eval
+
+    _setup_logging(verbose)
+    od = out_dir if out_dir and str(out_dir) else None
+    report = run_book_eval(
+        project_root, out_dir=od, source_lang=source_lang, target_lang=target_lang
+    )
+    col = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+
+    def _c(v: str) -> str:
+        return f"[{col.get(v, 'white')}]{v}[/]"
+
+    console.print(
+        f"[bold]{report.book}[/]  status={report.status}  总判定={_c(report.verdict)}"
+    )
+    console.print(
+        f"  L1 流程={_c(report.l1.verdict)}  "
+        f"L2 译文={_c(report.l2.verdict)}  "
+        f"L3 产物={_c(report.l3.verdict)}"
+    )
+    l2 = report.l2
+    console.print(
+        f"  [bold]L2[/] {l2.source_lang}->{l2.target_lang}  "
+        f"chapters={l2.n_chapters}(译={l2.n_chapters_translated})  "
+        f"paras={l2.n_paragraphs}  para_score avg={l2.score_avg} p10={l2.score_p10} "
+        f"min={l2.score_min}  completeness={l2.completeness}  flags={l2.flag_counts or '{}'}"
+    )
+    e, sc = report.l3.epub, report.l3.spotcheck
+    console.print(
+        f"  [bold]L3[/] epub_built={e.epub_built} lint_ok={e.publication_lint_ok} "
+        f"asset_ok={e.asset_manifest_ok} epubcheck(f/e/w)="
+        f"{e.epubcheck_fatal}/{e.epubcheck_errors}/{e.epubcheck_warnings}  "
+        f"spotcheck(ran={sc.ran} status={sc.status} conf={sc.release_confidence})"
+    )
+    console.print(
+        f"  [bold]system[/] cost=${report.l1.cost_usd} "
+        f"tokens(in/out)={report.l1.tokens_in}/{report.l1.tokens_out} "
+        f"first_pass_rate={report.l1.first_pass_rate}"
+    )
+    if od is not None:
+        console.print(f"  [dim]reports -> {od}/{report.book}/[/]")
+    if report.verdict == "FAIL":
+        raise typer.Exit(code=1)
+
+
 def _print_result(project: BookProject, result: Any) -> None:
     console.print()
     icon = "[bold green]✓[/]" if result.final_status == Status.DONE else "[bold yellow]…[/]"

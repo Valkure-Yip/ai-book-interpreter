@@ -94,6 +94,8 @@ def _env_overrides() -> dict[str, Any]:
         out.setdefault("llm", {})["max_concurrency"] = n
     if (n := _env_int("ABI_MAX_STAGE_ATTEMPTS")) is not None and n >= 1:
         out["max_stage_attempts"] = n
+    if os.environ.get("ABI_TOC_REFINE") == "0":
+        out["refine_toc"] = False
     return out
 
 

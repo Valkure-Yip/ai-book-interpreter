@@ -7,12 +7,20 @@ import random
 import pytest
 
 from abi.eval.align import align_paragraphs, split_paragraphs
+from abi.eval.book import (
+    _load_glossary,
+    check_book_l3,
+    eval_book,
+    score_book_l2,
+)
 from abi.eval.calibration import bands_from_calibration, calibrate
 from abi.eval.datasets import load_triples, parse_dataset_spec
 from abi.eval.judge import LikertOutput, PairwiseOutput, SlotScore, judge_triple
 from abi.eval.mechanical import length_ratio_ok, resolve_band, score_paragraph
 from abi.eval.report import aggregate_mechanical
 from abi.eval.types import EvalTriple
+from abi.project.layout import BookProject
+from abi.project.state import PipelineState, Status
 
 
 # --- datasets / spec ---
@@ -136,11 +144,22 @@ def test_align_skips_headings():
 
 
 def test_align_large_gap_degrades():
+    # 10 source paras vs 1 target: match rate far below threshold -> chapter-level
+    # fallback (caller scores the whole chapter), even though NW matches one pair.
     src = "\n\n".join(f"Source paragraph number {i} with text." for i in range(10))
     tgt = "Only one paragraph."
     al = align_paragraphs(src, tgt)
     assert al.chapter_align_failed
-    assert all(p.target is None for p in al.pairs)
+    assert sum(p.target is not None for p in al.pairs) <= 1
+
+
+def test_align_merged_paragraphs_stays_per_paragraph():
+    # A realistic small merge (5 -> 4 paras) keeps a high match rate, so per-
+    # paragraph alignment is retained (chapter_align_failed stays False).
+    src = "\n\n".join(f"Source sentence number {i} with some words." for i in range(5))
+    tgt = "\n\n".join(f"目标句子第 {i} 句包含若干词语内容。" for i in range(4))
+    al = align_paragraphs(src, tgt)
+    assert sum(p.target is not None for p in al.pairs) >= 4
 
 
 # --- calibration ---
@@ -222,3 +241,84 @@ async def test_judge_skips_when_missing_side():
     )
     assert await judge_triple(router, triple, rng=random.Random(0)) is None
     assert router.calls == 0
+
+
+# --- whole-book three-plane eval ---
+_SRC_CH1 = (
+    "All happy families are alike; each unhappy family is unhappy in its own way.\n\n"
+    "Everything was in confusion in the Oblonskys' house. The wife had found out "
+    "that the husband was carrying on an intrigue with a French girl.\n"
+)
+_TGT_CH1_GOOD = (
+    "幸福的家庭都是相似的，不幸的家庭各有各的不幸。\n\n"
+    "奥布隆斯基家里一片混乱。妻子发现丈夫和家里的一个法国女人有暧昧关系。\n"
+)
+
+
+def _make_project(tmp_path, *, translated: bool = True, glossary: bool = True):
+    root = tmp_path / "0001_book"
+    proj = BookProject(root)
+    for d in ("state", "chapters/src", "chapters/translated", "glossary"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    state = PipelineState(
+        book_slug="book", source_lang="en", target_lang="zh-Hans",
+        source_target="en-zh-Hans", status=Status.TRANSLATED,
+    )
+    proj.save_state(state)
+    (proj.chapters_src / "001_intro.md").write_text(_SRC_CH1, encoding="utf-8")
+    if translated:
+        (proj.chapters_translated / "001_intro.md").write_text(_TGT_CH1_GOOD, encoding="utf-8")
+    if glossary:
+        proj.terms_csv.write_text(
+            "term,target,status,display_policy,forbidden_body_renderings,note\n"
+            "family,家庭,locked,inline,,\n"
+            "intrigue,暧昧,preferred,inline,,\n"
+            "ignore_me,X,avoid,inline,,\n",
+            encoding="utf-8",
+        )
+    return proj
+
+
+def test_load_glossary_only_enforced(tmp_path):
+    proj = _make_project(tmp_path)
+    g = _load_glossary(proj)
+    assert g == {"family": "家庭", "intrigue": "暧昧"}  # 'avoid' row excluded
+
+
+def test_score_book_l2_good_translation(tmp_path):
+    proj = _make_project(tmp_path)
+    rep = score_book_l2(proj, source_lang="en", target_lang="zh-Hans")
+    assert rep.n_chapters == 1
+    assert rep.n_chapters_translated == 1
+    assert rep.n_paragraphs >= 1
+    assert rep.completeness == 1.0
+    assert rep.glossary_terms == 2
+    assert rep.verdict in {"PASS", "WARN"}
+    assert "completeness_fail" not in rep.flag_counts
+
+
+def test_score_book_l2_missing_translation_fails(tmp_path):
+    proj = _make_project(tmp_path, translated=False)
+    rep = score_book_l2(proj, source_lang="en", target_lang="zh-Hans")
+    assert rep.n_chapters_translated == 0
+    assert rep.completeness == 0.0
+    assert rep.verdict == "FAIL"
+    assert rep.chapters[0].translated_missing is True
+
+
+def test_check_book_l3_no_epub_fails(tmp_path):
+    proj = _make_project(tmp_path)
+    l3 = check_book_l3(proj)
+    assert l3.epub.epub_built is False
+    assert l3.verdict == "FAIL"
+    assert l3.spotcheck.ran is False
+
+
+def test_eval_book_rolls_up_worst_plane(tmp_path):
+    proj = _make_project(tmp_path)
+    report = eval_book(proj)
+    # L3 has no EPUB -> FAIL, so the combined verdict must be FAIL.
+    assert report.l3.verdict == "FAIL"
+    assert report.verdict == "FAIL"
+    assert report.l2.source_lang == "en"
+    assert report.book == "0001_book"

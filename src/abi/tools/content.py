@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
+from pathlib import Path
 
 from langchain_core.tools import BaseTool, StructuredTool
 
 from abi.ir import ingest
 from abi.ir.split import split_book_to_chapters, write_toc_json
+from abi.ir.toc_refiner import needs_refinement, refine_toc_with_llm
 from abi.project.state import Status
 from abi.tools.context import ToolContext
+from abi.types.book import Book
+
+_log = logging.getLogger(__name__)
 
 
 def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
@@ -56,6 +63,38 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
         return (f"ingested {book.meta.source_format}: {len(book.toc)} sections, "
                 f"{len(paras)} paragraphs. Wrote source_text.txt + source_manifest.json.")
 
+    def _maybe_refine_toc(book: Book, warnings: list[str], src_path: Path) -> Book:
+        """Run Pass 0.5 LLM TOC refinement if the heuristic result is suspect."""
+        if ctx.config is not None and not ctx.config.refine_toc:
+            return book
+        if not needs_refinement(book, warnings):
+            return book
+        _log.info("toc_refiner: Pass 0 produced suspect structure (%d sections, "
+                   "%d paragraphs), running Pass 0.5 LLM refinement",
+                   len(book.toc), len(book.iter_paragraphs()))
+        raw_text = src_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            refined = asyncio.get_event_loop().run_until_complete(
+                refine_toc_with_llm(book, raw_text, router=ctx.services.router)
+            )
+        except RuntimeError:
+            # No running event loop; create one.
+            refined = asyncio.run(
+                refine_toc_with_llm(book, raw_text, router=ctx.services.router)
+            )
+        if len(refined.toc) > len(book.toc):
+            _log.info("toc_refiner: refined %d -> %d sections",
+                       len(book.toc), len(refined.toc))
+            ctx.services.events.event(
+                "toc.refinement.applied",
+                before=len(book.toc), after=len(refined.toc),
+            )
+            return refined
+        _log.info("toc_refiner: refinement did not improve (kept %d sections)",
+                   len(book.toc))
+        ctx.services.events.event("toc.refinement.skipped", reason="no improvement")
+        return book
+
     def split_chapters() -> str:
         """Split the ingested source into chapters/src/{NNN_slug}.md + source/toc.json."""
         raw = project.source_raw
@@ -63,7 +102,8 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
         src_path = raw if raw.exists() else (epubs[0] if epubs else None)
         if src_path is None:
             return "ERROR: ingest the source first (no source file found)."
-        book, _ = ingest(src_path)
+        book, warnings = ingest(src_path)
+        book = _maybe_refine_toc(book, warnings, src_path)
         entries = split_book_to_chapters(book, project.chapters_src)
         write_toc_json(entries, project.toc_json)
         st = ctx.state()

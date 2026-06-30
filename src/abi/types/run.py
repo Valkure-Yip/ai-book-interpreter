@@ -40,6 +40,9 @@ class RunConfig(FrozenModel):
     target_language: str | None = None
     # Max agent retries per stage before the orchestrator marks the run blocked.
     max_stage_attempts: int = 3
+    # Pass 0.5 LLM TOC refinement (default on). Disable with --no-refine-toc
+    # or ABI_TOC_REFINE=0 for offline tests / known-good heuristic results.
+    refine_toc: bool = True
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
