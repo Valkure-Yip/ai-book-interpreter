@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "ai-book-interpreter contributors" }]
 
 dependencies = [
+  "aiosqlite>=0.20,<1",
   "pydantic>=2.7,<3",
   "langchain>=0.3,<0.4",
   "langchain-openai>=0.2,<0.3",
