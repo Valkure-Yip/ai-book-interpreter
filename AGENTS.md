@@ -44,6 +44,7 @@ ai-book-interpreter/
 | 看 agent 工具带 | `src/abi/tools/` |
 | 看 agent 运行时（LangGraph） | `src/abi/providers/agent_runtime/` |
 | 理解 LangGraph 单元如何组建 28 态流水线 + 持久化分层 | [`docs/design-docs/langgraph-and-state-machine.md`](./docs/design-docs/langgraph-and-state-machine.md) |
+| 看下一代受约束动态编排设计（Planner + Policy + durable loop） | [`docs/design-docs/dynamic-agent-orchestration.md`](./docs/design-docs/dynamic-agent-orchestration.md) |
 | 看 EPUB 构建 / 门禁 | `src/abi/epub/` |
 | 看随机抽检 / 卓越线 | `src/abi/qa/` + `src/abi/assets/references/stratified_random_spotcheck.md` |
 | 看版本化发布 / 私人自用 | `src/abi/release/` + `src/abi/assets/references/release_versioning.md` |

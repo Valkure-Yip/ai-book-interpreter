@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | [`agentic-pipeline.md`](./agentic-pipeline.md) | **权威总览**：架构图 + 28 态流程图 + prompt/翻译方法论 | core-beliefs, tech-stack |
 | [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md) | LangGraph ReAct 单元如何组建 28 态流水线 + 三层持久化（checkpointer/store 取舍） | agentic-pipeline, tech-stack |
+| [`dynamic-agent-orchestration.md`](./dynamic-agent-orchestration.md) | **设计共识已确认、待书面审阅**：Planner + Policy Engine + durable action loop 取代固定 `HAPPY_PATH` | agentic-pipeline, langgraph-and-state-machine, tech-stack |
 | [`core-beliefs.md`](./core-beliefs.md) | 项目设计哲学，影响所有取舍 | 无 |
 | [`tech-stack.md`](./tech-stack.md) | 技术选型（LangChain/LangGraph / OpenAI-compatible / Langfuse）与取舍 | core-beliefs |
 | [`data-model.md`](./data-model.md) | Book IR 等数据契约 | 无 |
@@ -20,5 +21,6 @@
 
 - 想理解**为什么这么设计** → `core-beliefs.md`
 - 想理解**当前整个架构与流程** → `agentic-pipeline.md`
+- 想理解**下一代动态编排方案** → `dynamic-agent-orchestration.md`
 - 想动手实现/修改 → `agentic-pipeline.md` 末尾的「相关源码入口」+ `data-model.md`
 - 想加 LLM provider 或调技术栈 → `tech-stack.md`

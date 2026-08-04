@@ -22,6 +22,7 @@ htmlcov/
 
 .specstory/
 .worktrees/
+.superpowers/
 
 # generated book projects (agent runtime output)
 # private-use books are copyrighted/source-bearing and must NEVER be committed
