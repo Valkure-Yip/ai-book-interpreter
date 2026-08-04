@@ -7,7 +7,13 @@ its progress is tracked by :class:`PipelineState` (``state/pipeline_state.json``
 
 from __future__ import annotations
 
-from abi.project.artifacts import ArtifactConflictError, ArtifactStore, InjectedCrash, sha256_file
+from abi.project.artifacts import (
+    ArtifactConflictError,
+    ArtifactReconciliationError,
+    ArtifactStore,
+    InjectedCrash,
+    sha256_file,
+)
 from abi.project.layout import BookProject, slugify
 from abi.project.run_ledger import (
     ActionAttemptRecord,
@@ -33,6 +39,7 @@ __all__ = [
     "ActionAttemptRecord",
     "ActionRecord",
     "ArtifactConflictError",
+    "ArtifactReconciliationError",
     "ArtifactStore",
     "BookProject",
     "CommittedAction",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from hashlib import sha256
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from abi.project.run_ledger import PromotionIntent, RunLedger
 
 __all__ = [
     "ArtifactConflictError",
+    "ArtifactReconciliationError",
     "ArtifactStore",
     "InjectedCrash",
     "PromotionIntent",
@@ -19,6 +21,17 @@ __all__ = [
 
 class ArtifactConflictError(RuntimeError):
     """Raised when a promotion would overwrite a different canonical artifact."""
+
+
+class ArtifactReconciliationError(ArtifactConflictError):
+    """Raised after reconciliation has recorded and continued through conflicts."""
+
+    def __init__(self, intent_ids: tuple[str, ...]) -> None:
+        self.intent_ids = intent_ids
+        noun = "conflict" if len(intent_ids) == 1 else "conflicts"
+        super().__init__(
+            f"{len(intent_ids)} promotion {noun} require review; inspect and choose the canonical artifact"
+        )
 
 
 class InjectedCrash(RuntimeError):
@@ -45,7 +58,7 @@ class ArtifactStore:
         """Return and create the one safe staging directory for an action attempt."""
         path = self._staging_dir_path(action_id, attempt)
         path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self._staging_dir_path(action_id, attempt)
 
     def _staging_dir_path(self, action_id: str, attempt: int) -> Path:
         """Validate and calculate an attempt staging path without creating it."""
@@ -53,7 +66,15 @@ class ArtifactStore:
             raise ValueError("action_id must be a safe path component")
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             raise ValueError("attempt must be a positive integer")
-        return self._project.staging_root / action_id / str(attempt)
+        staging_root = self._resolved_staging_root()
+        candidate = self._project.staging_root / action_id / str(attempt)
+        self._reject_symlink_components(candidate)
+        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate.relative_to(staging_root)
+        except ValueError as exc:
+            raise ValueError("attempt staging directory escapes the resolved staging root") from exc
+        return resolved_candidate
 
     async def prepare_promotion(
         self,
@@ -66,19 +87,27 @@ class ArtifactStore:
     ) -> PromotionIntent:
         """Persist a checksum-bearing intent before any canonical path is changed."""
         staged_path = self._path_for(staged_relpath)
-        staging_dir = self._staging_dir_path(action_id, attempt).resolve()
+        staging_dir = self._staging_dir_path(action_id, attempt)
         try:
             staged_path.relative_to(staging_dir)
         except ValueError as exc:
             raise ValueError("staged artifact must be inside its attempt staging directory") from exc
-        self._path_for(canonical_relpath)
+        canonical_path = self._path_for(canonical_relpath)
+        try:
+            canonical_path.relative_to(self._resolved_staging_root())
+        except ValueError:
+            pass
+        else:
+            raise ValueError("canonical artifact must be outside the staging root")
+        if canonical_path == staged_path:
+            raise ValueError("canonical artifact may not alias its staged source")
         if not staged_path.is_file():
             raise FileNotFoundError(f"staged artifact {staged_relpath} does not exist")
         return await self._require_ledger().create_promotion_intent(
             action_id=action_id,
             attempt=attempt,
-            staged_relpath=staged_relpath,
-            canonical_relpath=canonical_relpath,
+            staged_relpath=self._project_relative(staged_path),
+            canonical_relpath=self._project_relative(canonical_path),
             checksum=sha256_file(staged_path),
             media_type=media_type,
         )
@@ -109,37 +138,26 @@ class ArtifactStore:
         return await self._complete(durable_intent)
 
     async def reconcile_all(self) -> tuple[PromotionIntent, ...]:
-        """Reconcile every durable intent, including cleanup after committed recovery."""
-        return tuple(
-            [await self.reconcile_intent(intent) for intent in await self._require_ledger().promotion_intents()]
-        )
+        """Reconcile every intent, raising only after every conflict has been recorded."""
+        reconciled: list[PromotionIntent] = []
+        conflicts: list[str] = []
+        for intent in await self._require_ledger().promotion_intents():
+            try:
+                reconciled.append(await self.reconcile_intent(intent))
+            except ArtifactConflictError:
+                conflicts.append(intent.intent_id)
+        if conflicts:
+            raise ArtifactReconciliationError(tuple(conflicts))
+        return tuple(reconciled)
 
     async def _complete(
         self, intent: PromotionIntent, *, crash_after: str | None = None
     ) -> PromotionIntent:
         staged = self._path_for(intent.staged_relpath)
         canonical = self._path_for(intent.canonical_relpath)
-        staged_exists = staged.is_file()
-        canonical_exists = canonical.is_file()
-
-        if canonical_exists:
-            if sha256_file(canonical) != intent.checksum:
-                await self._record_checksum_conflict(intent)
-                raise ArtifactConflictError(
-                    f"canonical artifact {intent.canonical_relpath} has a different checksum; "
-                    "inspect and choose the canonical artifact"
-                )
-            if staged_exists and sha256_file(staged) != intent.checksum:
-                await self._record_checksum_conflict(intent)
-                raise ArtifactConflictError(
-                    f"staged artifact {intent.staged_relpath} has a different checksum; "
-                    "inspect and choose the canonical artifact"
-                )
-            committed = await self._require_ledger().commit_promotion_intent(intent.intent_id)
-            self._clean_staged_file(committed)
-            return committed
-
-        if not staged_exists:
+        if not staged.is_file():
+            if canonical.is_file():
+                return await self._commit_existing(intent, staged, canonical)
             await self._require_ledger().record_promotion_incident(
                 intent.intent_id,
                 error_code="artifact_promotion_missing",
@@ -151,19 +169,36 @@ class ArtifactStore:
             return intent
 
         if sha256_file(staged) != intent.checksum:
-            await self._record_checksum_conflict(intent)
-            raise ArtifactConflictError(
-                f"staged artifact {intent.staged_relpath} no longer matches its promotion intent; "
-                "inspect and choose the canonical artifact"
-            )
+            await self._raise_checksum_conflict(intent, "staged artifact no longer matches its promotion intent")
 
         canonical.parent.mkdir(parents=True, exist_ok=True)
-        staged.replace(canonical)
+        try:
+            os.link(staged, canonical)
+        except FileExistsError:
+            return await self._commit_existing(intent, staged, canonical)
         if crash_after == "after_rename":
             raise InjectedCrash("injected crash after artifact rename")
         committed = await self._require_ledger().commit_promotion_intent(intent.intent_id)
         self._clean_staged_file(committed)
         return committed
+
+    async def _commit_existing(
+        self, intent: PromotionIntent, staged: Path, canonical: Path
+    ) -> PromotionIntent:
+        """Commit an already-created canonical file only when both checksums agree."""
+        if not canonical.is_file() or sha256_file(canonical) != intent.checksum:
+            await self._raise_checksum_conflict(intent, "canonical artifact has a different checksum")
+        if staged.is_file() and sha256_file(staged) != intent.checksum:
+            await self._raise_checksum_conflict(intent, "staged artifact has a different checksum")
+        committed = await self._require_ledger().commit_promotion_intent(intent.intent_id)
+        self._clean_staged_file(committed)
+        return committed
+
+    async def _raise_checksum_conflict(self, intent: PromotionIntent, detail: str) -> None:
+        await self._record_checksum_conflict(intent)
+        raise ArtifactConflictError(
+            f"{detail} for {intent.canonical_relpath}; inspect and choose the canonical artifact"
+        )
 
     async def _record_checksum_conflict(self, intent: PromotionIntent) -> None:
         await self._require_ledger().record_promotion_incident(
@@ -203,6 +238,26 @@ class ArtifactStore:
         if not self._project.within(path):
             raise ValueError("artifact path must stay inside the project")
         return path
+
+    def _resolved_staging_root(self) -> Path:
+        root = self._project.staging_root.resolve()
+        try:
+            root.relative_to(self._project.root.resolve())
+        except ValueError as exc:
+            raise ValueError("staging root must stay inside the project") from exc
+        return root
+
+    def _reject_symlink_components(self, candidate: Path) -> None:
+        """Reject existing symlink components before creating or using staging paths."""
+        relative = candidate.relative_to(self._project.root)
+        current = self._project.root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise ValueError("attempt staging directory may not traverse a symlink")
+
+    def _project_relative(self, path: Path) -> str:
+        return path.relative_to(self._project.root.resolve()).as_posix()
 
     def _require_ledger(self) -> RunLedger:
         if self._ledger is None:

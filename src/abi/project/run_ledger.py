@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self, cast
 from uuid import uuid4
 
 import aiosqlite
@@ -153,7 +153,7 @@ class PromotionIntent(FrozenModel):
     canonical_relpath: str
     checksum: str
     media_type: str
-    status: str
+    status: Literal["PENDING", "COMMITTED"]
     created_at: datetime
     committed_at: datetime | None = None
 
@@ -604,6 +604,11 @@ class RunLedger:
                 raise LedgerNotFoundError(
                     f"promotion intent {intent_id} was not found; prepare the staged artifact before committing it"
                 )
+            if row["status"] not in {"PENDING", "COMMITTED"}:
+                raise LedgerError(
+                    f"promotion intent {intent_id} has corrupted status {row['status']!r}; "
+                    "repair the ledger before reconciling artifacts"
+                )
             if row["status"] == "COMMITTED":
                 return self._promotion_intent_from_row(row)
             await db.execute(
@@ -933,6 +938,12 @@ class RunLedger:
 
     @staticmethod
     def _promotion_intent_from_row(row: aiosqlite.Row) -> PromotionIntent:
+        raw_status = row["status"]
+        if raw_status not in {"PENDING", "COMMITTED"}:
+            raise LedgerError(
+                f"promotion intent {row['intent_id']} has corrupted status {raw_status!r}; "
+                "repair the ledger before reconciling artifacts"
+            )
         return PromotionIntent(
             intent_id=row["intent_id"],
             action_id=row["action_id"],
@@ -941,7 +952,7 @@ class RunLedger:
             canonical_relpath=row["canonical_relpath"],
             checksum=row["checksum"],
             media_type=row["media_type"],
-            status=row["status"],
+            status=cast(Literal["PENDING", "COMMITTED"], raw_status),
             created_at=_parse_time(row["created_at"]),
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
         )
