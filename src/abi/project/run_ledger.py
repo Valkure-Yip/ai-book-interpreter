@@ -136,6 +136,7 @@ class IncidentRecord(FrozenModel):
     incident_id: str
     run_id: str
     error_code: str
+    subject: str | None = None
     message: str
     action_id: str | None = None
     status: str
@@ -634,8 +635,9 @@ class RunLedger:
                     f"promotion intent {intent_id} was not found; cannot record its reconciliation incident"
                 )
             cursor = await db.execute(
-                "SELECT * FROM incidents WHERE action_id = ? AND error_code = ? AND status = 'OPEN'",
-                (row["action_id"], error_code),
+                "SELECT * FROM incidents WHERE action_id = ? AND error_code = ? AND subject = ? "
+                "AND status = 'OPEN'",
+                (row["action_id"], error_code, intent_id),
             )
             prior = await cursor.fetchone()
             if prior is not None:
@@ -646,6 +648,7 @@ class RunLedger:
                 error_code=error_code,
                 message=message,
                 action_id=row["action_id"],
+                subject=intent_id,
                 now=now,
             )
 
@@ -904,16 +907,17 @@ class RunLedger:
         error_code: str,
         message: str,
         action_id: str | None,
+        subject: str | None = None,
         now: str,
     ) -> IncidentRecord:
         record = IncidentRecord(
-            incident_id=str(uuid4()), run_id=run_id, error_code=error_code, message=message,
+            incident_id=str(uuid4()), run_id=run_id, error_code=error_code, subject=subject, message=message,
             action_id=action_id, status="OPEN", created_at=_parse_time(now)
         )
         await db.execute(
-            "INSERT INTO incidents (incident_id, run_id, action_id, error_code, message, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (record.incident_id, run_id, action_id, error_code, message, record.status, now),
+            "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (record.incident_id, run_id, action_id, error_code, subject, message, record.status, now),
         )
         return record
 
@@ -963,6 +967,7 @@ class RunLedger:
             incident_id=row["incident_id"],
             run_id=row["run_id"],
             error_code=row["error_code"],
+            subject=row["subject"],
             message=row["message"],
             action_id=row["action_id"],
             status=row["status"],

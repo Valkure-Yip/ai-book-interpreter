@@ -395,6 +395,119 @@ async def test_reconcile_all_continues_after_a_conflict(tmp_path: Path) -> None:
         assert (tmp_path / "chapters/final/002.md").read_text(encoding="utf-8") == "recovered"
 
 
+@pytest.mark.asyncio
+async def test_staged_mutation_after_verification_never_commits_wrong_canonical(tmp_path: Path) -> None:
+    """Catch a mutable staged inode being installed after its checksum was verified."""
+    async with prepared_store(tmp_path, content="expected") as (_, ledger, staged):
+        staged_path = tmp_path / "state/staging/translate-001/1/001.md"
+
+        def mutate_staged(point: str, _: PromotionIntent | None) -> None:
+            if point == "after_staged_verification":
+                staged_path.write_text("wrong", encoding="utf-8")
+
+        store = ArtifactStore(BookProject(tmp_path), ledger, test_hook=mutate_staged)
+        with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
+            await store.promote(staged)
+
+        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        canonical = tmp_path / "chapters/final/001.md"
+        assert not canonical.exists() or canonical.read_text(encoding="utf-8") == "expected"
+
+
+@pytest.mark.asyncio
+async def test_post_prepare_staging_alias_never_deletes_canonical(tmp_path: Path) -> None:
+    """Catch cleanup unlinking canonical after an attempt directory becomes a symlink."""
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, _):
+        canonical = tmp_path / "chapters/final/001.md"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("translation", encoding="utf-8")
+        staged_path = tmp_path / "state/staging/translate-001/1/001.md"
+        attempt_dir = staged_path.parent
+        staged_path.unlink()
+        attempt_dir.rmdir()
+        attempt_dir.symlink_to(canonical.parent, target_is_directory=True)
+
+        with pytest.raises(ArtifactConflictError, match=r"staging|repair"):
+            await store.reconcile_all()
+
+        assert canonical.read_text(encoding="utf-8") == "translation"
+        assert await ledger.has_open_incident("artifact_intent_invalid")
+
+
+def test_staging_dir_race_hook_cannot_create_outside_project(tmp_path: Path) -> None:
+    """Catch a symlink inserted between validation and mkdir creating an external attempt directory."""
+    project = BookProject(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def insert_symlink(point: str, _: PromotionIntent | None) -> None:
+        if point == "before_staging_mkdir":
+            project.staging_root.mkdir(parents=True, exist_ok=True)
+            (project.staging_root / "translate-001").symlink_to(outside, target_is_directory=True)
+
+    store = ArtifactStore(project, None, test_hook=insert_symlink)
+    with pytest.raises(ValueError, match="symlink"):
+        store.staging_dir("translate-001", 1)
+
+    assert not (outside / "1").exists()
+
+
+@pytest.mark.asyncio
+async def test_direct_ledger_intent_bypass_never_promotes_source_file(tmp_path: Path) -> None:
+    """Catch a ledger-created intent bypassing attempt staging validation during reconciliation."""
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, _):
+        source = tmp_path / "source.md"
+        source.write_text("source", encoding="utf-8")
+        bypass = await ledger.create_promotion_intent(
+            action_id="translate-001",
+            attempt=1,
+            staged_relpath="source.md",
+            canonical_relpath="chapters/final/source.md",
+            checksum="41cf6794ba4200b839c53531555decbf73202b1f3cefa1a22190f76f08c1ae47",
+            media_type="text/markdown",
+        )
+
+        with pytest.raises(ArtifactConflictError, match="repair"):
+            await store.reconcile_intent(bypass)
+
+        assert source.read_text(encoding="utf-8") == "source"
+        assert not (tmp_path / "chapters/final/source.md").exists()
+        assert await ledger.has_open_incident("artifact_intent_invalid")
+
+
+@pytest.mark.asyncio
+async def test_each_conflicting_intent_records_its_own_incident(tmp_path: Path) -> None:
+    """Catch incident deduplication that collapses two canonical conflicts from one action."""
+    async with prepared_store(tmp_path, content="first") as (store, ledger, _):
+        first = tmp_path / "chapters/final/001.md"
+        first.parent.mkdir(parents=True)
+        first.write_text("old-first", encoding="utf-8")
+        staged_two = store.staging_dir("translate-001", 1) / "002.md"
+        staged_two.write_text("second", encoding="utf-8")
+        await store.prepare_promotion(
+            action_id="translate-001",
+            attempt=1,
+            staged_relpath="state/staging/translate-001/1/002.md",
+            canonical_relpath="chapters/final/002.md",
+            media_type="text/markdown",
+        )
+        second_canonical = tmp_path / "chapters/final/002.md"
+        second_canonical.write_text("old-second", encoding="utf-8")
+
+        with pytest.raises(ArtifactConflictError):
+            await store.reconcile_all()
+        with pytest.raises(ArtifactConflictError):
+            await store.reconcile_all()
+
+        incidents = [
+            incident
+            for incident in (await ledger.load_snapshot("run-1")).incidents
+            if incident.error_code == "artifact_checksum_conflict"
+        ]
+        assert len(incidents) == 2
+        assert second_canonical.read_text(encoding="utf-8") == "old-second"
+
+
 def test_staging_dir_rejects_path_escape(tmp_path: Path) -> None:
     """Catch action identifiers that would write a staging artifact outside its attempt directory."""
     store = ArtifactStore(BookProject(tmp_path), None)

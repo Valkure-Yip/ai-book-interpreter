@@ -93,11 +93,16 @@ CREATE TABLE IF NOT EXISTS incidents (
     run_id TEXT NOT NULL REFERENCES runs(run_id),
     action_id TEXT REFERENCES actions(action_id),
     error_code TEXT NOT NULL,
+    subject TEXT,
     message TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     resolved_at TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS open_promotion_incident_subject
+ON incidents(action_id, error_code, subject)
+WHERE status = 'OPEN' AND subject IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS interrupts (
     interrupt_id TEXT PRIMARY KEY,
