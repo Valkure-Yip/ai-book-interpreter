@@ -144,6 +144,9 @@ class IncidentRecord(FrozenModel):
     resolved_at: datetime | None = None
 
 
+PromotionStatus = Literal["PENDING", "COMMITTED", "CONFLICT"]
+
+
 class PromotionIntent(FrozenModel):
     """A durable bridge between a staged file and its canonical destination."""
 
@@ -154,7 +157,7 @@ class PromotionIntent(FrozenModel):
     canonical_relpath: str
     checksum: str
     media_type: str
-    status: Literal["PENDING", "COMMITTED"]
+    status: PromotionStatus
     created_at: datetime
     committed_at: datetime | None = None
 
@@ -586,7 +589,7 @@ class RunLedger:
             )
         return self._promotion_intent_from_row(row)
 
-    async def promotion_state(self, intent_id: str) -> str:
+    async def promotion_state(self, intent_id: str) -> PromotionStatus:
         """Return the durable state of one promotion intent."""
         return (await self.get_promotion_intent(intent_id)).status
 
@@ -596,7 +599,7 @@ class RunLedger:
         return tuple(self._promotion_intent_from_row(row) for row in rows)
 
     async def commit_promotion_intent(self, intent_id: str) -> PromotionIntent:
-        """Confirm a rename only after the filesystem checksum has been verified."""
+        """Confirm a canonical install only after its filesystem facts are verified."""
         now = self._now()
         async with self.transaction() as db:
             cursor = await db.execute("SELECT * FROM promotion_intents WHERE intent_id = ?", (intent_id,))
@@ -605,18 +608,63 @@ class RunLedger:
                 raise LedgerNotFoundError(
                     f"promotion intent {intent_id} was not found; prepare the staged artifact before committing it"
                 )
-            if row["status"] not in {"PENDING", "COMMITTED"}:
-                raise LedgerError(
-                    f"promotion intent {intent_id} has corrupted status {row['status']!r}; "
-                    "repair the ledger before reconciling artifacts"
+            status = _promotion_status(row["status"], intent_id)
+            if status == "CONFLICT":
+                raise LedgerTransitionError(
+                    f"promotion intent {intent_id} is CONFLICT; repair or replace the intent "
+                    "instead of committing it"
                 )
-            if row["status"] == "COMMITTED":
+            if status == "COMMITTED":
                 return self._promotion_intent_from_row(row)
             await db.execute(
                 "UPDATE promotion_intents SET status = ?, committed_at = ? WHERE intent_id = ?",
                 ("COMMITTED", now, intent_id),
             )
         return await self.get_promotion_intent(intent_id)
+
+    async def conflict_promotion_intent(
+        self, intent_id: str, *, error_code: str, message: str
+    ) -> PromotionIntent:
+        """Atomically compensate a pending or committed promotion and record its incident."""
+        now = self._now()
+        async with self.transaction() as db:
+            cursor = await db.execute(
+                "SELECT pi.*, a.run_id FROM promotion_intents pi "
+                "JOIN actions a ON a.action_id = pi.action_id WHERE pi.intent_id = ?",
+                (intent_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerNotFoundError(
+                    f"promotion intent {intent_id} was not found; cannot compensate its promotion"
+                )
+            status = _promotion_status(row["status"], intent_id)
+            if status != "CONFLICT":
+                await db.execute(
+                    "UPDATE promotion_intents SET status = ? WHERE intent_id = ?",
+                    ("CONFLICT", intent_id),
+                )
+            cursor = await db.execute(
+                "SELECT * FROM incidents WHERE action_id = ? AND error_code = ? AND subject = ? "
+                "AND status = 'OPEN'",
+                (row["action_id"], error_code, intent_id),
+            )
+            if await cursor.fetchone() is None:
+                await self._insert_incident(
+                    db,
+                    run_id=row["run_id"],
+                    error_code=error_code,
+                    message=message,
+                    action_id=row["action_id"],
+                    subject=intent_id,
+                    now=now,
+                )
+            cursor = await db.execute(
+                "SELECT * FROM promotion_intents WHERE intent_id = ?", (intent_id,)
+            )
+            compensated = await cursor.fetchone()
+            assert compensated is not None
+            return self._promotion_intent_from_row(compensated)
 
     async def record_promotion_incident(
         self, intent_id: str, *, error_code: str, message: str
@@ -942,12 +990,7 @@ class RunLedger:
 
     @staticmethod
     def _promotion_intent_from_row(row: aiosqlite.Row) -> PromotionIntent:
-        raw_status = row["status"]
-        if raw_status not in {"PENDING", "COMMITTED"}:
-            raise LedgerError(
-                f"promotion intent {row['intent_id']} has corrupted status {raw_status!r}; "
-                "repair the ledger before reconciling artifacts"
-            )
+        status = _promotion_status(row["status"], row["intent_id"])
         return PromotionIntent(
             intent_id=row["intent_id"],
             action_id=row["action_id"],
@@ -956,7 +999,7 @@ class RunLedger:
             canonical_relpath=row["canonical_relpath"],
             checksum=row["checksum"],
             media_type=row["media_type"],
-            status=cast(Literal["PENDING", "COMMITTED"], raw_status),
+            status=status,
             created_at=_parse_time(row["created_at"]),
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
         )
@@ -1063,6 +1106,15 @@ def _action_status(value: str, field: str) -> ActionStatus:
         raise LedgerError(
             f"invalid persisted {field} value {value!r}; repair or recreate the ledger before resuming"
         ) from exc
+
+
+def _promotion_status(value: str, intent_id: str) -> PromotionStatus:
+    if value not in {"PENDING", "COMMITTED", "CONFLICT"}:
+        raise LedgerError(
+            f"promotion intent {intent_id} has corrupted status {value!r}; "
+            "repair the ledger before reconciling artifacts"
+        )
+    return cast(PromotionStatus, value)
 
 
 def _parse_time(value: str) -> datetime:

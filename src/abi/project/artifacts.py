@@ -13,7 +13,7 @@ from typing import NoReturn
 from weakref import finalize
 
 from abi.project.layout import BookProject
-from abi.project.run_ledger import PromotionIntent, RunLedger
+from abi.project.run_ledger import LedgerTransitionError, PromotionIntent, RunLedger
 
 __all__ = [
     "ArtifactConflictError",
@@ -52,11 +52,20 @@ class InjectedCrash(RuntimeError):
 
 def sha256_file(path: Path) -> str:
     """Return the SHA-256 digest of a regular artifact file."""
-    digest = sha256()
-    with path.open("rb") as artifact:
-        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    if os.name != "posix" or _O_NOFOLLOW == 0 or _O_NONBLOCK == 0:
+        raise RuntimeError("artifact checksums require POSIX O_NOFOLLOW and O_NONBLOCK support")
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("artifact checksum path may not be a symlink") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("artifact checksum target must be a regular file")
+        return _sha256_fd(fd)
+    finally:
+        os.close(fd)
 
 
 class ArtifactStore:
@@ -174,15 +183,32 @@ class ArtifactStore:
         self, intent: PromotionIntent, *, crash_after: str | None = None
     ) -> PromotionIntent:
         _require_secure_dirfd_support()
+        if intent.status == "CONFLICT":
+            raise ArtifactConflictError(
+                f"promotion intent {intent.intent_id} is CONFLICT; inspect its incident and repair the artifact"
+            )
         try:
             self._assert_root_anchor()
             staged_parts = self._staged_file_parts(intent.action_id, intent.attempt, intent.staged_relpath)
             canonical_parts = self._canonical_parts(intent.canonical_relpath)
-            canonical_parent_fd = self._open_project_parent(canonical_parts, create=True)
+            canonical_parent_fd = self._open_project_parent(
+                canonical_parts, create=intent.status == "PENDING"
+            )
+        except FileNotFoundError as exc:
+            if intent.status == "COMMITTED":
+                await self._raise_missing_committed(intent)
+            await self._record_invalid_intent(intent, str(exc))
+            raise ArtifactConflictError(f"invalid promotion intent requires ledger repair: {exc}") from exc
         except (OSError, ValueError) as exc:
             await self._record_invalid_intent(intent, str(exc))
             raise ArtifactConflictError(f"invalid promotion intent requires ledger repair: {exc}") from exc
         try:
+            if intent.status == "COMMITTED":
+                if _sha256_regular_at(canonical_parent_fd, canonical_parts[-1]) is None:
+                    await self._raise_missing_committed(intent)
+                return await self._commit_existing(
+                    intent, staged_parts, canonical_parent_fd, canonical_parts[-1]
+                )
             staged_checksum = await self._validated_staged_checksum(intent, staged_parts)
             if staged_checksum is None:
                 if _sha256_regular_at(canonical_parent_fd, canonical_parts[-1]) is None:
@@ -218,21 +244,24 @@ class ArtifactStore:
                 _raise_unsafe_path_error(exc)
             try:
                 _require_regular_file(canonical_fd)
-                canonical_stat = os.fstat(canonical_fd)
-                os.fsync(canonical_parent_fd)
-                if crash_after == "after_canonical_create":
-                    raise InjectedCrash("injected crash after canonical file creation")
-                source_fd = self._open_staged_file(intent.action_id, intent.attempt, staged_parts)
-                if source_fd is None:
-                    raise FileNotFoundError(
-                        f"staged artifact {intent.staged_relpath} disappeared during promotion"
-                    )
                 try:
-                    while chunk := os.read(source_fd, 1024 * 1024):
-                        _write_all(canonical_fd, chunk)
-                finally:
-                    os.close(source_fd)
-                os.fsync(canonical_fd)
+                    canonical_stat = os.fstat(canonical_fd)
+                    os.fsync(canonical_parent_fd)
+                    if crash_after == "after_canonical_create":
+                        raise InjectedCrash("injected crash after canonical file creation")
+                    source_fd = self._open_staged_file(intent.action_id, intent.attempt, staged_parts)
+                    if source_fd is None:
+                        raise FileNotFoundError(
+                            f"staged artifact {intent.staged_relpath} disappeared during promotion"
+                        )
+                    try:
+                        while chunk := os.read(source_fd, 1024 * 1024):
+                            _write_all(canonical_fd, chunk)
+                    finally:
+                        os.close(source_fd)
+                    os.fsync(canonical_fd)
+                except OSError as exc:
+                    await self._raise_write_incomplete(intent, exc)
                 if _sha256_fd(canonical_fd) != intent.checksum:
                     await self._raise_checksum_conflict(
                         intent, "new canonical artifact has a different checksum"
@@ -241,9 +270,12 @@ class ArtifactStore:
                 self._assert_directory_binding(canonical_parent_fd, canonical_parts[:-1])
                 if not _named_inode_matches(canonical_parent_fd, canonical_parts[-1], canonical_stat):
                     await self._raise_checksum_conflict(intent, "canonical artifact name was replaced")
-                os.fsync(canonical_parent_fd)
-                if crash_after == "after_rename":
-                    raise InjectedCrash("injected crash after artifact install")
+                try:
+                    os.fsync(canonical_parent_fd)
+                except OSError as exc:
+                    await self._raise_write_incomplete(intent, exc)
+                if crash_after == "after_canonical_write":
+                    raise InjectedCrash("injected crash after canonical artifact write")
                 return await self._commit_existing(
                     intent,
                     staged_parts,
@@ -284,8 +316,20 @@ class ArtifactStore:
             staged_checksum = await self._validated_staged_checksum(intent, staged_parts)
             if staged_checksum is not None and staged_checksum != intent.checksum:
                 await self._raise_checksum_conflict(intent, "staged artifact has a different checksum")
-            os.fsync(canonical_parent_fd)
-            committed = await self._require_ledger().commit_promotion_intent(intent.intent_id)
+            try:
+                os.fsync(canonical_parent_fd)
+            except OSError as exc:
+                await self._raise_write_incomplete(intent, exc)
+            try:
+                committed = await self._require_ledger().commit_promotion_intent(intent.intent_id)
+            except LedgerTransitionError as exc:
+                durable_intent = await self._require_ledger().get_promotion_intent(intent.intent_id)
+                if durable_intent.status != "CONFLICT":
+                    raise
+                raise ArtifactConflictError(
+                    f"promotion intent {intent.intent_id} became CONFLICT during commit; "
+                    "inspect its incident and continue reconciliation"
+                ) from exc
             if (
                 _sha256_fd(canonical_fd) != intent.checksum
                 or not _named_inode_matches(canonical_parent_fd, canonical_name, canonical_stat)
@@ -299,7 +343,7 @@ class ArtifactStore:
             os.close(canonical_fd)
 
     async def _raise_checksum_conflict(self, intent: PromotionIntent, detail: str) -> NoReturn:
-        await self._require_ledger().record_promotion_incident(
+        await self._require_ledger().conflict_promotion_intent(
             intent.intent_id,
             error_code="artifact_checksum_conflict",
             message=(
@@ -311,8 +355,36 @@ class ArtifactStore:
             f"{detail} for {intent.canonical_relpath}; inspect and choose the canonical artifact"
         )
 
+    async def _raise_missing_committed(self, intent: PromotionIntent) -> NoReturn:
+        await self._require_ledger().conflict_promotion_intent(
+            intent.intent_id,
+            error_code="artifact_promotion_missing",
+            message=(
+                f"committed canonical artifact {intent.canonical_relpath} is missing; "
+                "inspect storage, retain staged evidence, and create a repair action"
+            ),
+        )
+        raise ArtifactConflictError(
+            f"committed canonical artifact {intent.canonical_relpath} is missing; "
+            "inspect storage and repair the promotion conflict"
+        )
+
+    async def _raise_write_incomplete(self, intent: PromotionIntent, error: OSError) -> NoReturn:
+        await self._require_ledger().conflict_promotion_intent(
+            intent.intent_id,
+            error_code="canonical_write_incomplete",
+            message=(
+                f"canonical write for {intent.canonical_relpath} was incomplete after storage error "
+                f"{error}; inspect storage and retain the partial canonical and staged artifact"
+            ),
+        )
+        raise ArtifactConflictError(
+            f"canonical artifact for {intent.canonical_relpath} was retained after storage failure; "
+            "it may be partial, so inspect storage and retain both artifacts"
+        ) from error
+
     async def _record_invalid_intent(self, intent: PromotionIntent, detail: str) -> None:
-        await self._require_ledger().record_promotion_incident(
+        await self._require_ledger().conflict_promotion_intent(
             intent.intent_id,
             error_code="artifact_intent_invalid",
             message=f"promotion intent {intent.intent_id} is unsafe: {detail}; repair the ledger",
@@ -598,7 +670,10 @@ def _require_secure_dirfd_support() -> None:
         os.name != "posix"
         or _O_DIRECTORY == 0
         or _O_NOFOLLOW == 0
+        or _O_NONBLOCK == 0
         or os.open not in os.supports_dir_fd
         or os.mkdir not in os.supports_dir_fd
     ):
-        raise RuntimeError("artifact promotion requires POSIX dirfd and O_NOFOLLOW support")
+        raise RuntimeError(
+            "artifact promotion requires POSIX dirfd, O_NOFOLLOW, and O_NONBLOCK support"
+        )

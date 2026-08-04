@@ -610,76 +610,163 @@ git commit -m "feat: add transactional run ledger"
 - Extend: `src/abi/project/run_ledger.py`
 - Modify: `src/abi/project/layout.py`
 - Test: `tests/test_artifact_promotion.py`
+- Test: `tests/test_run_ledger.py`
 
 **Interfaces:**
 - Consumes: `RunLedger` and `ArtifactRef`.
-- Produces: `ArtifactStore.staging_dir()`, `prepare_promotion()`, `promote()`, `reconcile_intent()`, `sha256_file()`, and ledger promotion-intent methods.
+- Produces: create-only `ArtifactStore.write_staged_bytes()`, display-only `staging_dir()`,
+  `prepare_promotion()`, `promote()`, `reconcile_intent()`, safe `sha256_file()`, and durable
+  `PENDING | COMMITTED | CONFLICT` promotion transitions.
 
-- [ ] **Step 1: Write crash-boundary and conflict tests**
+- [ ] **Step 1: Write crash, race, storage-failure, and conflict-state tests**
 
 ```python
 @pytest.mark.asyncio
-@pytest.mark.parametrize("crash_point", ["after_intent", "after_rename"])
+@pytest.mark.parametrize("crash_point", ["after_intent", "after_canonical_write"])
 async def test_reconcile_completes_interrupted_promotion(tmp_path: Path, crash_point: str) -> None:
-    store, ledger, staged = await prepared_store(tmp_path, content="translation")
-    with pytest.raises(InjectedCrash):
-        await store.promote(staged, crash_after=crash_point)
-    await store.reconcile_all()
-    assert (tmp_path / "chapters/final/001.md").read_text() == "translation"
-    assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
+        with pytest.raises(InjectedCrash):
+            await store.promote(staged, crash_after=crash_point)
+        await store.reconcile_all()
+        assert (tmp_path / "chapters/final/001.md").read_text() == "translation"
+        assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
 
 
 @pytest.mark.asyncio
 async def test_different_canonical_checksum_creates_conflict(tmp_path: Path) -> None:
-    store, ledger, staged = await prepared_store(tmp_path, content="new")
-    canonical = tmp_path / "chapters/final/001.md"
-    canonical.parent.mkdir(parents=True)
-    canonical.write_text("old")
-    with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
-        await store.promote(staged)
-    assert await ledger.has_open_incident("artifact_checksum_conflict")
+    async with prepared_store(tmp_path, content="new") as (store, ledger, staged):
+        canonical = tmp_path / "chapters/final/001.md"
+        canonical.parent.mkdir(parents=True)
+        canonical.write_text("old")
+        with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
+            await store.promote(staged)
+        assert await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_canonical_race_inside_ledger_commit_is_compensated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with prepared_store(tmp_path, content="expected") as (store, ledger, intent):
+        canonical = tmp_path / "chapters/final/001.md"
+        commit = ledger.commit_promotion_intent
+
+        async def commit_then_replace(intent_id: str) -> PromotionIntent:
+            committed = await commit(intent_id)
+            canonical.unlink()
+            canonical.write_text("competing", encoding="utf-8")
+            return committed
+
+        monkeypatch.setattr(ledger, "commit_promotion_intent", commit_then_replace)
+        with pytest.raises(ArtifactConflictError):
+            await store.promote(intent)
+        assert await ledger.promotion_state(intent.intent_id) == "CONFLICT"
+
+
+def test_sha256_file_rejects_a_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"artifact")
+    alias = tmp_path / "alias.bin"
+    alias.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        sha256_file(alias)
 ```
+
+Add the companion FIFO test with a bounded worker join, forced teardown only for the RED run, and
+`/dev/fd` counts before/after. It must fail if the call blocks, accepts the FIFO, or leaks its opened
+descriptor. Add partial-write then `ENOSPC` injection that asserts `canonical_write_incomplete`, a
+durable `CONFLICT`, preserved partial/staged bytes, and absence of `artifact_intent_invalid`.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
-Run: `.venv/bin/pytest tests/test_artifact_promotion.py -v`
+Run: `.venv/bin/pytest tests/test_artifact_promotion.py tests/test_run_ledger.py -v`
 
-Expected: collection fails because `abi.project.artifacts` does not exist.
+Expected: the new tests fail because `CONFLICT` parsing/compensation, post-commit repair,
+`canonical_write_incomplete`, and no-follow/nonblocking public hashing are absent.
 
-- [ ] **Step 3: Implement staged paths and checksum records**
+- [ ] **Step 3: Implement the durable promotion state machine**
 
-`BookProject` gains `run_db`, `graph_checkpoints`, `staging_root`, and `status_projection` properties. `ArtifactStore.staging_dir(action_id, attempt)` returns `state/staging/{action_id}/{attempt}` after validating both path components.
+`PromotionIntent.status` is exactly `PENDING | COMMITTED | CONFLICT`. The ledger provides an
+atomic compensation operation that changes either `PENDING` or `COMMITTED` to `CONFLICT` and
+creates one subject-scoped incident in the same SQLite transaction. Repeating the same
+compensation is idempotent. Repeating a matching `COMMITTED` transition is idempotent, but
+`CONFLICT → COMMITTED` is an illegal transition with a repair-oriented error. Unknown persisted
+states fail closed during repository-owned parsing.
 
-```python
-async def prepare_promotion(
-    self, *, action_id: str, attempt: int, staged_relpath: str,
-    canonical_relpath: str, media_type: str
-) -> PromotionIntent:
-    checksum = sha256_file(self._project.root / staged_relpath)
-    return await self._ledger.create_promotion_intent(
-        action_id=action_id,
-        attempt=attempt,
-        staged_relpath=staged_relpath,
-        canonical_relpath=canonical_relpath,
-        checksum=checksum,
-        media_type=media_type,
-    )
-```
+| Current status | Requested transition | Result |
+| --- | --- | --- |
+| `PENDING` | commit after all prechecks | `COMMITTED` |
+| `COMMITTED` | identical commit replay | unchanged `COMMITTED` |
+| `PENDING` or `COMMITTED` | conflict compensation + incident | `CONFLICT` atomically |
+| `CONFLICT` | repeated same compensation | unchanged `CONFLICT`, no duplicate incident |
+| `CONFLICT` | commit | reject; never report success |
 
-- [ ] **Step 4: Implement promotion and reconciliation**
+- [ ] **Step 4: Implement pinned, create-only staging and checksum I/O**
 
-Promotion writes the ledger intent first, verifies canonical checksum, uses same-filesystem `Path.replace`, then confirms the intent in a second transaction. `reconcile_intent()` handles all four combinations of staged/canonical presence and never deletes a differing artifact. Clean only staging directories whose intents are committed and whose checksum matches canonical.
+Pin the project root descriptor and its device/inode for the `ArtifactStore` lifetime. Traverse all
+staging and canonical directories relative to pinned dirfds with `O_DIRECTORY | O_NOFOLLOW`, and
+revalidate the durable root and directory-chain identities before commit and after commit.
+`write_staged_bytes()` creates each leaf once with
+`O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK`, requires a regular file, and fsyncs the
+file and parent. `staging_dir()` is display-only. `sha256_file()` opens with
+`O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, requires a regular file through `fstat`, and closes the fd on
+every success and failure path; symlinks are rejected and FIFOs never block.
 
-- [ ] **Step 5: Run focused and project tests**
+- [ ] **Step 5: Implement create-only canonical promotion**
 
-Run: `.venv/bin/pytest tests/test_artifact_promotion.py tests/test_project_model.py -v`
+Persist the normalized `PENDING` intent before canonical mutation. Hold the canonical-parent dirfd
+through the whole operation. If the canonical name already exists, open it read-only without
+following links and commit only when its checksum matches. If absent, open the final canonical name
+exactly once with `O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK`, copy verified staged bytes through
+the returned fd, fsync and hash that fd, and prove that the name still identifies the same inode and
+the parent still belongs to the pinned durable chain. Then commit the ledger intent and repeat the
+inode/checksum/directory-chain checks.
+
+The last filesystem precheck and the SQLite update are deliberately **not** described as atomic.
+Any identity, checksum, or directory-chain failure after SQLite commit immediately compensates
+`COMMITTED → CONFLICT` and records the incident. A process crash in that window leaves
+`COMMITTED`; startup reconciliation repeats the postchecks and performs the same durable
+compensation if it finds drift.
+
+The same non-atomic window permits another connection to compensate a stale `PENDING` snapshot to
+`CONFLICT` while a worker is already copying. That worker may have created or written the canonical
+candidate before it learns the durable state, but its ledger commit must be rejected and converted
+to an aggregateable artifact conflict. Preserve the candidate and continue later intents. Calls
+that load `CONFLICT` perform no further write or delete; this rule does not claim to undo syscalls
+already issued by an in-flight worker.
+
+Do not create promotion temporary names, rename/replace/link an artifact into place, overwrite a
+canonical name, or automatically unlink staged/canonical files. A partial canonical created by a
+write, file-fsync, or parent-directory-fsync failure is retained. Record
+`canonical_write_incomplete` with instructions to inspect storage and preserve the partial
+canonical plus staged source; never misclassify that failure as `artifact_intent_invalid`.
+
+- [ ] **Step 6: Implement reconciliation from the durable state table**
+
+| Durable status | Filesystem evidence | Reconciliation |
+| --- | --- | --- |
+| `PENDING` | valid staged; canonical absent | perform the create-only copy and guarded commit |
+| `PENDING` | canonical checksum matches; staged absent or matches | guarded commit to `COMMITTED` |
+| `PENDING` | neither artifact exists | remain `PENDING`; idempotent `artifact_promotion_missing` incident |
+| `PENDING` | canonical differs/is partial, staged differs, or intent path is unsafe | atomically enter `CONFLICT`; retain every artifact |
+| `COMMITTED` | canonical name/inode/checksum/dirchain match; staged absent or matches | remain `COMMITTED` |
+| `COMMITTED` | canonical missing/drifted, staged differs, or any identity/dirchain check fails | atomically compensate to `CONFLICT`; never recreate canonical |
+| `CONFLICT` | any evidence | a caller that observes it never commits, rewrites, or deletes; an already in-flight stale `PENDING` worker preserves its candidate and fails commit; surface the incident and continue later intents |
+
+`reconcile_all()` processes every intent before raising an aggregate conflict. Repeated
+reconciliation and compensation do not duplicate incidents. Automatic staged cleanup remains out of
+scope until a separate durable ownership protocol can prove safe unlinking.
+
+- [ ] **Step 7: Run focused and project tests**
+
+Run: `.venv/bin/pytest tests/test_artifact_promotion.py tests/test_project_model.py tests/test_run_ledger.py -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit artifact transactions**
+- [ ] **Step 8: Commit artifact transactions**
 
 ```bash
-git add src/abi/project tests/test_artifact_promotion.py
+git add src/abi/project tests/test_artifact_promotion.py tests/test_run_ledger.py
 git commit -m "feat: reconcile staged artifact promotion"
 ```
 
@@ -1128,7 +1215,8 @@ git commit -m "feat: execute durable policy-gated action loop"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", [
     "before_dispatch", "after_action_output", "after_promotion_intent",
-    "after_artifact_rename", "after_ledger_commit", "before_graph_checkpoint",
+    "after_canonical_create", "after_canonical_write",
+    "after_promotion_commit_before_postcheck", "after_ledger_commit", "before_graph_checkpoint",
 ])
 async def test_crash_boundaries_do_not_duplicate_business_facts(
     tmp_path: Path, boundary: str

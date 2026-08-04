@@ -448,7 +448,8 @@ LangGraph checkpoint
 | --- | --- |
 | Action 执行前 | 重新派发 |
 | 执行中且没有工件 | 按 retry policy 重试 |
-| 工件已写但未业务 commit | validator 验证；合格则补交事务 |
+| staging 已写但 promotion 仍为 `PENDING` | 按第 12 节的 create-only 协议验证并补完，或保留证据进入 `CONFLICT` |
+| promotion 已 `COMMITTED` 但进程尚未完成文件系统后验 | Reconciler 重做 inode/checksum/目录链检查；drift 时补偿为 `CONFLICT` |
 | ledger 已 commit 但 graph 未 checkpoint | Reconciler 发现已成功并跳过执行 |
 | gate FAIL | 保留证据并 replan 修复动作 |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
@@ -460,28 +461,72 @@ LangGraph checkpoint
 
 ## 12. 工件隔离与提交
 
-Action 不直接覆盖 canonical artifacts。每次 attempt 写：
+Action 不直接覆盖 canonical artifacts。每次 attempt 的 staging 命名空间为：
 
 ```text
 state/staging/{action_id}/{attempt}/...
 ```
 
-流程为：
+`ArtifactStore` 生命周期内固定持有项目根目录 fd 及其 device/inode；staging 与 canonical 的所有
+遍历均相对该 fd，使用 `O_DIRECTORY | O_NOFOLLOW`，并在关键边界重开 durable 路径确认根目录和
+目录链仍绑定到原 inode。`staging_dir()` 只返回展示路径，不授予安全写能力。
 
-1. 写临时文件；
-2. 计算 checksum；
-3. validator 检查 staging 工件；
-4. PASS 后原子 rename/replace 到 canonical 路径；
-5. 在同一业务事务记录 artifact 与 gate evidence。
+staging 写入采用 create-only 协议：`write_staged_bytes()` 通过 no-follow dirfd 链创建父目录，以
+`O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK` 打开叶子，`fstat` 要求 regular file，写完
+后 fsync 文件与父目录。已存在名称一律拒绝，不能截断现有 inode 或经 hardlink 修改别处内容。
+公共 `sha256_file()` 同样以 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` 打开，`fstat` 后只接受 regular
+file，并在所有成功/异常路径关闭 fd；symlink 被拒绝，FIFO 不得阻塞。
 
-若 canonical 路径已有相同 checksum，视为幂等成功；checksum 不同则创建 conflict incident，禁止
-静默覆盖。
+validator PASS 后按以下顺序提升：
 
-文件系统 rename 与 SQLite 事务无法组成真正的跨介质原子提交，因此第 4、5 步使用显式
-`promotion_intent`：先在 ledger 事务写入待提升记录，再执行同文件系统原子 rename，最后在新事务
-确认 artifact 与 gate。任何边界崩溃都由 Reconciler 根据 intent、staging/canonical checksum 和
-ledger 状态补完或创建 conflict incident；文中的“原子提交”仅指单个 ledger 事务，不暗示跨介质
-两阶段事务。
+1. 通过安全 staging fd 计算 checksum，规范化 staged/canonical 相对路径，并在 ledger 中唯一预留
+   canonical 路径，写入 `PENDING` promotion intent；
+2. 固定持有 canonical parent dirfd，复核项目根、目录链、staging checksum；
+3. canonical 名称若已存在，只读验证 regular-file/inode/checksum；相同 checksum 是幂等候选，不同
+   checksum 立即进入 `CONFLICT`；
+4. canonical 名称若不存在，直接以
+   `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK` 打开**最终名称一次**，从已验证的 staged fd
+   复制，fsync 并对 canonical fd 计算 checksum；
+5. 证明 canonical 名称仍指向该 fd 的 inode，目录链仍绑定到 pinned root，然后在一个 SQLite 事务
+   中提交 `PENDING → COMMITTED`；
+6. ledger commit 返回后再次检查 canonical fd checksum、名称/inode 和目录链。任何失败都立即在
+   SQLite 中原子补偿 `COMMITTED → CONFLICT` 并创建 subject-scoped incident。
+
+第 5 步之前的最后一次文件系统检查与 SQLite 更新之间存在不可消除的窗口；本文**不宣称文件系统与
+SQLite 原子**。若进程在 ledger commit 后、第 6 步之前崩溃，durable 状态暂为 `COMMITTED`；启动
+Reconciler 必须重做后验，发现 identity/checksum/目录链 drift 时转为 `CONFLICT`，不能继续把该
+intent 当成成功。
+
+同一窗口也允许另一个连接把该 intent 补偿为 `CONFLICT`。由于协议不虚构文件系统与 SQLite 的
+原子性，已经按先前 `PENDING` 快照进入 copy 的 worker 可能在获知补偿前创建或写入 canonical
+候选；它在 ledger commit 处必须被拒绝，将该拒绝转换为可聚合的 artifact conflict，并保留候选
+文件。任何**已经读取到** `CONFLICT` 的后续调用都不得再写入或删除。这里的终止语义不追溯撤销
+另一个 worker 已经执行的系统调用。
+
+协议不创建 promotion temporary name，不把 staging rename/replace/link 到 canonical，不覆盖现有
+canonical，也不自动删除 staging、partial canonical 或其他候选 inode。canonical 创建后的 copy、
+file fsync 或 parent-dir fsync 发生 partial write、`ENOSPC` 或其他 durability failure 时保留 partial
+canonical 与 staged 证据，记录
+`canonical_write_incomplete`，处置为检查存储并保留两者；不得误记为 `artifact_intent_invalid` 或
+“repair ledger”。crash 后只知道 canonical checksum 不同时可记 `artifact_checksum_conflict`，仍须
+保留所有文件供人工选择。
+
+Promotion intent 的合法状态与恢复语义为：
+
+| Durable 状态 | 文件系统证据 | Reconciler 行为 |
+| --- | --- | --- |
+| `PENDING` | staged 有效、canonical 不存在 | 执行 create-only copy 和受保护 commit |
+| `PENDING` | canonical checksum 相同；staged 不存在或相同 | 完成受保护 commit，转 `COMMITTED` |
+| `PENDING` | staged/canonical 都不存在 | 保持 `PENDING`，幂等记录 `artifact_promotion_missing` |
+| `PENDING` | canonical 不同或 partial、staged checksum 不同、intent 路径不安全 | 原子转 `CONFLICT` 并记录对应 incident；不删文件 |
+| `COMMITTED` | canonical 名称/inode/checksum/目录链一致；staged 不存在或相同 | 保持 `COMMITTED` |
+| `COMMITTED` | canonical 缺失或 drift、staged 不同、identity/目录链复核失败 | 原子补偿为 `CONFLICT`；不得从 staging 重建 canonical |
+| `CONFLICT` | 任意 | 观察到该状态的调用不再 commit、写入或删除；返回已有冲突，同时继续对账后续 intents；已在途的旧 `PENDING` worker 只能保留候选并在 commit 处失败 |
+
+ledger 只允许验证后的 `PENDING → COMMITTED`、幂等 `COMMITTED → COMMITTED`，以及原子的
+`PENDING/COMMITTED → CONFLICT + incident`。重复补偿保持 `CONFLICT` 且不重复 incident；
+`CONFLICT → COMMITTED` 非法。`reconcile_all()` 处理全部 intents 后才汇总抛错，一个冲突不得阻断
+后续可恢复 intent。自动清理只有在未来另行设计 durable ownership/unlink 协议后才可加入。
 
 发布、上传等不可逆动作采用 `prepare → commit → reconcile` 协议并携带 idempotency key。
 
@@ -602,7 +647,7 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 在每个 checkpoint/commit 边界注入崩溃，验证：
 
 - 已提交 Action 不重复；
-- 未提交 staging 可验证或清理；
+- 未提交 staging 可验证并保留；本协议不自动清理 staging；
 - ledger commit 后 graph crash 能跳过；
 - `Indeterminate` 不会盲重试；
 - budget/HITL/blocked 可恢复；

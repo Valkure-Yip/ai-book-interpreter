@@ -55,6 +55,19 @@ async def _seed_authorized_action(ledger: RunLedger, action_id: str = "a1") -> N
     await ledger.start_attempt(action_id)
 
 
+async def _seed_promotion_intent(ledger: RunLedger) -> str:
+    await _seed_authorized_action(ledger)
+    intent = await ledger.create_promotion_intent(
+        action_id="a1",
+        attempt=1,
+        staged_relpath="state/staging/a1/1/source.json",
+        canonical_relpath="source/a1.json",
+        checksum="abc",
+        media_type="application/json",
+    )
+    return intent.intent_id
+
+
 def _success_commit(
     action_id: str,
     checksum: str,
@@ -354,6 +367,104 @@ async def test_unknown_persisted_action_status_has_repair_error(tmp_path: Path) 
 
         with pytest.raises(LedgerError, match=r"actions.status.*BROKEN.*repair or recreate"):
             await ledger.get_action("a1")
+
+
+@pytest.mark.asyncio
+async def test_conflict_is_a_valid_persisted_promotion_status(tmp_path: Path) -> None:
+    """Catch valid compensated intents being rejected as corrupt ledger rows."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        intent_id = await _seed_promotion_intent(ledger)
+        await ledger._db.execute(
+            "UPDATE promotion_intents SET status = 'CONFLICT' WHERE intent_id = ?", (intent_id,)
+        )
+        await ledger._db.commit()
+
+        intent = await ledger.get_promotion_intent(intent_id)
+
+        assert intent.status == "CONFLICT"
+        assert await ledger.promotion_state(intent_id) == "CONFLICT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_first", [False, True])
+async def test_promotion_conflict_compensation_is_atomic_and_idempotent(
+    tmp_path: Path, commit_first: bool
+) -> None:
+    """Catch compensation that leaves a pending/successful intent or duplicates its incident."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        intent_id = await _seed_promotion_intent(ledger)
+        if commit_first:
+            await ledger.commit_promotion_intent(intent_id)
+
+        first = await ledger.conflict_promotion_intent(
+            intent_id,
+            error_code="artifact_checksum_conflict",
+            message="canonical bytes drifted; inspect and retain both artifacts",
+        )
+        second = await ledger.conflict_promotion_intent(
+            intent_id,
+            error_code="artifact_checksum_conflict",
+            message="canonical bytes drifted; inspect and retain both artifacts",
+        )
+
+        assert first == second
+        assert first.status == "CONFLICT"
+        assert await ledger.promotion_state(intent_id) == "CONFLICT"
+        incidents = [
+            incident
+            for incident in (await ledger.load_snapshot("run-1")).incidents
+            if incident.error_code == "artifact_checksum_conflict"
+        ]
+        assert len(incidents) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("commit_first", "expected_status"), [(False, "PENDING"), (True, "COMMITTED")]
+)
+async def test_promotion_conflict_compensation_rolls_back_if_incident_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_first: bool,
+    expected_status: str,
+) -> None:
+    """Catch the status update escaping its transaction when incident persistence fails."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        intent_id = await _seed_promotion_intent(ledger)
+        if commit_first:
+            await ledger.commit_promotion_intent(intent_id)
+
+        async def fail_incident(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("injected incident failure")
+
+        monkeypatch.setattr(ledger, "_insert_incident", fail_incident)
+
+        with pytest.raises(RuntimeError, match="injected incident failure"):
+            await ledger.conflict_promotion_intent(
+                intent_id,
+                error_code="artifact_checksum_conflict",
+                message="canonical bytes drifted; inspect and retain both artifacts",
+            )
+
+        assert await ledger.promotion_state(intent_id) == expected_status
+        assert not await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_conflicted_promotion_cannot_transition_back_to_committed(tmp_path: Path) -> None:
+    """Catch a compensated promotion being reported as successful on a later retry."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        intent_id = await _seed_promotion_intent(ledger)
+        await ledger.conflict_promotion_intent(
+            intent_id,
+            error_code="artifact_checksum_conflict",
+            message="canonical bytes drifted; inspect and retain both artifacts",
+        )
+
+        with pytest.raises(LedgerTransitionError, match=r"CONFLICT.*repair"):
+            await ledger.commit_promotion_intent(intent_id)
+
+        assert await ledger.promotion_state(intent_id) == "CONFLICT"
 
 
 @pytest.mark.asyncio

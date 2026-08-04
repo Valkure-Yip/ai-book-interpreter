@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+import stat
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 
+import abi.project.artifacts as artifact_module
 from abi.project.artifacts import (
     ArtifactConflictError,
     ArtifactStore,
     InjectedCrash,
     PromotionIntent,
+    sha256_file,
 )
 from abi.project.layout import BookProject
 from abi.project.run_ledger import LedgerConflictError, LedgerError, RunLedger, RunSeed
@@ -68,7 +73,7 @@ async def prepared_store(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("crash_point", ["after_intent", "after_rename"])
+@pytest.mark.parametrize("crash_point", ["after_intent", "after_canonical_write"])
 async def test_reconcile_completes_interrupted_promotion(
     tmp_path: Path, crash_point: str
 ) -> None:
@@ -149,16 +154,20 @@ async def test_reconcile_detects_tampered_committed_canonical(tmp_path: Path) ->
 
 @pytest.mark.asyncio
 async def test_reconcile_records_a_missing_committed_canonical(tmp_path: Path) -> None:
-    """Catch reconciler code that skips a committed intent whose canonical file disappears."""
+    """Catch recovery recreating a committed artifact after its canonical name drifts missing."""
     async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
         await store.promote(staged)
         (tmp_path / "chapters/final/001.md").unlink()
-        (tmp_path / "state/staging/translate-001/1/001.md").unlink()
 
-        await store.reconcile_all()
+        for _ in range(2):
+            with pytest.raises(ArtifactConflictError, match="promotion conflict"):
+                await store.reconcile_all()
 
-        assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         assert await ledger.has_open_incident("artifact_promotion_missing")
+        assert (tmp_path / "state/staging/translate-001/1/001.md").read_text(
+            encoding="utf-8"
+        ) == "translation"
 
 
 @pytest.mark.asyncio
@@ -276,6 +285,56 @@ def test_safe_staged_writer_never_modifies_an_existing_hardlinked_inode(tmp_path
 
     assert outside.read_bytes() == b"must survive"
     assert staged.read_bytes() == b"must survive"
+
+
+def test_sha256_file_rejects_a_symlink(tmp_path: Path) -> None:
+    """Catch the public checksum helper following a caller-controlled symlink."""
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"artifact")
+    alias = tmp_path / "alias.bin"
+    alias.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        sha256_file(alias)
+
+
+def test_sha256_file_rejects_a_fifo_without_blocking_or_leaking_fd(tmp_path: Path) -> None:
+    """Catch the public checksum helper blocking on or leaking a special-file descriptor."""
+    fifo = tmp_path / "artifact.fifo"
+    os.mkfifo(fifo)
+    outcome: list[object] = []
+    baseline = len(os.listdir("/dev/fd"))
+
+    def checksum_fifo() -> None:
+        try:
+            outcome.append(sha256_file(fifo))
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=checksum_fifo, daemon=True)
+    worker.start()
+    worker.join(timeout=0.5)
+    blocked = worker.is_alive()
+    if blocked:
+        unblock_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        os.close(unblock_fd)
+        worker.join(timeout=1)
+
+    assert not blocked, "sha256_file blocked while opening a FIFO"
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ValueError)
+    assert "regular file" in str(outcome[0])
+    assert len(os.listdir("/dev/fd")) <= baseline
+
+
+def test_store_fails_closed_without_nonblocking_open_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch internal staged/canonical opens silently losing their nonblocking guarantee."""
+    monkeypatch.setattr(artifact_module, "_O_NONBLOCK", 0)
+
+    with pytest.raises(RuntimeError, match="O_NONBLOCK"):
+        ArtifactStore(BookProject(tmp_path), None)
 
 
 def test_store_rejects_a_symlink_as_the_durable_project_root(tmp_path: Path) -> None:
@@ -425,10 +484,12 @@ async def test_two_ledger_connections_do_not_overwrite_competing_promotions(tmp_
 @pytest.mark.asyncio
 async def test_reconcile_all_continues_after_a_conflict(tmp_path: Path) -> None:
     """Catch reconciliation that abandons a later recoverable intent after one conflict."""
-    async with prepared_store(tmp_path, content="conflicting") as (store, ledger, _):
-        conflict = tmp_path / "chapters/final/001.md"
-        conflict.parent.mkdir(parents=True)
-        conflict.write_text("canonical", encoding="utf-8")
+    async with prepared_store(tmp_path, content="conflicting") as (store, ledger, first):
+        await ledger.conflict_promotion_intent(
+            first.intent_id,
+            error_code="artifact_checksum_conflict",
+            message="canonical ownership is disputed; inspect and retain both artifacts",
+        )
         await ledger.authorize_actions(
             "run-1",
             (
@@ -454,10 +515,79 @@ async def test_reconcile_all_continues_after_a_conflict(tmp_path: Path) -> None:
             media_type="text/markdown",
         )
 
+        for _ in range(2):
+            with pytest.raises(ArtifactConflictError, match="promotion conflict"):
+                await store.reconcile_all()
+
+        assert await ledger.promotion_state(first.intent_id) == "CONFLICT"
+        assert await ledger.promotion_state(second.intent_id) == "COMMITTED"
+        assert not (tmp_path / "chapters/final/001.md").exists()
+        assert (tmp_path / "chapters/final/002.md").read_text(encoding="utf-8") == "recovered"
+        first_incidents = [
+            incident
+            for incident in (await ledger.load_snapshot("run-1")).incidents
+            if incident.action_id == first.action_id
+        ]
+        assert [incident.error_code for incident in first_incidents] == [
+            "artifact_checksum_conflict"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_conflict_during_commit_does_not_block_later_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch a concurrent compensation escaping reconciliation as a ledger exception."""
+    async with prepared_store(tmp_path, content="conflicting") as (store, ledger, first):
+        await ledger.authorize_actions(
+            "run-1",
+            (
+                AuthorizedAction(
+                    action_id="translate-002",
+                    proposal_id="proposal-1",
+                    plan_version=1,
+                    capability="translate.chapter",
+                    parameters_json="{}",
+                    idempotency_key="translate-002",
+                ),
+            ),
+        )
+        await ledger.start_attempt("translate-002")
+        store.write_staged_bytes(
+            action_id="translate-002", attempt=1, relative_path="002.md", content=b"recovered"
+        )
+        second = await store.prepare_promotion(
+            action_id="translate-002",
+            attempt=1,
+            staged_relpath="state/staging/translate-002/1/002.md",
+            canonical_relpath="chapters/final/002.md",
+            media_type="text/markdown",
+        )
+        commit = ledger.commit_promotion_intent
+
+        async def compensate_before_commit(intent_id: str) -> PromotionIntent:
+            if intent_id == first.intent_id:
+                await ledger.conflict_promotion_intent(
+                    intent_id,
+                    error_code="artifact_checksum_conflict",
+                    message="concurrent verifier disputed canonical ownership",
+                )
+            return await commit(intent_id)
+
+        monkeypatch.setattr(ledger, "commit_promotion_intent", compensate_before_commit)
+
+        with pytest.raises(ArtifactConflictError, match="promotion conflict"):
+            await store.reconcile_all()
+        first_canonical = tmp_path / "chapters/final/001.md"
+        assert first_canonical.read_text(encoding="utf-8") == "conflicting"
+        (tmp_path / first.staged_relpath).write_text("later mutation", encoding="utf-8")
+
         with pytest.raises(ArtifactConflictError, match="promotion conflict"):
             await store.reconcile_all()
 
+        assert await ledger.promotion_state(first.intent_id) == "CONFLICT"
         assert await ledger.promotion_state(second.intent_id) == "COMMITTED"
+        assert first_canonical.read_text(encoding="utf-8") == "conflicting"
         assert (tmp_path / "chapters/final/002.md").read_text(encoding="utf-8") == "recovered"
 
 
@@ -475,7 +605,7 @@ async def test_staged_mutation_after_verification_never_commits_wrong_canonical(
         with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
             await store.promote(staged)
 
-        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         canonical = tmp_path / "chapters/final/001.md"
         assert canonical.read_text(encoding="utf-8") == "wrong"
         assert await ledger.has_open_incident("artifact_checksum_conflict")
@@ -596,7 +726,7 @@ async def test_canonical_directory_remap_after_validation_cannot_escape_project(
         with pytest.raises(ArtifactConflictError, match=r"repair|project directory"):
             await store.promote(staged)
 
-        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         assert not (saved_chapters / "final/001.md").exists()
         assert not (outside / "final/001.md").exists()
         assert await ledger.has_open_incident("artifact_intent_invalid")
@@ -621,7 +751,7 @@ async def test_project_root_remap_during_promotion_never_writes_external_or_comm
         with pytest.raises(ArtifactConflictError, match=r"project root|repair"):
             await store.promote(staged)
 
-        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         assert not (outside / "chapters/final/001.md").exists()
         assert not (saved_root / "chapters/final/001.md").exists()
         assert await ledger.has_open_incident("artifact_intent_invalid")
@@ -642,8 +772,89 @@ async def test_replaced_canonical_name_cannot_commit_or_delete_the_competing_ino
         with pytest.raises(ArtifactConflictError, match=r"canonical.*replaced|choose the canonical"):
             await store.promote(staged)
 
-        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         assert canonical.read_text(encoding="utf-8") == "competing"
+
+
+@pytest.mark.asyncio
+async def test_canonical_race_inside_ledger_commit_is_compensated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch a post-commit identity race remaining durably reported as successful."""
+    async with prepared_store(tmp_path, content="expected") as (store, ledger, staged):
+        canonical = tmp_path / "chapters/final/001.md"
+        commit = ledger.commit_promotion_intent
+
+        async def commit_then_replace(intent_id: str) -> PromotionIntent:
+            committed = await commit(intent_id)
+            canonical.unlink()
+            canonical.write_text("competing", encoding="utf-8")
+            return committed
+
+        monkeypatch.setattr(ledger, "commit_promotion_intent", commit_then_replace)
+
+        with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
+            await store.promote(staged)
+
+        assert canonical.read_text(encoding="utf-8") == "competing"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
+        assert await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_compensates_drift_after_commit_before_postcheck_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch recovery trusting COMMITTED after a crash skipped filesystem postchecks."""
+    async with prepared_store(tmp_path, content="expected") as (store, ledger, staged):
+        commit = ledger.commit_promotion_intent
+
+        async def commit_then_crash(intent_id: str) -> PromotionIntent:
+            await commit(intent_id)
+            raise InjectedCrash("injected crash after ledger commit")
+
+        monkeypatch.setattr(ledger, "commit_promotion_intent", commit_then_crash)
+        with pytest.raises(InjectedCrash, match="after ledger commit"):
+            await store.promote(staged)
+        assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
+
+        canonical = tmp_path / "chapters/final/001.md"
+        canonical.write_text("drifted", encoding="utf-8")
+        monkeypatch.setattr(ledger, "commit_promotion_intent", commit)
+
+        with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
+            await store.reconcile_all()
+
+        assert canonical.read_text(encoding="utf-8") == "drifted"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
+        assert await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_directory_chain_race_inside_ledger_commit_is_compensated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch post-commit directory rebinding leaving the intent durably successful."""
+    async with prepared_store(tmp_path, content="expected") as (store, ledger, staged):
+        commit = ledger.commit_promotion_intent
+        chapters = tmp_path / "chapters"
+        displaced = tmp_path / "displaced-chapters"
+
+        async def commit_then_rebind(intent_id: str) -> PromotionIntent:
+            committed = await commit(intent_id)
+            chapters.rename(displaced)
+            (chapters / "final").mkdir(parents=True)
+            return committed
+
+        monkeypatch.setattr(ledger, "commit_promotion_intent", commit_then_rebind)
+
+        with pytest.raises(ArtifactConflictError, match=r"project directory|repair"):
+            await store.promote(staged)
+
+        assert (displaced / "final/001.md").read_text(encoding="utf-8") == "expected"
+        assert not (chapters / "final/001.md").exists()
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
+        assert await ledger.has_open_incident("artifact_intent_invalid")
 
 
 def test_display_staging_path_remap_cannot_redirect_safe_writer(tmp_path: Path) -> None:
@@ -694,7 +905,7 @@ async def test_special_staged_file_records_repair_and_reconcile_continues(
 
         assert (tmp_path / "chapters/final/001.md").read_text(encoding="utf-8") == "good"
         assert await ledger.has_open_incident("artifact_intent_invalid")
-        assert await ledger.promotion_state(special_intent.intent_id) == "PENDING"
+        assert await ledger.promotion_state(special_intent.intent_id) == "CONFLICT"
 
 
 @pytest.mark.asyncio
@@ -713,12 +924,86 @@ async def test_partial_canonical_after_create_crash_is_preserved_and_never_commi
         with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
             await store.reconcile_all()
 
-        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
         assert canonical.read_bytes() == b""
         assert (tmp_path / "state/staging/translate-001/1/001.md").read_text(
             encoding="utf-8"
         ) == "translation"
         assert await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_partial_write_enospc_records_canonical_write_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch a storage write failure being mislabeled as a corrupt promotion intent."""
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
+        write = os.write
+        writes = 0
+
+        def partial_then_enospc(fd: int, data: bytes | memoryview) -> int:
+            nonlocal writes
+            if writes == 0:
+                writes += 1
+                return write(fd, data[:4])
+            raise OSError(errno.ENOSPC, "injected storage exhaustion")
+
+        monkeypatch.setattr(os, "write", partial_then_enospc)
+
+        with pytest.raises(ArtifactConflictError, match=r"storage|partial canonical"):
+            await store.promote(staged)
+
+        canonical = tmp_path / "chapters/final/001.md"
+        assert canonical.read_bytes() == b"tran"
+        assert (tmp_path / "state/staging/translate-001/1/001.md").read_bytes() == b"translation"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
+        error_codes = {
+            incident.error_code for incident in (await ledger.load_snapshot("run-1")).incidents
+        }
+        assert "canonical_write_incomplete" in error_codes
+        assert "artifact_intent_invalid" not in error_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_preexists", [False, True])
+async def test_parent_fsync_failure_records_canonical_write_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    canonical_preexists: bool,
+) -> None:
+    """Catch canonical durability failures being mislabeled as corrupt ledger paths."""
+    async with prepared_store(tmp_path, content="translation") as (_, ledger, staged):
+        canonical = tmp_path / "chapters/final/001.md"
+        if canonical_preexists:
+            canonical.parent.mkdir(parents=True)
+            canonical.write_text("translation", encoding="utf-8")
+        fail_directory_fsync = canonical_preexists
+
+        def arm_failure(point: str, _: PromotionIntent | None) -> None:
+            nonlocal fail_directory_fsync
+            if point == "after_canonical_written":
+                fail_directory_fsync = True
+
+        store = ArtifactStore(BookProject(tmp_path), ledger, test_hook=arm_failure)
+        fsync = os.fsync
+
+        def fail_parent_fsync(fd: int) -> None:
+            if fail_directory_fsync and stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.ENOSPC, "injected parent fsync exhaustion")
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_parent_fsync)
+
+        with pytest.raises(ArtifactConflictError, match=r"storage|partial canonical"):
+            await store.promote(staged)
+
+        assert canonical.read_text(encoding="utf-8") == "translation"
+        assert await ledger.promotion_state(staged.intent_id) == "CONFLICT"
+        error_codes = {
+            incident.error_code for incident in (await ledger.load_snapshot("run-1")).incidents
+        }
+        assert "canonical_write_incomplete" in error_codes
+        assert "artifact_intent_invalid" not in error_codes
 
 
 @pytest.mark.asyncio
@@ -763,7 +1048,7 @@ async def test_invalid_long_intent_does_not_block_later_valid_reconciliation(tmp
         with pytest.raises(ArtifactConflictError, match="promotion conflict"):
             await store.reconcile_all()
 
-        assert await ledger.promotion_state(invalid.intent_id) == "PENDING"
+        assert await ledger.promotion_state(invalid.intent_id) == "CONFLICT"
         assert await ledger.promotion_state(valid.intent_id) == "COMMITTED"
         assert (tmp_path / "chapters/final/002.md").read_text(encoding="utf-8") == "second"
         assert await ledger.has_open_incident("artifact_intent_invalid")
