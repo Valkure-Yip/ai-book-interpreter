@@ -192,6 +192,30 @@ def test_policy_emits_only_canonical_validated_parameters() -> None:
     assert decision.actions[0].idempotency_key == "run-1:2:ingest"
 
 
+@pytest.mark.parametrize("next_plan_version", (0, 1, 3))
+def test_policy_rejects_stale_equal_or_skipped_plan_versions(
+    next_plan_version: int,
+) -> None:
+    """Catch replayed or skipped plan versions that would reuse commit identities."""
+    patch = _patch(
+        _proposal(
+            "ingest",
+            "source.ingest",
+            arguments=(
+                ActionArgument(name="source_relpath", value_json='"source/raw.txt"'),
+            ),
+        )
+    )
+
+    decision = PolicyEngine(_registry()).authorize(
+        _snapshot(), patch, next_plan_version=next_plan_version
+    )
+
+    assert decision.authorized is False
+    assert decision.actions == ()
+    assert decision.reason_codes == ("invalid_plan_version",)
+
+
 @pytest.mark.parametrize(
     ("patch", "snapshot", "reason_code"),
     [

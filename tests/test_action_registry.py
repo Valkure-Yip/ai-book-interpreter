@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from abi.actions.contracts import ActionDefinition
@@ -28,6 +30,10 @@ async def _execute_unused(context: object, parameters: FrozenModel) -> object:
 
 def _validate_unused(project: object, parameters: FrozenModel) -> GateDecision:
     return GateDecision(passed=True, reason_code="ok", message="valid")
+
+
+def _different_validator(project: object, parameters: FrozenModel) -> GateDecision:
+    return GateDecision(passed=True, reason_code="different", message="valid")
 
 
 def _definition(
@@ -70,6 +76,25 @@ def test_registry_rejects_missing_validator_and_duplicate_capability() -> None:
     registry = _registry()
     with pytest.raises(RegistryConfigurationError, match="duplicate capability"):
         registry.register(_definition())
+
+
+@pytest.mark.parametrize(
+    "validator",
+    (
+        _different_validator,
+        object(),
+    ),
+)
+def test_registry_rejects_unregistered_or_non_callable_validator_bindings(
+    validator: object,
+) -> None:
+    """Catch an ActionDefinition that could execute a validator outside the registry."""
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(), validators={"source_manifest": _validate_unused}
+    )
+
+    with pytest.raises(RegistryConfigurationError, match="validator binding"):
+        registry.register(replace(_definition(), validator=validator))  # type: ignore[arg-type]
 
 
 def test_registry_parses_arguments_with_capability_schema() -> None:

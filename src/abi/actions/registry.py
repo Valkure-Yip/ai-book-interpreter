@@ -121,10 +121,20 @@ class ActionRegistry:
             raise RegistryConfigurationError(
                 f"input schema for {spec.capability} is not serializable; correct the model"
             ) from exc
-        if spec.validator not in self._validators:
+        registered_validator = self._validators.get(spec.validator)
+        if registered_validator is None:
             raise RegistryConfigurationError(
                 f"validator {spec.validator} for {spec.capability} is not registered; "
                 "register validator before startup"
+            )
+        if (
+            not callable(registered_validator)
+            or not callable(definition.validator)
+            or definition.validator is not registered_validator
+        ):
+            raise RegistryConfigurationError(
+                f"validator binding for {spec.capability} must use registered "
+                f"validator {spec.validator}; correct the action definition"
             )
         for predicate in spec.prerequisites:
             if not self._predicates.contains(predicate.name):

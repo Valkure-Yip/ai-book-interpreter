@@ -24,6 +24,10 @@ class PolicyEngine:
     def authorize(
         self, snapshot: RunSnapshot, patch: PlanPatch, *, next_plan_version: int
     ) -> AuthorizationDecision:
+        if next_plan_version != snapshot.plan_version + 1:
+            return AuthorizationDecision(
+                authorized=False, reason_codes=("invalid_plan_version",)
+            )
         reasons = self._collect_rejections(snapshot, patch)
         if reasons:
             return AuthorizationDecision(
