@@ -345,99 +345,105 @@ class RunLedger:
     async def commit_success(self, commit: SuccessCommit) -> CommittedAction:
         now = self._now()
         conflict = False
-        async with self.transaction() as db:
-            action = await self._require_action(db, commit.action_id)
-            signature = _commit_signature(commit, idempotency_key=action["idempotency_key"])
-            prior_signature = action["commit_signature"]
-            if _action_status(action["status"], "actions.status") is ActionStatus.SUCCEEDED:
-                if prior_signature == signature:
-                    return await self._committed_action(db, commit.action_id)
-                await self._insert_incident(
-                    db,
-                    run_id=action["run_id"],
-                    error_code="action_commit_conflict",
-                    message=(
-                        f"action {commit.action_id} was already committed with different checksums; "
-                        "inspect the canonical artifact and create a repair action"
-                    ),
-                    action_id=commit.action_id,
-                    now=now,
-                )
-                conflict = True
-            else:
-                _validate_success_fact_set(commit)
-                if _action_status(action["status"], "actions.status") is not ActionStatus.RUNNING:
-                    raise LedgerTransitionError(
-                        f"action {commit.action_id} is {action['status']}; start an attempt before committing success"
+        try:
+            async with self.transaction() as db:
+                action = await self._require_action(db, commit.action_id)
+                signature = _commit_signature(commit, idempotency_key=action["idempotency_key"])
+                prior_signature = action["commit_signature"]
+                if _action_status(action["status"], "actions.status") is ActionStatus.SUCCEEDED:
+                    if prior_signature == signature:
+                        return await self._committed_action(db, commit.action_id)
+                    await self._insert_incident(
+                        db,
+                        run_id=action["run_id"],
+                        error_code="action_commit_conflict",
+                        message=(
+                            f"action {commit.action_id} was already committed with different checksums; "
+                            "inspect the canonical artifact and create a repair action"
+                        ),
+                        action_id=commit.action_id,
+                        now=now,
                     )
-                attempt = await self._attempt_row(db, commit.action_id, commit.attempt)
-                if _action_status(attempt["status"], "action_attempts.status") is not ActionStatus.RUNNING:
-                    raise LedgerTransitionError(
-                        f"attempt {commit.attempt} for {commit.action_id} is already finished; do not commit it again"
-                    )
-                await db.execute(
-                    "UPDATE actions SET status = ?, committed_at = ?, commit_signature = ? WHERE action_id = ?",
-                    (ActionStatus.SUCCEEDED.value, now, signature, commit.action_id),
-                )
-                await db.execute(
-                    "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
-                    (ActionStatus.SUCCEEDED.value, now, commit.action_id, commit.attempt),
-                )
-                for artifact in commit.artifacts:
+                    conflict = True
+                else:
+                    _validate_success_fact_set(commit)
+                    if _action_status(action["status"], "actions.status") is not ActionStatus.RUNNING:
+                        raise LedgerTransitionError(
+                            f"action {commit.action_id} is {action['status']}; start an attempt before committing success"
+                        )
+                    attempt = await self._attempt_row(db, commit.action_id, commit.attempt)
+                    if _action_status(attempt["status"], "action_attempts.status") is not ActionStatus.RUNNING:
+                        raise LedgerTransitionError(
+                            f"attempt {commit.attempt} for {commit.action_id} is already finished; do not commit it again"
+                        )
                     await db.execute(
-                        "INSERT INTO artifacts (artifact_id, action_id, attempt, canonical_relpath, sha256, "
-                        "media_type, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "UPDATE actions SET status = ?, committed_at = ?, commit_signature = ? WHERE action_id = ?",
+                        (ActionStatus.SUCCEEDED.value, now, signature, commit.action_id),
+                    )
+                    await db.execute(
+                        "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
+                        (ActionStatus.SUCCEEDED.value, now, commit.action_id, commit.attempt),
+                    )
+                    for artifact in commit.artifacts:
+                        await db.execute(
+                            "INSERT INTO artifacts (artifact_id, action_id, attempt, canonical_relpath, sha256, "
+                            "media_type, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                artifact.artifact_id,
+                                commit.action_id,
+                                commit.attempt,
+                                artifact.relpath,
+                                artifact.sha256,
+                                artifact.media_type,
+                                now,
+                            ),
+                        )
+                    for evidence in commit.gate_evidence:
+                        await db.execute(
+                            "INSERT INTO gate_evidence (evidence_id, action_id, gate, passed, validator_version, "
+                            "artifact_checksums_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                evidence.evidence_id,
+                                commit.action_id,
+                                evidence.gate,
+                                int(evidence.passed),
+                                evidence.validator_version,
+                                _dump_tuple(evidence.artifact_checksums),
+                                now,
+                            ),
+                        )
+                    await db.execute(
+                        "INSERT INTO budget_entries (entry_id, run_id, action_id, attempt, amount_usd, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
                         (
-                            artifact.artifact_id,
+                            f"action:{commit.action_id}:attempt:{commit.attempt}",
+                            action["run_id"],
                             commit.action_id,
                             commit.attempt,
-                            artifact.relpath,
-                            artifact.sha256,
-                            artifact.media_type,
+                            commit.cost_usd,
                             now,
                         ),
                     )
-                for evidence in commit.gate_evidence:
+                    payload = json.dumps(
+                        {"action_id": commit.action_id, "attempt": commit.attempt}, sort_keys=True
+                    )
                     await db.execute(
-                        "INSERT INTO gate_evidence (evidence_id, action_id, gate, passed, validator_version, "
-                        "artifact_checksums_json, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO event_outbox (event_id, event_name, aggregate_id, payload_json, "
+                        "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                         (
-                            evidence.evidence_id,
+                            f"action.committed:{commit.action_id}",
+                            "action.committed",
                             commit.action_id,
-                            evidence.gate,
-                            int(evidence.passed),
-                            evidence.validator_version,
-                            _dump_tuple(evidence.artifact_checksums),
+                            payload,
+                            f"action.committed:{commit.action_id}",
                             now,
                         ),
                     )
-                await db.execute(
-                    "INSERT INTO budget_entries (entry_id, run_id, action_id, attempt, amount_usd, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        f"action:{commit.action_id}:attempt:{commit.attempt}",
-                        action["run_id"],
-                        commit.action_id,
-                        commit.attempt,
-                        commit.cost_usd,
-                        now,
-                    ),
-                )
-                payload = json.dumps(
-                    {"action_id": commit.action_id, "attempt": commit.attempt}, sort_keys=True
-                )
-                await db.execute(
-                    "INSERT INTO event_outbox (event_id, event_name, aggregate_id, payload_json, "
-                    "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        f"action.committed:{commit.action_id}",
-                        "action.committed",
-                        commit.action_id,
-                        payload,
-                        f"action.committed:{commit.action_id}",
-                        now,
-                    ),
-                )
+        except aiosqlite.IntegrityError as exc:
+            raise LedgerConflictError(
+                f"action {commit.action_id} conflicts with a durable artifact fact; "
+                "inspect and choose the canonical artifact before retrying"
+            ) from exc
         if conflict:
             raise LedgerConflictError(
                 f"action {commit.action_id} conflicts with its prior commit; inspect the canonical artifact "

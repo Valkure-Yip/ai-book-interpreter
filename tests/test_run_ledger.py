@@ -198,6 +198,121 @@ async def test_replay_with_different_cost_creates_conflict_incident(tmp_path: Pa
         assert await ledger.has_open_incident("action_commit_conflict")
 
 
+def _replay_variant(commit: SuccessCommit, field: str) -> SuccessCommit:
+    artifact = commit.artifacts[0]
+    evidence = commit.gate_evidence[0]
+    if field == "attempt":
+        return commit.model_copy(update={"attempt": 2})
+    if field == "artifact_id":
+        return commit.model_copy(
+            update={"artifacts": (artifact.model_copy(update={"artifact_id": "artifact-other"}),)}
+        )
+    if field == "media_type":
+        return commit.model_copy(
+            update={"artifacts": (artifact.model_copy(update={"media_type": "text/plain"}),)}
+        )
+    if field == "evidence_id":
+        return commit.model_copy(
+            update={"gate_evidence": (evidence.model_copy(update={"evidence_id": "gate-other"}),)}
+        )
+    if field == "gate":
+        return commit.model_copy(
+            update={"gate_evidence": (evidence.model_copy(update={"gate": "different_gate"}),)}
+        )
+    if field == "validator_version":
+        return commit.model_copy(
+            update={"gate_evidence": (evidence.model_copy(update={"validator_version": "2"}),)}
+        )
+    if field == "evidence_checksum_set":
+        return commit.model_copy(
+            update={
+                "gate_evidence": (
+                    evidence.model_copy(update={"artifact_checksums": ("abc", "different")}),
+                )
+            }
+        )
+    if field == "cost":
+        return commit.model_copy(update={"cost_usd": 0.5})
+    raise AssertionError(f"unknown replay variant {field}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    (
+        "attempt",
+        "artifact_id",
+        "media_type",
+        "evidence_id",
+        "gate",
+        "validator_version",
+        "evidence_checksum_set",
+        "cost",
+    ),
+)
+async def test_replay_difference_creates_conflict_incident(
+    tmp_path: Path, field: str
+) -> None:
+    """Catch replays that alter any canonical success fact behind a stable action key."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        commit = _success_commit("a1", "abc")
+        await ledger.commit_success(commit)
+
+        with pytest.raises(LedgerConflictError, match="inspect the canonical artifact"):
+            await ledger.commit_success(_replay_variant(commit, field))
+
+        snapshot = await ledger.load_snapshot("run-1")
+        assert [incident.error_code for incident in snapshot.incidents] == [
+            "action_commit_conflict"
+        ]
+        assert await ledger.count_outbox_events("action.committed", "a1") == 1
+
+
+@pytest.mark.asyncio
+async def test_canonical_artifact_collision_rolls_back_mid_transaction(tmp_path: Path) -> None:
+    """Catch an artifact constraint failure that leaves partial action success facts behind."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        await ledger.authorize_actions("run-1", (_action("a2"),))
+        await ledger.start_attempt("a2")
+        await ledger.commit_success(_success_commit("a1", "abc"))
+        second = _success_commit("a2", "different").model_copy(
+            update={
+                "artifacts": (
+                    ArtifactCommit(
+                        artifact_id="artifact-a2",
+                        relpath="source/a1.json",
+                        sha256="different",
+                        producer_action_id="a2",
+                        media_type="application/json",
+                    ),
+                ),
+                "gate_evidence": (
+                    GateEvidence(
+                        evidence_id="gate-a2",
+                        gate="source_manifest",
+                        passed=True,
+                        validator_version="1",
+                        artifact_checksums=("different",),
+                    ),
+                ),
+            }
+        )
+
+        with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
+            await ledger.commit_success(second)
+
+        snapshot = await ledger.load_snapshot("run-1")
+        assert [action.status for action in snapshot.actions if action.action_id == "a2"] == [
+            ActionStatus.RUNNING
+        ]
+        assert await ledger.count_artifacts_for("a2") == 0
+        assert await ledger.count_outbox_events("action.committed", "a2") == 0
+        assert snapshot.remaining_budget_usd == 4.75
+        assert [evidence.evidence_id for evidence in snapshot.gate_evidence] == ["gate-a1"]
+
+
 @pytest.mark.asyncio
 async def test_concurrent_identical_commits_serialize_without_duplicate_facts(tmp_path: Path) -> None:
     """Catch shared-connection transactions that interleave and issue nested BEGIN calls."""
