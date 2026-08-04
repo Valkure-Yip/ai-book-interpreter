@@ -35,6 +35,17 @@ class LangfuseConfig(FrozenModel):
     upload_full_payload: bool = False
 
 
+class PlannerConfig(FrozenModel):
+    horizon: int = Field(default=5, ge=1)
+    max_rejections: int = Field(default=3, ge=0)
+
+
+class OrchestrationConfig(FrozenModel):
+    max_cycles: int = Field(default=500, ge=1)
+    max_parallel_actions: int = Field(default=4, ge=1)
+    default_action_attempts: int = Field(default=3, ge=1)
+
+
 class RunConfig(FrozenModel):
     # Optional override; normally derived from the {source}-{target} template.
     target_language: str | None = None
@@ -47,3 +58,5 @@ class RunConfig(FrozenModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
+    planner: PlannerConfig = Field(default_factory=PlannerConfig)
+    orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
