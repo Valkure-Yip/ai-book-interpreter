@@ -143,6 +143,21 @@ class IncidentRecord(FrozenModel):
     resolved_at: datetime | None = None
 
 
+class PromotionIntent(FrozenModel):
+    """A durable bridge between a staged file and its canonical destination."""
+
+    intent_id: str
+    action_id: str
+    attempt: int = Field(ge=1)
+    staged_relpath: str
+    canonical_relpath: str
+    checksum: str
+    media_type: str
+    status: str
+    created_at: datetime
+    committed_at: datetime | None = None
+
+
 Clock = Callable[[], datetime]
 
 
@@ -479,6 +494,156 @@ class RunLedger:
                 db, run_id=run_id, error_code=error_code, message=message, action_id=action_id, now=now
             )
 
+    async def create_promotion_intent(
+        self,
+        *,
+        action_id: str,
+        attempt: int,
+        staged_relpath: str,
+        canonical_relpath: str,
+        checksum: str,
+        media_type: str,
+    ) -> PromotionIntent:
+        """Record an immutable pending promotion before changing the filesystem."""
+        now = self._now()
+        canonical_conflict = False
+        async with self.transaction() as db:
+            action = await self._require_action(db, action_id)
+            await self._attempt_row(db, action_id, attempt)
+            cursor = await db.execute(
+                "SELECT * FROM promotion_intents WHERE action_id = ? AND attempt = ? "
+                "AND staged_relpath = ? AND canonical_relpath = ?",
+                (action_id, attempt, staged_relpath, canonical_relpath),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                if existing["checksum"] != checksum or existing["media_type"] != media_type:
+                    raise LedgerConflictError(
+                        f"promotion for {canonical_relpath} disagrees with its recorded checksum; "
+                        "inspect and choose the canonical artifact before retrying"
+                    )
+                return self._promotion_intent_from_row(existing)
+            cursor = await db.execute(
+                "SELECT intent_id FROM promotion_intents WHERE canonical_relpath = ?",
+                (canonical_relpath,),
+            )
+            canonical_intent = await cursor.fetchone()
+            if canonical_intent is not None:
+                await self._insert_incident(
+                    db,
+                    run_id=action["run_id"],
+                    error_code="artifact_checksum_conflict",
+                    message=(
+                        f"canonical artifact {canonical_relpath} already has promotion intent "
+                        f"{canonical_intent['intent_id']}; inspect and choose the canonical artifact"
+                    ),
+                    action_id=action_id,
+                    now=now,
+                )
+                canonical_conflict = True
+            else:
+                intent_id = str(uuid4())
+                await db.execute(
+                    "INSERT INTO promotion_intents (intent_id, action_id, attempt, staged_relpath, "
+                    "canonical_relpath, checksum, media_type, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        intent_id,
+                        action_id,
+                        attempt,
+                        staged_relpath,
+                        canonical_relpath,
+                        checksum,
+                        media_type,
+                        "PENDING",
+                        now,
+                    ),
+                )
+        if canonical_conflict:
+            raise LedgerConflictError(
+                f"canonical artifact {canonical_relpath} already has a promotion intent; "
+                "inspect and choose the canonical artifact"
+            )
+        return PromotionIntent(
+            intent_id=intent_id,
+            action_id=action_id,
+            attempt=attempt,
+            staged_relpath=staged_relpath,
+            canonical_relpath=canonical_relpath,
+            checksum=checksum,
+            media_type=media_type,
+            status="PENDING",
+            created_at=_parse_time(now),
+        )
+
+    async def get_promotion_intent(self, intent_id: str) -> PromotionIntent:
+        """Load one typed promotion intent."""
+        row = await self._fetch_one("SELECT * FROM promotion_intents WHERE intent_id = ?", (intent_id,))
+        if row is None:
+            raise LedgerNotFoundError(
+                f"promotion intent {intent_id} was not found; prepare the staged artifact before promoting it"
+            )
+        return self._promotion_intent_from_row(row)
+
+    async def promotion_state(self, intent_id: str) -> str:
+        """Return the durable state of one promotion intent."""
+        return (await self.get_promotion_intent(intent_id)).status
+
+    async def promotion_intents(self) -> tuple[PromotionIntent, ...]:
+        """List promotion intents so a filesystem reconciler can resume them."""
+        rows = await self._fetch_all("SELECT * FROM promotion_intents ORDER BY created_at, intent_id", ())
+        return tuple(self._promotion_intent_from_row(row) for row in rows)
+
+    async def commit_promotion_intent(self, intent_id: str) -> PromotionIntent:
+        """Confirm a rename only after the filesystem checksum has been verified."""
+        now = self._now()
+        async with self.transaction() as db:
+            cursor = await db.execute("SELECT * FROM promotion_intents WHERE intent_id = ?", (intent_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerNotFoundError(
+                    f"promotion intent {intent_id} was not found; prepare the staged artifact before committing it"
+                )
+            if row["status"] == "COMMITTED":
+                return self._promotion_intent_from_row(row)
+            await db.execute(
+                "UPDATE promotion_intents SET status = ?, committed_at = ? WHERE intent_id = ?",
+                ("COMMITTED", now, intent_id),
+            )
+        return await self.get_promotion_intent(intent_id)
+
+    async def record_promotion_incident(
+        self, intent_id: str, *, error_code: str, message: str
+    ) -> IncidentRecord:
+        """Record one idempotent reconciliation incident against an intent's action."""
+        now = self._now()
+        async with self.transaction() as db:
+            cursor = await db.execute(
+                "SELECT pi.action_id, a.run_id FROM promotion_intents pi "
+                "JOIN actions a ON a.action_id = pi.action_id WHERE pi.intent_id = ?",
+                (intent_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerNotFoundError(
+                    f"promotion intent {intent_id} was not found; cannot record its reconciliation incident"
+                )
+            cursor = await db.execute(
+                "SELECT * FROM incidents WHERE action_id = ? AND error_code = ? AND status = 'OPEN'",
+                (row["action_id"], error_code),
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                return self._incident_from_row(prior)
+            return await self._insert_incident(
+                db,
+                run_id=row["run_id"],
+                error_code=error_code,
+                message=message,
+                action_id=row["action_id"],
+                now=now,
+            )
+
     async def set_run_status(self, run_id: str, status: RunStatus) -> RunRecord:
         now = self._now()
         async with self.transaction() as db:
@@ -764,6 +929,34 @@ class RunLedger:
             status=_action_status(row["status"], "actions.status"), idempotency_key=row["idempotency_key"],
             failure_signature=row["failure_signature"],
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
+        )
+
+    @staticmethod
+    def _promotion_intent_from_row(row: aiosqlite.Row) -> PromotionIntent:
+        return PromotionIntent(
+            intent_id=row["intent_id"],
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            staged_relpath=row["staged_relpath"],
+            canonical_relpath=row["canonical_relpath"],
+            checksum=row["checksum"],
+            media_type=row["media_type"],
+            status=row["status"],
+            created_at=_parse_time(row["created_at"]),
+            committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
+        )
+
+    @staticmethod
+    def _incident_from_row(row: aiosqlite.Row) -> IncidentRecord:
+        return IncidentRecord(
+            incident_id=row["incident_id"],
+            run_id=row["run_id"],
+            error_code=row["error_code"],
+            message=row["message"],
+            action_id=row["action_id"],
+            status=row["status"],
+            created_at=_parse_time(row["created_at"]),
+            resolved_at=None if row["resolved_at"] is None else _parse_time(row["resolved_at"]),
         )
 
     @staticmethod

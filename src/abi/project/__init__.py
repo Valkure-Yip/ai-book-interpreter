@@ -7,6 +7,7 @@ its progress is tracked by :class:`PipelineState` (``state/pipeline_state.json``
 
 from __future__ import annotations
 
+from abi.project.artifacts import ArtifactConflictError, ArtifactStore, InjectedCrash, sha256_file
 from abi.project.layout import BookProject, slugify
 from abi.project.run_ledger import (
     ActionAttemptRecord,
@@ -18,6 +19,7 @@ from abi.project.run_ledger import (
     LedgerNotFoundError,
     LedgerTransitionError,
     PlanVersionRecord,
+    PromotionIntent,
     RunLedger,
     RunRecord,
     RunSeed,
@@ -30,15 +32,19 @@ __all__ = [
     "HAPPY_PATH",
     "ActionAttemptRecord",
     "ActionRecord",
+    "ArtifactConflictError",
+    "ArtifactStore",
     "BookProject",
     "CommittedAction",
     "IncidentRecord",
+    "InjectedCrash",
     "LedgerConflictError",
     "LedgerError",
     "LedgerNotFoundError",
     "LedgerTransitionError",
     "PipelineState",
     "PlanVersionRecord",
+    "PromotionIntent",
     "RunLedger",
     "RunRecord",
     "RunSeed",
@@ -47,5 +53,6 @@ __all__ = [
     "SuccessCommit",
     "project_dir_for",
     "scaffold_project",
+    "sha256_file",
     "slugify",
 ]

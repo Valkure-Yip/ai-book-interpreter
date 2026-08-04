@@ -222,6 +222,26 @@ class BookProject:
     def run_log(self) -> Path:
         return self.root / RUN_LOG
 
+    @property
+    def run_db(self) -> Path:
+        """SQLite business ledger for this book project."""
+        return self.root / "state/run.db"
+
+    @property
+    def graph_checkpoints(self) -> Path:
+        """Durable LangGraph checkpoint database, separate from business facts."""
+        return self.root / "state/graph_checkpoints.sqlite"
+
+    @property
+    def staging_root(self) -> Path:
+        """Attempt-isolated workspace for artifacts not yet promoted."""
+        return self.root / "state/staging"
+
+    @property
+    def status_projection(self) -> Path:
+        """Rebuildable, non-authoritative projection of the run ledger."""
+        return self.root / "state/status_projection.json"
+
     # --- helpers ---
     def rel(self, path: Path) -> str:
         """Return ``path`` as a project-relative POSIX string (for manifests)."""

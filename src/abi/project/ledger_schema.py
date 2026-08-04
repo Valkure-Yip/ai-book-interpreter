@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS promotion_intents (
     media_type TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    committed_at TEXT
+    committed_at TEXT,
+    UNIQUE (action_id, attempt, staged_relpath, canonical_relpath),
+    UNIQUE (canonical_relpath)
 );
 
 CREATE TABLE IF NOT EXISTS gate_evidence (
