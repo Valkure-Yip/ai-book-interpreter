@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from abi.project.run_ledger import (
+    ArtifactCommit,
     LedgerConflictError,
+    LedgerError,
     LedgerTransitionError,
     RunLedger,
     RunSeed,
@@ -15,7 +18,6 @@ from abi.project.run_ledger import (
 )
 from abi.types.orchestration import (
     ActionStatus,
-    ArtifactRef,
     AuthorizedAction,
     GateEvidence,
     PlanPatch,
@@ -53,20 +55,28 @@ async def _seed_authorized_action(ledger: RunLedger, action_id: str = "a1") -> N
     await ledger.start_attempt(action_id)
 
 
-def _success_commit(action_id: str, checksum: str) -> SuccessCommit:
+def _success_commit(
+    action_id: str,
+    checksum: str,
+    *,
+    cost_usd: float = 0.25,
+    evidence: GateEvidence | None = None,
+) -> SuccessCommit:
     return SuccessCommit(
         action_id=action_id,
         attempt=1,
         artifacts=(
-            ArtifactRef(
+            ArtifactCommit(
                 artifact_id=f"artifact-{action_id}",
                 relpath=f"source/{action_id}.json",
                 sha256=checksum,
                 producer_action_id=action_id,
+                media_type="application/json",
             ),
         ),
         gate_evidence=(
-            GateEvidence(
+            evidence
+            or GateEvidence(
                 evidence_id=f"gate-{action_id}",
                 gate="source_manifest",
                 passed=True,
@@ -74,7 +84,7 @@ def _success_commit(action_id: str, checksum: str) -> SuccessCommit:
                 artifact_checksums=(checksum,),
             ),
         ),
-        cost_usd=0.25,
+        cost_usd=cost_usd,
     )
 
 
@@ -88,6 +98,7 @@ async def test_commit_success_is_exactly_once(tmp_path: Path) -> None:
         second = await ledger.commit_success(_success_commit("a1", checksum="abc"))
 
         assert first == second
+        assert first.artifacts[0].media_type == "application/json"
         assert await ledger.count_committed_actions("a1") == 1
         assert await ledger.count_outbox_events("action.committed", "a1") == 1
 
@@ -103,6 +114,128 @@ async def test_different_success_checksum_creates_conflict_incident(tmp_path: Pa
             await ledger.commit_success(_success_commit("a1", checksum="different"))
 
         assert await ledger.has_open_incident("action_commit_conflict")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("commit", "repair"),
+    [
+        (
+            SuccessCommit(action_id="a1", attempt=1),
+            "supply at least one committed artifact",
+        ),
+        (
+            SuccessCommit(
+                action_id="a1",
+                attempt=1,
+                artifacts=(
+                    ArtifactCommit(
+                        artifact_id="artifact-a1",
+                        relpath="source/a1.json",
+                        sha256="abc",
+                        producer_action_id="a1",
+                        media_type="application/json",
+                    ),
+                ),
+            ),
+            "supply at least one passing gate evidence record",
+        ),
+        (
+            _success_commit(
+                "a1",
+                "abc",
+                evidence=GateEvidence(
+                    evidence_id="gate-a1",
+                    gate="source_manifest",
+                    passed=False,
+                    validator_version="1",
+                    artifact_checksums=("abc",),
+                ),
+            ),
+            "repair the failed gate",
+        ),
+        (
+            _success_commit(
+                "a1",
+                "abc",
+                evidence=GateEvidence(
+                    evidence_id="gate-a1",
+                    gate="source_manifest",
+                    passed=True,
+                    validator_version="1",
+                    artifact_checksums=("different",),
+                ),
+            ),
+            "re-run the validator",
+        ),
+    ],
+)
+async def test_invalid_success_fact_set_rolls_back(
+    tmp_path: Path, commit: SuccessCommit, repair: str
+) -> None:
+    """Catch success commits that lack deterministic proof or mutate before validation."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+
+        with pytest.raises(LedgerTransitionError, match=repair):
+            await ledger.commit_success(commit)
+
+        assert await ledger.count_committed_actions("a1") == 0
+        assert await ledger.count_artifacts_for("a1") == 0
+        assert (await ledger.get_action("a1")).status is ActionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_replay_with_different_cost_creates_conflict_incident(tmp_path: Path) -> None:
+    """Catch replays that alter a committed fact while retaining artifact checksums."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        await ledger.commit_success(_success_commit("a1", "abc", cost_usd=0.25))
+
+        with pytest.raises(LedgerConflictError, match="inspect the canonical artifact"):
+            await ledger.commit_success(_success_commit("a1", "abc", cost_usd=0.5))
+
+        assert await ledger.has_open_incident("action_commit_conflict")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_commits_serialize_without_duplicate_facts(tmp_path: Path) -> None:
+    """Catch shared-connection transactions that interleave and issue nested BEGIN calls."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        commit = _success_commit("a1", "abc")
+
+        first, second = await asyncio.gather(
+            ledger.commit_success(commit), ledger.commit_success(commit)
+        )
+
+        assert first == second
+        assert await ledger.count_committed_actions("a1") == 1
+        assert await ledger.count_outbox_events("action.committed", "a1") == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_persisted_run_status_has_repair_error(tmp_path: Path) -> None:
+    """Catch corrupt enum values escaping as raw parsing exceptions."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        run_id = await ledger.create_run(_run_seed())
+        await ledger._db.execute("UPDATE runs SET status = 'BROKEN' WHERE run_id = ?", (run_id,))
+        await ledger._db.commit()
+
+        with pytest.raises(LedgerError, match=r"runs.status.*BROKEN.*repair or recreate"):
+            await ledger.get_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_unknown_persisted_action_status_has_repair_error(tmp_path: Path) -> None:
+    """Catch corrupt action enums escaping as raw parsing exceptions."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        await ledger._db.execute("UPDATE actions SET status = 'BROKEN' WHERE action_id = 'a1'")
+        await ledger._db.commit()
+
+        with pytest.raises(LedgerError, match=r"actions.status.*BROKEN.*repair or recreate"):
+            await ledger.get_action("a1")
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -99,12 +100,22 @@ class ActionAttemptRecord(FrozenModel):
     failure_signature: str | None = None
 
 
+class ArtifactCommit(FrozenModel):
+    """One canonical artifact fact validated before an action becomes successful."""
+
+    artifact_id: str
+    relpath: str
+    sha256: str
+    producer_action_id: str
+    media_type: str
+
+
 class SuccessCommit(FrozenModel):
     """Validated facts that atomically make one action successful."""
 
     action_id: str
     attempt: int = Field(default=1, ge=1)
-    artifacts: tuple[ArtifactRef, ...] = ()
+    artifacts: tuple[ArtifactCommit, ...] = ()
     gate_evidence: tuple[GateEvidence, ...] = ()
     cost_usd: float = Field(default=0.0, ge=0)
 
@@ -114,7 +125,7 @@ class CommittedAction(FrozenModel):
 
     action_id: str
     committed_at: datetime
-    artifacts: tuple[ArtifactRef, ...] = ()
+    artifacts: tuple[ArtifactCommit, ...] = ()
     gate_evidence: tuple[GateEvidence, ...] = ()
     cost_usd: float = Field(ge=0)
 
@@ -141,6 +152,7 @@ class RunLedger:
     def __init__(self, db: aiosqlite.Connection, *, clock: Clock | None = None) -> None:
         self._db = db
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._transaction_lock = asyncio.Lock()
 
     @classmethod
     @asynccontextmanager
@@ -158,14 +170,15 @@ class RunLedger:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         """Run one explicitly serialized SQLite business transaction."""
-        await self._db.execute("BEGIN IMMEDIATE")
-        try:
-            yield self._db
-        except BaseException:
-            await self._db.rollback()
-            raise
-        else:
-            await self._db.commit()
+        async with self._transaction_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._db
+            except BaseException:
+                await self._db.rollback()
+                raise
+            else:
+                await self._db.commit()
 
     async def create_run(self, seed: RunSeed) -> str:
         now = self._now()
@@ -257,7 +270,7 @@ class RunLedger:
         async with self.transaction() as db:
             action = await self._require_action(db, action_id)
             await self._require_running_run(db, action["run_id"])
-            status = ActionStatus(action["status"])
+            status = _action_status(action["status"], "actions.status")
             if status not in {ActionStatus.AUTHORIZED, ActionStatus.RETRY_WAIT}:
                 raise LedgerTransitionError(
                     f"action {action_id} is {status.value}; authorize or schedule a retry before starting an attempt"
@@ -302,12 +315,12 @@ class RunLedger:
         now = self._now()
         async with self.transaction() as db:
             action = await self._require_action(db, action_id)
-            if ActionStatus(action["status"]) is not ActionStatus.RUNNING:
+            if _action_status(action["status"], "actions.status") is not ActionStatus.RUNNING:
                 raise LedgerTransitionError(
                     f"action {action_id} is not running; start its attempt before recording an outcome"
                 )
             row = await self._attempt_row(db, action_id, attempt)
-            if ActionStatus(row["status"]) is not ActionStatus.RUNNING:
+            if _action_status(row["status"], "action_attempts.status") is not ActionStatus.RUNNING:
                 raise LedgerTransitionError(
                     f"attempt {attempt} for {action_id} is already finished; record a new retry attempt instead"
                 )
@@ -331,12 +344,12 @@ class RunLedger:
 
     async def commit_success(self, commit: SuccessCommit) -> CommittedAction:
         now = self._now()
-        signature = _commit_signature(commit)
         conflict = False
         async with self.transaction() as db:
             action = await self._require_action(db, commit.action_id)
+            signature = _commit_signature(commit, idempotency_key=action["idempotency_key"])
             prior_signature = action["commit_signature"]
-            if ActionStatus(action["status"]) is ActionStatus.SUCCEEDED:
+            if _action_status(action["status"], "actions.status") is ActionStatus.SUCCEEDED:
                 if prior_signature == signature:
                     return await self._committed_action(db, commit.action_id)
                 await self._insert_incident(
@@ -352,12 +365,13 @@ class RunLedger:
                 )
                 conflict = True
             else:
-                if ActionStatus(action["status"]) is not ActionStatus.RUNNING:
+                _validate_success_fact_set(commit)
+                if _action_status(action["status"], "actions.status") is not ActionStatus.RUNNING:
                     raise LedgerTransitionError(
                         f"action {commit.action_id} is {action['status']}; start an attempt before committing success"
                     )
                 attempt = await self._attempt_row(db, commit.action_id, commit.attempt)
-                if ActionStatus(attempt["status"]) is not ActionStatus.RUNNING:
+                if _action_status(attempt["status"], "action_attempts.status") is not ActionStatus.RUNNING:
                     raise LedgerTransitionError(
                         f"attempt {commit.attempt} for {commit.action_id} is already finished; do not commit it again"
                     )
@@ -370,19 +384,16 @@ class RunLedger:
                     (ActionStatus.SUCCEEDED.value, now, commit.action_id, commit.attempt),
                 )
                 for artifact in commit.artifacts:
-                    if artifact.producer_action_id != commit.action_id:
-                        raise LedgerTransitionError(
-                            f"artifact {artifact.artifact_id} has another producer; attach only action-owned artifacts"
-                        )
                     await db.execute(
-                        "INSERT INTO artifacts (artifact_id, action_id, attempt, canonical_relpath, sha256, committed_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO artifacts (artifact_id, action_id, attempt, canonical_relpath, sha256, "
+                        "media_type, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             artifact.artifact_id,
                             commit.action_id,
                             commit.attempt,
                             artifact.relpath,
                             artifact.sha256,
+                            artifact.media_type,
                             now,
                         ),
                     )
@@ -454,7 +465,7 @@ class RunLedger:
         now = self._now()
         async with self.transaction() as db:
             row = await self._require_run(db, run_id)
-            current = RunStatus(row["status"])
+            current = _run_status(row["status"], "runs.status")
             if status is current:
                 return self._run_from_row(row)
             if status is RunStatus.COMPLETED:
@@ -505,7 +516,7 @@ class RunLedger:
                 ActionView(
                     action_id=row["action_id"],
                     capability=row["capability"],
-                    status=ActionStatus(row["status"]),
+                    status=_action_status(row["status"], "actions.status"),
                     failure_signature=row["failure_signature"],
                 )
                 for row in actions
@@ -611,7 +622,7 @@ class RunLedger:
         self, db: aiosqlite.Connection, run_id: str
     ) -> aiosqlite.Row:
         row = await self._require_run(db, run_id)
-        if RunStatus(row["status"]) is not RunStatus.RUNNING:
+        if _run_status(row["status"], "runs.status") is not RunStatus.RUNNING:
             raise LedgerTransitionError(
                 f"run {run_id} is {row['status']}; resume the run before planning or dispatching work"
             )
@@ -660,8 +671,12 @@ class RunLedger:
             action_id=action_id,
             committed_at=_parse_time(action["committed_at"]),
             artifacts=tuple(
-                ArtifactRef(
-                    artifact_id=row["artifact_id"], relpath=row["canonical_relpath"], sha256=row["sha256"], producer_action_id=action_id
+                ArtifactCommit(
+                    artifact_id=row["artifact_id"],
+                    relpath=row["canonical_relpath"],
+                    sha256=row["sha256"],
+                    producer_action_id=action_id,
+                    media_type=row["media_type"],
                 )
                 for row in artifact_rows
             ),
@@ -717,7 +732,7 @@ class RunLedger:
     @staticmethod
     def _run_from_row(row: aiosqlite.Row) -> RunRecord:
         return RunRecord(
-            run_id=row["run_id"], status=RunStatus(row["status"]), budget_usd=row["budget_usd"],
+            run_id=row["run_id"], status=_run_status(row["status"], "runs.status"), budget_usd=row["budget_usd"],
             created_at=_parse_time(row["created_at"]), updated_at=_parse_time(row["updated_at"])
         )
 
@@ -728,7 +743,7 @@ class RunLedger:
             capability=row["capability"], parameters_json=row["parameters_json"],
             dependencies=tuple(json.loads(row["dependencies_json"])), priority=row["priority"],
             read_set=tuple(json.loads(row["read_set_json"])), write_set=tuple(json.loads(row["write_set_json"])),
-            status=ActionStatus(row["status"]), idempotency_key=row["idempotency_key"],
+            status=_action_status(row["status"], "actions.status"), idempotency_key=row["idempotency_key"],
             failure_signature=row["failure_signature"],
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
         )
@@ -748,10 +763,68 @@ def _dump_tuple(values: tuple[str, ...]) -> str:
     return json.dumps(values, separators=(",", ":"))
 
 
-def _commit_signature(commit: SuccessCommit) -> str:
+def _validate_success_fact_set(commit: SuccessCommit) -> None:
+    if not commit.artifacts:
+        raise LedgerTransitionError(
+            "success commits require artifacts; supply at least one committed artifact before marking success"
+        )
+    if not commit.gate_evidence:
+        raise LedgerTransitionError(
+            "success commits require gate evidence; supply at least one passing gate evidence record"
+        )
+    if len({artifact.artifact_id for artifact in commit.artifacts}) != len(commit.artifacts):
+        raise LedgerTransitionError(
+            "success commit repeats an artifact ID; repair the artifact manifest and retry the commit"
+        )
+    if len({artifact.relpath for artifact in commit.artifacts}) != len(commit.artifacts):
+        raise LedgerTransitionError(
+            "success commit repeats a canonical artifact path; repair the artifact manifest and retry the commit"
+        )
+    if any(artifact.producer_action_id != commit.action_id for artifact in commit.artifacts):
+        raise LedgerTransitionError(
+            "success commit contains another action's artifact; repair the artifact manifest and retry the commit"
+        )
+    if len({evidence.evidence_id for evidence in commit.gate_evidence}) != len(commit.gate_evidence):
+        raise LedgerTransitionError(
+            "success commit repeats a gate evidence ID; repair the evidence bundle and retry the commit"
+        )
+    artifact_checksums = tuple(sorted(artifact.sha256 for artifact in commit.artifacts))
+    for evidence in commit.gate_evidence:
+        if not evidence.passed:
+            raise LedgerTransitionError(
+                f"gate {evidence.gate} did not pass; repair the failed gate and re-run its validator"
+            )
+        if tuple(sorted(evidence.artifact_checksums)) != artifact_checksums:
+            raise LedgerTransitionError(
+                f"gate {evidence.gate} checksums do not match the committed artifacts; "
+                "re-run the validator against the exact artifact set"
+            )
+
+
+def _commit_signature(commit: SuccessCommit, *, idempotency_key: str) -> str:
     return json.dumps(
-        sorted((artifact.relpath, artifact.sha256) for artifact in commit.artifacts), separators=(",", ":")
+        {"commit": commit.model_dump(mode="json"), "idempotency_key": idempotency_key},
+        sort_keys=True,
+        separators=(",", ":"),
     )
+
+
+def _run_status(value: str, field: str) -> RunStatus:
+    try:
+        return RunStatus(value)
+    except ValueError as exc:
+        raise LedgerError(
+            f"invalid persisted {field} value {value!r}; repair or recreate the ledger before resuming"
+        ) from exc
+
+
+def _action_status(value: str, field: str) -> ActionStatus:
+    try:
+        return ActionStatus(value)
+    except ValueError as exc:
+        raise LedgerError(
+            f"invalid persisted {field} value {value!r}; repair or recreate the ledger before resuming"
+        ) from exc
 
 
 def _parse_time(value: str) -> datetime:

@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     attempt INTEGER NOT NULL,
     canonical_relpath TEXT NOT NULL UNIQUE,
     sha256 TEXT NOT NULL,
-    media_type TEXT,
+    media_type TEXT NOT NULL,
     committed_at TEXT NOT NULL
 );
 
