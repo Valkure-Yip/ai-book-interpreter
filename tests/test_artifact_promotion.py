@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -52,8 +53,9 @@ async def prepared_store(
         await ledger.start_attempt("translate-001")
         project = BookProject(tmp_path)
         store = ArtifactStore(project, ledger)
-        staged_path = store.staging_dir("translate-001", 1) / "001.md"
-        staged_path.write_text(content, encoding="utf-8")
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="001.md", content=content.encode()
+        )
         intent = await store.prepare_promotion(
             action_id="translate-001",
             attempt=1,
@@ -157,8 +159,9 @@ async def test_reconcile_preserves_a_differing_staged_duplicate_after_commit(tmp
     """Catch cleanup that deletes a staged artifact differing from a committed canonical file."""
     async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
         await store.promote(staged)
-        staged_duplicate = store.staging_dir("translate-001", 1) / "001.md"
-        staged_duplicate.write_text("different", encoding="utf-8")
+        staged_duplicate = store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="001.md", content=b"different"
+        )
 
         with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
             await store.reconcile_all()
@@ -198,8 +201,9 @@ async def test_prepare_rejects_a_second_intent_for_one_canonical_path(tmp_path: 
             ),
         )
         await ledger.start_attempt("translate-002")
-        second_staged = store.staging_dir("translate-002", 1) / "001.md"
-        second_staged.write_text("second", encoding="utf-8")
+        store.write_staged_bytes(
+            action_id="translate-002", attempt=1, relative_path="001.md", content=b"second"
+        )
 
         with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
             await store.prepare_promotion(
@@ -240,7 +244,9 @@ def test_staging_dir_rejects_symlinked_action_ancestor(tmp_path: Path) -> None:
     store = ArtifactStore(project, None)
 
     with pytest.raises(ValueError, match="symlink"):
-        store.staging_dir("translate-001", 1)
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="001.md", content=b"translation"
+        )
 
     assert not (outside / "1").exists()
 
@@ -263,8 +269,9 @@ async def test_canonical_aliases_share_one_reservation_key(tmp_path: Path) -> No
             ),
         )
         await ledger.start_attempt("translate-002")
-        alias_staged = store.staging_dir("translate-002", 1) / "001.md"
-        alias_staged.write_text("second", encoding="utf-8")
+        store.write_staged_bytes(
+            action_id="translate-002", attempt=1, relative_path="001.md", content=b"second"
+        )
 
         with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
             await store.prepare_promotion(
@@ -327,8 +334,8 @@ async def test_two_ledger_connections_do_not_overwrite_competing_promotions(tmp_
                 "translate-002": ArtifactStore(project, second_ledger),
             }
             for action_id, content in (("translate-001", "first"), ("translate-002", "second")):
-                (stores[action_id].staging_dir(action_id, 1) / "001.md").write_text(
-                    content, encoding="utf-8"
+                stores[action_id].write_staged_bytes(
+                    action_id=action_id, attempt=1, relative_path="001.md", content=content.encode()
                 )
             results = await asyncio.gather(
                 stores["translate-001"].prepare_promotion(
@@ -378,8 +385,9 @@ async def test_reconcile_all_continues_after_a_conflict(tmp_path: Path) -> None:
             ),
         )
         await ledger.start_attempt("translate-002")
-        recovered = store.staging_dir("translate-002", 1) / "002.md"
-        recovered.write_text("recovered", encoding="utf-8")
+        store.write_staged_bytes(
+            action_id="translate-002", attempt=1, relative_path="002.md", content=b"recovered"
+        )
         second = await store.prepare_promotion(
             action_id="translate-002",
             attempt=1,
@@ -447,7 +455,9 @@ def test_staging_dir_race_hook_cannot_create_outside_project(tmp_path: Path) -> 
 
     store = ArtifactStore(project, None, test_hook=insert_symlink)
     with pytest.raises(ValueError, match="symlink"):
-        store.staging_dir("translate-001", 1)
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="001.md", content=b"translation"
+        )
 
     assert not (outside / "1").exists()
 
@@ -482,8 +492,9 @@ async def test_each_conflicting_intent_records_its_own_incident(tmp_path: Path) 
         first = tmp_path / "chapters/final/001.md"
         first.parent.mkdir(parents=True)
         first.write_text("old-first", encoding="utf-8")
-        staged_two = store.staging_dir("translate-001", 1) / "002.md"
-        staged_two.write_text("second", encoding="utf-8")
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="002.md", content=b"second"
+        )
         await store.prepare_promotion(
             action_id="translate-001",
             attempt=1,
@@ -506,6 +517,116 @@ async def test_each_conflicting_intent_records_its_own_incident(tmp_path: Path) 
         ]
         assert len(incidents) == 2
         assert second_canonical.read_text(encoding="utf-8") == "old-second"
+
+
+@pytest.mark.asyncio
+async def test_canonical_directory_remap_after_validation_cannot_escape_project(tmp_path: Path) -> None:
+    """Catch canonical parent re-resolution after a validated directory is replaced by an external symlink."""
+    async with prepared_store(tmp_path, content="translation") as (_, ledger, staged):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        chapters = tmp_path / "chapters"
+        saved_chapters = tmp_path / "saved_chapters"
+
+        def remap_canonical_parent(point: str, _: PromotionIntent | None) -> None:
+            if point == "after_staged_verification":
+                chapters.rename(saved_chapters)
+                chapters.symlink_to(outside, target_is_directory=True)
+
+        store = ArtifactStore(BookProject(tmp_path), ledger, test_hook=remap_canonical_parent)
+        await store.promote(staged)
+
+        assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
+        assert (saved_chapters / "final/001.md").read_text(encoding="utf-8") == "translation"
+        assert not (outside / "final/001.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_replaced_temp_inode_cannot_install_wrong_canonical(tmp_path: Path) -> None:
+    """Catch a temporary filename replacement between its verification and no-overwrite installation."""
+    async with prepared_store(tmp_path, content="expected") as (_, ledger, staged):
+        def replace_temp(point: str, _: PromotionIntent | None) -> None:
+            if point == "after_temp_verified":
+                temp = next((tmp_path / "chapters/final").glob(".abi-promotion-*.tmp"))
+                temp.unlink()
+                temp.write_text("wrong", encoding="utf-8")
+
+        store = ArtifactStore(BookProject(tmp_path), ledger, test_hook=replace_temp)
+        with pytest.raises(ArtifactConflictError, match="temporary file was replaced"):
+            await store.promote(staged)
+
+        assert await ledger.promotion_state(staged.intent_id) == "PENDING"
+        assert not (tmp_path / "chapters/final/001.md").exists()
+
+
+def test_display_staging_path_remap_cannot_redirect_safe_writer(tmp_path: Path) -> None:
+    """Catch writes through the safe API escaping after a previously displayed path is remapped."""
+    project = BookProject(tmp_path)
+    store = ArtifactStore(project, None)
+    displayed = store.staging_dir("translate-001", 1)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    project.staging_root.mkdir(parents=True)
+    (project.staging_root / "translate-001").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="001.md", content=b"translation"
+        )
+
+    assert displayed == project.staging_root / "translate-001/1"
+    assert not (outside / "1/001.md").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("special", ["symlink", "fifo"])
+async def test_special_staged_file_records_repair_and_reconcile_continues(
+    tmp_path: Path, special: str
+) -> None:
+    """Catch a symlink or FIFO staged target being consumed during recovery."""
+    async with prepared_store(tmp_path, content="good") as (store, ledger, _):
+        store.write_staged_bytes(
+            action_id="translate-001", attempt=1, relative_path="special.md", content=b"special"
+        )
+        special_intent = await store.prepare_promotion(
+            action_id="translate-001",
+            attempt=1,
+            staged_relpath="state/staging/translate-001/1/special.md",
+            canonical_relpath=f"chapters/final/{special}.md",
+            media_type="text/markdown",
+        )
+        special_path = tmp_path / "state/staging/translate-001/1/special.md"
+        special_path.unlink()
+        if special == "symlink":
+            special_path.symlink_to(tmp_path / "source.md")
+        else:
+            os.mkfifo(special_path)
+
+        with pytest.raises(ArtifactConflictError, match="repair"):
+            await store.reconcile_all()
+
+        assert (tmp_path / "chapters/final/001.md").read_text(encoding="utf-8") == "good"
+        assert await ledger.has_open_incident("artifact_intent_invalid")
+        assert await ledger.promotion_state(special_intent.intent_id) == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_safely_cleans_only_its_crash_temporary_files(tmp_path: Path) -> None:
+    """Catch crash recovery leaving owned promotion temporaries or sweeping unrelated files."""
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
+        with pytest.raises(InjectedCrash):
+            await store.promote(staged, crash_after="after_temp")
+        final_dir = tmp_path / "chapters/final"
+        owned = list(final_dir.glob(f".abi-promotion-{staged.intent_id}-*.tmp"))
+        unrelated = final_dir / ".abi-promotion-unrelated.tmp"
+        unrelated.write_text("keep", encoding="utf-8")
+        assert len(owned) == 1
+
+        await store.reconcile_all()
+
+        assert await ledger.promotion_state(staged.intent_id) == "COMMITTED"
+        assert not list(final_dir.glob(f".abi-promotion-{staged.intent_id}-*.tmp"))
+        assert unrelated.read_text(encoding="utf-8") == "keep"
 
 
 def test_staging_dir_rejects_path_escape(tmp_path: Path) -> None:
