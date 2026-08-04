@@ -307,6 +307,9 @@ async def test_canonical_artifact_collision_rolls_back_mid_transaction(tmp_path:
         assert [action.status for action in snapshot.actions if action.action_id == "a2"] == [
             ActionStatus.RUNNING
         ]
+        attempt = await ledger.get_attempt("a2", 1)
+        assert attempt.status is ActionStatus.RUNNING
+        assert attempt.finished_at is None
         assert await ledger.count_artifacts_for("a2") == 0
         assert await ledger.count_outbox_events("action.committed", "a2") == 0
         assert snapshot.remaining_budget_usd == 4.75

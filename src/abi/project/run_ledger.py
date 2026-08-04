@@ -294,6 +294,18 @@ class RunLedger:
             action_id=action_id, attempt=attempt, status=ActionStatus.RUNNING, started_at=_parse_time(now)
         )
 
+    async def get_attempt(self, action_id: str, attempt: int) -> ActionAttemptRecord:
+        """Load one typed attempt row without exposing SQLite row shapes to callers."""
+        row = await self._fetch_one(
+            "SELECT * FROM action_attempts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        if row is None:
+            raise LedgerNotFoundError(
+                f"attempt {attempt} for {action_id} was not found; start the action before reading its attempt"
+            )
+        return self._attempt_from_row(row)
+
     async def finish_attempt(
         self,
         action_id: str,
@@ -752,6 +764,17 @@ class RunLedger:
             status=_action_status(row["status"], "actions.status"), idempotency_key=row["idempotency_key"],
             failure_signature=row["failure_signature"],
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
+        )
+
+    @staticmethod
+    def _attempt_from_row(row: aiosqlite.Row) -> ActionAttemptRecord:
+        return ActionAttemptRecord(
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            status=_action_status(row["status"], "action_attempts.status"),
+            started_at=_parse_time(row["started_at"]),
+            finished_at=None if row["finished_at"] is None else _parse_time(row["finished_at"]),
+            failure_signature=row["failure_signature"],
         )
 
 
