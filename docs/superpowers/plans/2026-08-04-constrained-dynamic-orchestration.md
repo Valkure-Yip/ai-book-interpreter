@@ -543,12 +543,12 @@ async def test_snapshot_contains_hashes_not_book_body(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_planner_uses_plan_patch_schema_and_no_tools() -> None:
-    router = RecordingRouter(result=valid_patch())
+async def test_planner_returns_a_valid_patch_from_structured_provider() -> None:
+    router = DeterministicPlannerProvider(result=valid_patch())
     patch = await Planner(router=router).plan(snapshot_with_ingest_eligible())
     assert patch.proposed_actions[0].capability == "source.ingest"
-    assert router.schema is PlanPatch
-    assert router.agent_name == "orchestration.planner"
+    assert patch.objective == "produce missing source evidence"
+    assert patch.proposed_actions[0].expected_evidence == ("source_manifest",)
 ```
 
 - [ ] **Step 2: Run focused tests and confirm failure**
@@ -611,6 +611,7 @@ git commit -m "feat: plan from compressed run evidence"
 - Modify: `src/abi/tools/gates.py`
 - Modify: `src/abi/tools/subagent.py`
 - Modify: `src/abi/tools/belt.py`
+- Create: `tools/lint/architecture.py`
 - Test: `tests/test_agent_runtime.py`
 - Test: `tests/test_tool_boundaries.py`
 
@@ -621,9 +622,14 @@ git commit -m "feat: plan from compressed run evidence"
 - [ ] **Step 1: Write migration and persistence tests**
 
 ```python
-def test_business_tools_do_not_import_langchain() -> None:
-    offenders = sdk_imports_under(Path("src/abi/tools"), prefixes=("langchain", "langgraph"))
-    assert offenders == []
+def test_architecture_linter_reports_forbidden_sdk_import(tmp_path: Path) -> None:
+    module = tmp_path / "src/abi/tools/bad.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("from langchain.tools import tool\n", encoding="utf-8")
+    violations = scan_tree(tmp_path / "src/abi")
+    assert [(item.rule, item.path, item.line) for item in violations] == [
+        ("sdk-import-outside-providers", "tools/bad.py", 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -633,7 +639,7 @@ async def test_action_harness_resumes_same_thread(tmp_path: Path) -> None:
     second = await runtime.run_action(action_request(thread_id="run-1/a1/1", resume=True))
     assert first.outcome.kind == "paused"
     assert second.outcome.kind == "succeeded"
-    assert runtime.fake_model_seen_prior_tool_result is True
+    assert second.outcome.evidence_refs == ("prior_tool_result",)
 ```
 
 - [ ] **Step 2: Run focused tests before dependency changes**
@@ -658,7 +664,7 @@ Keep Langfuse on its existing major during this refactor; its v4 rewrite is a se
 
 - [ ] **Step 4: Replace SDK-owned tools at business boundaries**
 
-Each `make_*_tools()` returns `list[ToolBinding]`. Put Pydantic input models beside their business handler. `providers.agent_runtime.tooling.to_langchain_tool()` is the only adapter:
+Each `make_*_tools()` returns `list[ToolBinding]`. Put Pydantic input models beside their business handler. `providers.agent_runtime.tooling.to_langchain_tool()` is the only adapter. `tools/lint/architecture.py` parses imports with `ast`, returns frozen `Violation` records, and offers a CLI that exits non-zero after printing repair instructions when actual source violates the boundary:
 
 ```python
 def to_langchain_tool(binding: ToolBinding) -> BaseTool:
@@ -715,12 +721,14 @@ Run: `.venv/bin/pytest tests/test_agent_runtime.py tests/test_tool_boundaries.py
 
 Run: `.venv/bin/ruff check src tests`
 
-Expected: both commands pass; repository search finds no `create_react_agent`.
+Run: `.venv/bin/python tools/lint/architecture.py src/abi`
+
+Expected: all three commands pass; repository search finds no `create_react_agent`.
 
 - [ ] **Step 7: Commit the runtime migration**
 
 ```bash
-git add pyproject.toml uv.lock src/abi/providers src/abi/tools tests/test_agent_runtime.py tests/test_tool_boundaries.py tests/test_orchestrator_offline.py
+git add pyproject.toml uv.lock src/abi/providers src/abi/tools tools/lint/architecture.py tests/test_agent_runtime.py tests/test_tool_boundaries.py tests/test_orchestrator_offline.py
 git commit -m "feat: add durable LangChain v1 action harness"
 ```
 
@@ -884,7 +892,7 @@ async def test_permanent_failure_blocks_without_retry() -> None:
         error_code="copyright_denied", message="supply a license or use private mode"
     ),))
     await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
-    assert rig.dispatcher.attempts == 1
+    assert await rig.ledger.count_attempts(capability="rights.check") == 1
     assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
 ```
 
@@ -973,13 +981,16 @@ async def test_crash_boundaries_do_not_duplicate_business_facts(
 
 ```python
 @pytest.mark.asyncio
-async def test_indeterminate_release_is_probed_not_reissued() -> None:
+async def test_indeterminate_release_is_probed_not_reissued(tmp_path: Path) -> None:
+    operation_log = tmp_path / "external-operations.jsonl"
     rig = release_rig(first=Indeterminate(
         operation_key="release:abc", message="timeout after request"
-    ), probe=ProbeResult.COMMITTED)
+    ), probe=ProbeResult.COMMITTED, operation_log=operation_log)
     await rig.run()
-    assert rig.release_calls == 1
-    assert rig.probe_calls == 1
+    records = [json.loads(line) for line in operation_log.read_text().splitlines()]
+    assert [record["operation"] for record in records] == ["release", "probe"]
+    assert await rig.ledger.count_attempts(capability="release.prepare") == 1
+    assert await rig.ledger.count_attempts(capability="release.probe") == 1
     assert await rig.ledger.action_status("release") is ActionStatus.SUCCEEDED
 
 
@@ -1104,27 +1115,29 @@ git commit -m "feat: expose durable dynamic run lifecycle"
 - Modify: `docs/design-docs/dynamic-agent-orchestration.md`
 - Modify: `docs/product-specs/cli-and-config.md`
 - Modify: `AGENTS.md`
-- Test: `tests/test_no_fixed_pipeline.py`
+- Modify: `tests/test_tool_boundaries.py`
 - Modify: `tests/test_eval.py`
 
 **Interfaces:**
 - Consumes: completed dynamic implementation.
 - Produces: no fixed macro path in source, L1 eval over ledger events, and documentation whose architecture/flow diagrams match implemented modules.
 
-- [ ] **Step 1: Write a structural test that forbids legacy control symbols**
+- [ ] **Step 1: Extend the executable architecture linter with legacy-symbol rules**
 
 ```python
-def test_fixed_macro_pipeline_is_absent() -> None:
-    source = "\n".join(path.read_text() for path in Path("src/abi").rglob("*.py"))
-    for forbidden in ("HAPPY_PATH", "STAGE_SEQUENCE", "StageSpec", "set_state", "record_gate"):
-        assert forbidden not in source
-    assert not Path("src/abi/project/state.py").exists()
-    assert not Path("src/abi/stages").exists()
+def test_architecture_linter_reports_legacy_control_symbols(tmp_path: Path) -> None:
+    module = tmp_path / "src/abi/orchestrator/old.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("HAPPY_PATH = []\n", encoding="utf-8")
+    violations = scan_tree(tmp_path / "src/abi")
+    assert [(item.rule, item.symbol) for item in violations] == [
+        ("fixed-macro-control", "HAPPY_PATH")
+    ]
 ```
 
 - [ ] **Step 2: Run the structural test and confirm old symbols are found**
 
-Run: `.venv/bin/pytest tests/test_no_fixed_pipeline.py -v`
+Run: `.venv/bin/pytest tests/test_tool_boundaries.py -v`
 
 Expected: failure lists the remaining legacy symbols and files.
 
@@ -1142,18 +1155,20 @@ Update layering, project layout, CLI behavior, checkpoint/recovery matrix, failu
 
 - [ ] **Step 6: Run structural, eval, and documentation sanity checks**
 
-Run: `.venv/bin/pytest tests/test_no_fixed_pipeline.py tests/test_eval.py -v`
+Run: `.venv/bin/pytest tests/test_tool_boundaries.py tests/test_eval.py -v`
 
 Run: `git diff --check`
 
-Run: `rg -n 'pipeline_state\.json|28.state|HAPPY_PATH|STAGE_SEQUENCE' ARCHITECTURE.md docs src/abi tests`
+Run: `.venv/bin/python tools/lint/architecture.py src/abi`
+
+Run: `rg -n 'pipeline_state\.json|28.state|HAPPY_PATH|STAGE_SEQUENCE' ARCHITECTURE.md docs`
 
 Expected: tests pass; diff check is clean; the search finds only historical explanation in the approved design document's “old design” discussion and no active instructions or source code.
 
 - [ ] **Step 7: Commit legacy removal and documentation**
 
 ```bash
-git add -A src/abi tests ARCHITECTURE.md docs AGENTS.md
+git add -A src/abi tests tools/lint/architecture.py ARCHITECTURE.md docs AGENTS.md
 git commit -m "refactor: remove fixed macro workflow"
 ```
 
