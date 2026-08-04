@@ -176,6 +176,171 @@ class AgentRunResult(FrozenModel):
     tool_log: tuple[ToolCallRecord, ...] = ()
 ```
 
+Define the remaining contracts with these exact fields and defaults:
+
+```python
+class ActionKind(StrEnum):
+    DETERMINISTIC = "deterministic"
+    AGENT = "agent"
+    COMPOSITE = "composite"
+
+
+class ActionStatus(StrEnum):
+    AUTHORIZED = "AUTHORIZED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    RETRY_WAIT = "RETRY_WAIT"
+    REPAIR_REQUIRED = "REPAIR_REQUIRED"
+    PERMANENT_FAILED = "PERMANENT_FAILED"
+    INDETERMINATE = "INDETERMINATE"
+    PAUSED = "PAUSED"
+
+
+class RetryPolicySpec(FrozenModel):
+    max_attempts: int = Field(default=3, ge=1)
+    retryable_codes: tuple[str, ...] = ()
+    base_delay_s: float = Field(default=1.0, ge=0)
+    max_delay_s: float = Field(default=30.0, ge=0)
+
+
+class PredicateSpec(FrozenModel):
+    name: str
+    arguments: tuple[ActionArgument, ...] = ()
+
+
+class EffectSpec(FrozenModel):
+    name: str
+    artifact_pattern: str | None = None
+
+
+class EvidenceSpec(FrozenModel):
+    name: str
+    required: bool = True
+
+
+class ActionSpec(FrozenModel):
+    capability: str
+    description: str
+    input_schema: str
+    action_kind: ActionKind
+    prerequisites: tuple[PredicateSpec, ...] = ()
+    effects: tuple[EffectSpec, ...] = ()
+    expected_evidence: tuple[EvidenceSpec, ...] = ()
+    tool_allowlist: tuple[str, ...] = ()
+    skill_refs: tuple[str, ...] = ()
+    read_set: tuple[str, ...] = ()
+    write_set: tuple[str, ...] = ()
+    retry_policy: RetryPolicySpec = Field(default_factory=RetryPolicySpec)
+    validator: str
+    resource_class: str = "default"
+    estimated_cost_usd: float = Field(default=0.0, ge=0)
+    may_have_side_effects: bool = False
+    probe_capability: str | None = None
+
+
+class ActionArgument(FrozenModel):
+    name: str
+    value_json: str
+
+
+class ProposedAction(FrozenModel):
+    proposal_id: str
+    capability: str
+    arguments: tuple[ActionArgument, ...] = ()
+    dependencies: tuple[str, ...] = ()
+    expected_evidence: tuple[str, ...] = ()
+    priority: int = 0
+
+
+class PlanPatch(FrozenModel):
+    objective: str
+    proposed_actions: tuple[ProposedAction, ...]
+    superseded_action_ids: tuple[str, ...] = ()
+    rationale: str
+
+
+class ArtifactRef(FrozenModel):
+    artifact_id: str
+    relpath: str
+    sha256: str
+    producer_action_id: str
+
+
+class GateEvidence(FrozenModel):
+    evidence_id: str
+    gate: str
+    passed: bool
+    validator_version: str
+    artifact_checksums: tuple[str, ...] = ()
+
+
+class IncidentView(FrozenModel):
+    incident_id: str
+    error_code: str
+    message: str
+    action_id: str | None = None
+
+
+class ActionView(FrozenModel):
+    action_id: str
+    capability: str
+    status: ActionStatus
+    failure_signature: str | None = None
+
+
+class EligibleAction(FrozenModel):
+    capability: str
+    description: str
+    input_schema: str
+    estimated_cost_usd: float = Field(ge=0)
+
+
+class RunSnapshot(FrozenModel):
+    run_id: str
+    status: RunStatus
+    plan_version: int = Field(default=0, ge=0)
+    actions: tuple[ActionView, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
+    gate_evidence: tuple[GateEvidence, ...] = ()
+    incidents: tuple[IncidentView, ...] = ()
+    eligible_actions: tuple[EligibleAction, ...] = ()
+    remaining_budget_usd: float | None = Field(default=None, ge=0)
+    failure_signatures: tuple[str, ...] = ()
+
+
+class AuthorizedAction(FrozenModel):
+    action_id: str
+    proposal_id: str
+    plan_version: int = Field(ge=1)
+    capability: str
+    parameters_json: str
+    dependencies: tuple[str, ...] = ()
+    priority: int = 0
+    read_set: tuple[str, ...] = ()
+    write_set: tuple[str, ...] = ()
+    idempotency_key: str
+
+
+class AuthorizationDecision(FrozenModel):
+    authorized: bool
+    reason_codes: tuple[str, ...] = ()
+    actions: tuple[AuthorizedAction, ...] = ()
+
+
+class GateDecision(FrozenModel):
+    passed: bool
+    reason_code: str
+    message: str
+    evidence_refs: tuple[str, ...] = ()
+
+
+class RunResult(FrozenModel):
+    run_id: str
+    status: RunStatus
+    cost_usd: float = Field(default=0.0, ge=0)
+    blocked_reason: str | None = None
+```
+
 Add `PlannerConfig(horizon=5, max_rejections=3)`, `OrchestrationConfig(max_cycles=500, max_parallel_actions=4, default_action_attempts=3)`, and fields on `RunConfig` with frozen defaults. Define `ToolBinding` as a frozen dataclass containing `name`, `description`, `args_schema: type[FrozenModel]`, and a sync-or-async callable; it is an internal runtime binding, not a persisted model.
 
 - [ ] **Step 4: Run focused type and configuration tests**
