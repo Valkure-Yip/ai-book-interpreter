@@ -1252,8 +1252,8 @@ dict/Any。
 ### 19.1 Task 12 实现完成证据（2026-08-06）
 
 - **提交范围：** 实现、协议与独立审查修复从 `fa0bd60197656668ebd2479aa2a908296a44a739` 到
-  `babd6209ccecd96636396ebff37504c3bdd17c6f`（含首尾）；相对 `main` 的 merge-base 为
-  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...babd620` 共 54 个提交。
+  `5f5bde8546527ef215e1293efbd3d6a0e1abcce8`（含首尾）；相对 `main` 的 merge-base 为
+  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...5f5bde8` 共 56 个提交。
 - **持久化边界：** 业务真相固定为 `state/run.db`；LangGraph checkpoint 固定为
   `state/graph_checkpoints.sqlite`。ledger schema version 为 `1`，由单一
   `LEDGER_SCHEMA_VERSION = 1` 与 SQLite `PRAGMA user_version = 1` 共同标记；已有 v0 或未知版本
@@ -1263,11 +1263,11 @@ dict/Any。
   `langgraph-checkpoint-sqlite==3.1.1`、`aiosqlite==0.22.1`、`langfuse==2.60.10`、
   `pydantic==2.13.4`；验证工具为 `pytest==9.1.1`、`ruff==0.15.20`、`mypy==2.1.0`。
 - **全量自动化：** Python 3.12.11 fresh process 执行 `.venv/bin/pytest`，结果为
-  `680 passed, 22 warnings`，无失败或跳过；告警均为既有 `datetime.utcnow()` 弃用告警。
-  recovery/control/offline 独立集合为 `153 passed, 1 warning`。Ruff 全量通过。
-- **类型检查：** mypy 检查 98 个 source files；本方案修改文件为 0 errors。仅有 6 个未触碰的
-  基线 `type-arg` 错误：`src/abi/epub/result.py:16` 与
-  `src/abi/ir/builder.py:69,78,79,82,116`，均为裸 `dict` 缺少类型参数。
+  `689 passed, 25 warnings`，无失败或跳过；告警为既有 `datetime.utcnow()` 弃用告警及 EPUB 库告警。
+  recovery/control/offline 独立集合为 `154 passed, 1 warning`。Ruff 全量通过。
+- **类型检查：** mypy 检查 98 个 source files；本方案修改文件为 0 errors。仅有 1 个未触碰的
+  基线 `type-arg` 错误：`src/abi/epub/result.py:16`。本次因引入 bytes ingest 触碰
+  `src/abi/ir/builder.py`，同时消除了其中 5 个既有裸 `dict` 错误。
 - **边界扫描：** 固定宏观控制符号、provider 外 LangChain/LangGraph/Langfuse imports、旧单文件
   `Succeeded`/旧 probe shape，以及 types 反向依赖 project artifact paths 四组扫描均无匹配
   （`rg` exit 1 且无输出）。SDK scan 从仓库根使用
@@ -1289,6 +1289,13 @@ dict/Any。
   同章或目录/后代资源仍互斥；permissioned agent 读取统一拒绝任一 symlink component，`read_file`、grep、
   content 与 prompt/skill context 的字节读取使用 pinned dirfd + `O_NOFOLLOW`，平台缺少所需能力即 fail
   closed，并覆盖 leaf/directory symlink、check/read 竞态与 fd 关闭回归。
+- **定向复审修复：** 首轮修复的 scoped review 进一步发现 4 个 Important，现由
+  `5f5bde8546527ef215e1293efbd3d6a0e1abcce8` 修复：`list_dir` 在 pinned directory fd 上枚举；
+  deterministic source ingest/split 在写任何 staging 前读取 frozen authorized bytes，并由同一 bytes
+  完成解析、hash 与章节渲染；EPUB 解析受控副本固定为 `0600` 且正常/异常退出均 unlink；runtime
+  `ActionPathPermissions` 只从同一个 access expander 生成，Dispatcher 在执行前把重展开结果与 durable
+  read/write sets 精确比较，drift 进入 integrity repair；chapter control validator 要求每章 controlled
+  revision 为 regular、非空且 substantive，并检查完整 8 字段零问题 PASS 报告。
 
 ## 20. 实现完成判据
 
