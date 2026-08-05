@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sqlite3
@@ -101,11 +102,13 @@ class SequenceExecutor:
         store: ArtifactStore,
         capability: str,
         envelope_action_id: str | None = None,
+        delays_s: tuple[float, ...] = (),
     ) -> None:
         self._outcomes = deque(outcomes)
         self._store = store
         self._capability = capability
         self._envelope_action_id = envelope_action_id
+        self._delays_s = deque(delays_s)
         self.attempt_ids: list[int] = []
 
     async def __call__(
@@ -116,6 +119,8 @@ class SequenceExecutor:
             target_language="zh-Hans", publication_mode="public_domain"
         )
         self.attempt_ids.append(context.attempt)
+        if self._delays_s:
+            await asyncio.sleep(self._delays_s.popleft())
         planned = self._outcomes.popleft()
         if isinstance(planned, SuccessTemplate):
             writer = self._store.writer(context.action_id, context.attempt)
@@ -208,6 +213,14 @@ def _unknown_repair_gate(
     )
 
 
+def _raising_gate(
+    view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
+) -> GateDecision:
+    raise RuntimeError("validator implementation crashed")
+
+
 def _fixture_outputs(capability: str) -> tuple[tuple[str, str, str], ...]:
     return _FIXTURE_OUTPUTS.get(
         capability,
@@ -258,6 +271,7 @@ def _definition(
     retryable_codes: tuple[str, ...] = ("temporary",),
     max_attempts: int = 2,
     probe_capability: str | None = None,
+    may_have_side_effects: bool = False,
 ) -> ActionDefinition:
     return ActionDefinition(
         spec=ActionSpec(
@@ -277,6 +291,7 @@ def _definition(
             ),
             validator=validator_id,
             probe_capability=probe_capability,
+            may_have_side_effects=may_have_side_effects,
             write_set=tuple(path for path, _, _ in _fixture_outputs(capability)),
         ),
         input_model=EmptyInput,
@@ -352,6 +367,7 @@ async def _controller_rig(
     validators: dict[str, ValidatorFn] | None = None,
     probe_capabilities: frozenset[str] = frozenset(),
     controller_hook: Callable[[str, object], None] | None = None,
+    timeout_s: float = 2,
 ) -> AsyncIterator[ControllerRig]:
     project = BookProject(tmp_path)
     project.root.mkdir(parents=True, exist_ok=True)
@@ -389,6 +405,7 @@ async def _controller_rig(
                     if options.get("envelope_action_id") is not None
                     else None
                 ),
+                delays_s=cast(tuple[float, ...], options.get("delays_s", ())),
             )
             executors[capability] = executor
             registry.register(
@@ -410,6 +427,9 @@ async def _controller_rig(
                         if options.get("probe_capability") is not None
                         else None
                     ),
+                    may_have_side_effects=bool(
+                        options.get("may_have_side_effects", False)
+                    ),
                 )
             )
         registry.validate_startup()
@@ -429,7 +449,7 @@ async def _controller_rig(
             source_lang="en",
             source_target="en-zh-Hans",
             book_slug="fixture",
-            timeout_s=2,
+            timeout_s=timeout_s,
             test_hook=dispatcher_hook,
         )
         committer = Committer(
@@ -506,6 +526,37 @@ async def _authorize_one(
     records = await rig.ledger.authorize_actions(rig.run_id, decision.actions)
     assert len(records) == 1
     return records[0], context.policy_snapshot
+
+
+async def _assert_repair_incident_outbox_matches_rows(ledger: RunLedger) -> None:
+    """Assert the durable incident event contains its atomic repair classification."""
+    incidents = await ledger._fetch_all(
+        "SELECT incident_id, run_id, action_id, error_code, repair_class, repair_source, "
+        "reason_code FROM incidents WHERE repair_class IS NOT NULL ORDER BY incident_id",
+        (),
+    )
+    events = await ledger._fetch_all(
+        "SELECT payload_json FROM event_outbox WHERE event_name = 'incident.created'",
+        (),
+    )
+    parsed = tuple(json.loads(row["payload_json"]) for row in events)
+    assert incidents
+    for incident in incidents:
+        expected = {
+            "incident_id": incident["incident_id"],
+            "action_id": incident["action_id"],
+            "error_code": incident["error_code"],
+            "repair_class": incident["repair_class"],
+            "repair_source": incident["repair_source"],
+            "reason_code": incident["reason_code"],
+            "run_id": incident["run_id"],
+        }
+        matching = tuple(
+            payload
+            for payload in parsed
+            if payload.get("incident_id") == incident["incident_id"]
+        )
+        assert matching == (expected,)
 
 
 class BoundaryCrash(RuntimeError):
@@ -616,7 +667,7 @@ async def test_dispatcher_rejects_probe_resolution_from_non_probe(tmp_path: Path
 @pytest.mark.asyncio
 async def test_committer_persists_complete_multi_file_bundle_before_success(
     tmp_path: Path,
-) -> None:
+    ) -> None:
     """Catch single-file promotion or success before every exact intent is committed."""
     async with _controller_rig(
         tmp_path,
@@ -966,6 +1017,61 @@ async def test_committer_fails_closed_on_unsafe_or_mismatched_bundle(
             )
         assert not (tmp_path / "reports/a.json").exists()
         assert not (tmp_path / "reports/b.json").exists()
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_site", ("registry", "validator"))
+async def test_committer_boundary_exception_durably_compensates_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    validators: dict[str, ValidatorFn] = (
+        {"work.commit-boundary": _raising_gate}
+        if failure_site == "validator"
+        else {}
+    )
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.commit-boundary", (SuccessTemplate(),)),),
+        patches=(),
+        validators=validators,
+    ) as rig:
+        action, snapshot = await _authorize_one(rig, "work.commit-boundary")
+        envelope = await rig.dispatcher.execute(
+            run_id=rig.run_id, action=action, snapshot=snapshot, attempt=1
+        )
+        assert isinstance(envelope.outcome, Succeeded)
+        staged_paths = tuple(
+            tmp_path / entry.staged_relpath
+            for entry in envelope.outcome.artifact_bundle.entries
+        )
+        if failure_site == "registry":
+            def fail_resolve(capability: str, parameters_json: str) -> object:
+                raise RuntimeError("registry implementation crashed")
+
+            monkeypatch.setattr(rig.registry, "resolve_json", fail_resolve)
+
+        first = await rig.reconciler.reconcile(rig.run_id)
+        second = await rig.reconciler.reconcile(rig.run_id)
+
+        assert first.status is RunStatus.BLOCKED
+        assert second.status is RunStatus.BLOCKED
+        assert await rig.ledger.action_status(action.action_id) is ActionStatus.REPAIR_REQUIRED
+        attempt = await rig.ledger.get_attempt(action.action_id, 1)
+        assert (attempt.repair_class, attempt.repair_source, attempt.reason_code) == (
+            "integrity",
+            "integrity_guard",
+            "gate_binding_conflict",
+        )
+        assert all(path.is_file() for path in staged_paths)
+        assert await rig.ledger.promotion_intents(rig.run_id) == ()
+        assert await rig.ledger.count_artifacts_for(action.action_id) == 0
+        assert sum(
+            incident.reason_code == "gate_binding_conflict"
+            for incident in second.incidents
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -1113,6 +1219,7 @@ async def test_controller_replans_after_repair_and_completes(tmp_path: Path) -> 
         assert await rig.ledger.event_names() == _expected_replan_event_sequence()
         assert await rig.ledger.count_attempts(capability="work.initial") == 1
         assert await rig.ledger.count_attempts(capability="repair.glossary") == 1
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
 
 
 @pytest.mark.asyncio
@@ -1271,6 +1378,7 @@ async def test_validator_failure_receipt_drives_repair_without_pass_or_promotion
             "repair_source": "validator",
             "reason_code": "term_drift",
         }
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
 
 
 @pytest.mark.asyncio
@@ -1317,6 +1425,7 @@ async def test_unmapped_validator_failure_preserves_raw_fact_and_blocks_integrit
             "repair_source": "integrity_guard",
             "reason_code": "repair_class_unknown",
         }
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
 
 
 @pytest.mark.asyncio
@@ -1346,6 +1455,7 @@ async def test_integrity_repair_blocks_without_planner_or_replacement(
         action = (await rig.ledger.list_actions(rig.run_id))[0]
         assert action.repair_class == "integrity"
         assert action.reason_code == "artifact_identity_conflict"
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
 
 
 @pytest.mark.asyncio
@@ -1823,6 +1933,247 @@ async def test_indeterminate_without_registered_probe_blocks_without_reexecution
 
 
 @pytest.mark.asyncio
+async def test_side_effecting_timeout_persists_indeterminate_and_dispatches_one_probe(
+    tmp_path: Path,
+) -> None:
+    """A timeout cannot authorize a duplicate external side effect."""
+    operation_outcome = SuccessTemplate()
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            ("release.publish", (operation_outcome,)),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key="placeholder-replaced-below",
+                        disposition="unknown",
+                        evidence_refs=("provider:query-1",),
+                        message="provider still cannot resolve the operation",
+                    ),
+                ),
+            ),
+        ),
+        patches=(),
+        spec_options={
+            "release.publish": {
+                "probe_capability": "release.probe",
+                "retryable_codes": ("provider_timeout",),
+                "may_have_side_effects": True,
+                "delays_s": (0.05,),
+            }
+        },
+        probe_capabilities=frozenset({"release.probe"}),
+        timeout_s=0.001,
+    ) as rig:
+        action, snapshot = await _authorize_one(rig, "release.publish")
+        invocation_json = json.dumps(
+            {
+                "action_id": action.action_id,
+                "attempt": 1,
+                "capability": action.capability,
+                "parameters_json": action.parameters_json,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        expected_operation_key = f"operation:{sha256_canonical_json(invocation_json)}"
+        rig.executors["release.probe"]._outcomes = deque(
+            (
+                ProbeResolution(
+                    operation_key=expected_operation_key,
+                    disposition="unknown",
+                    evidence_refs=("provider:query-1",),
+                    message="provider still cannot resolve the operation",
+                ),
+            )
+        )
+
+        envelope = await rig.dispatcher.execute(
+            run_id=rig.run_id, action=action, snapshot=snapshot, attempt=1
+        )
+
+        assert isinstance(envelope.outcome, Indeterminate)
+        assert envelope.outcome.operation_key == expected_operation_key
+        assert envelope.outcome.failure_signature == canonical_failure_signature(
+            action.capability, action.parameters_json, "provider_timeout"
+        )
+        await rig.reconciler.reconcile(rig.run_id)
+        await rig.controller.tick(rig.run_id)
+        await rig.reconciler.reconcile(rig.run_id)
+
+        actions = await rig.ledger.list_actions(rig.run_id)
+        probes = tuple(item for item in actions if item.capability == "release.probe")
+        assert len(probes) == 1
+        assert rig.executors["release.publish"].attempt_ids == [1]
+        assert await rig.ledger.attempt_numbers(action.action_id) == (1,)
+        assert rig.executors["release.probe"].attempt_ids == [1]
+
+
+@pytest.mark.asyncio
+async def test_side_effect_free_timeout_uses_frozen_bounded_retry(tmp_path: Path) -> None:
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.timeout", (SuccessTemplate(),)),),
+        patches=(),
+        complete_when=_completed_capability("work.timeout"),
+        spec_options={
+            "work.timeout": {
+                "retryable_codes": ("provider_timeout",),
+                "max_attempts": 2,
+                "delays_s": (0.05, 0.0),
+            }
+        },
+        timeout_s=0.001,
+    ) as rig:
+        action, snapshot = await _authorize_one(rig, "work.timeout")
+        first = await rig.dispatcher.execute(
+            run_id=rig.run_id, action=action, snapshot=snapshot, attempt=1
+        )
+        assert isinstance(first.outcome, RetryableFailure)
+
+        await rig.controller.tick(rig.run_id)
+        await rig.controller.tick(rig.run_id)
+
+        assert rig.executors["work.timeout"].attempt_ids == [1, 2]
+        assert await rig.ledger.attempt_numbers(action.action_id) == (1, 2)
+        assert await rig.ledger.action_status(action.action_id) is ActionStatus.SUCCEEDED
+
+
+class _SecondBuildBarrier:
+    """Test-only snapshot wrapper that aligns probe check/create windows."""
+
+    def __init__(self, delegate: SnapshotBuilder, participants: int) -> None:
+        self._delegate = delegate
+        self._barrier = asyncio.Barrier(participants)
+        self._calls_by_task: dict[asyncio.Task[object], int] = {}
+
+    async def build(self, run_id: str) -> PlanningContext:
+        task = asyncio.current_task()
+        assert task is not None
+        count = self._calls_by_task.get(task, 0) + 1
+        self._calls_by_task[task] = count
+        if count == 2:
+            await self._barrier.wait()
+        return await self._delegate.build(run_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
+    tmp_path: Path,
+) -> None:
+    operation_key = "publish:concurrent-1"
+    participants = 8
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "release.publish",
+                (
+                    Indeterminate(
+                        operation_key=operation_key,
+                        error_code="provider_timeout",
+                        failure_signature=canonical_failure_signature(
+                            "release.publish", "{}", "provider_timeout"
+                        ),
+                        message="remote result unknown",
+                    ),
+                ),
+            ),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key=operation_key,
+                        disposition="unknown",
+                        evidence_refs=("provider:query-1",),
+                        message="remote result remains unknown",
+                    ),
+                ),
+            ),
+        ),
+        patches=(),
+        spec_options={"release.publish": {"probe_capability": "release.probe"}},
+        probe_capabilities=frozenset({"release.probe"}),
+    ) as rig:
+        original, snapshot = await _authorize_one(rig, "release.publish")
+        await rig.dispatcher.execute(
+            run_id=rig.run_id, action=original, snapshot=snapshot, attempt=1
+        )
+        await rig.reconciler.reconcile(rig.run_id)
+        rig.controller._snapshots = _SecondBuildBarrier(  # type: ignore[assignment]
+            SnapshotBuilder(ledger=rig.ledger, registry=rig.registry), participants
+        )
+
+        results = await asyncio.gather(
+            *(rig.controller.tick(rig.run_id) for _ in range(participants)),
+            return_exceptions=True,
+        )
+
+        actions = await rig.ledger.list_actions(rig.run_id)
+        probes = tuple(item for item in actions if item.capability == "release.probe")
+        errors = tuple(
+            (type(item).__name__, str(item))
+            for item in results
+            if isinstance(item, BaseException)
+        )
+        durable = await rig.ledger.load_snapshot(rig.run_id)
+        probe_attempt_count = 0
+        for probe in probes:
+            probe_attempt_count += len(await rig.ledger.attempt_numbers(probe.action_id))
+        observed = (
+            errors,
+            len(probes),
+            durable.plan_version,
+            await rig.ledger.attempt_numbers(original.action_id),
+            probe_attempt_count,
+            tuple(rig.executors["release.publish"].attempt_ids),
+            tuple(rig.executors["release.probe"].attempt_ids),
+        )
+        assert observed == ((), 1, 2, (1,), 1, (1,), (1,))
+        binding_count = await rig.ledger._count(
+            "SELECT COUNT(*) FROM probe_bindings", ()
+        )
+        plan_count = await rig.ledger._count(
+            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+        )
+        action_count = await rig.ledger._count(
+            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
+        )
+        outbox_rows = await rig.ledger._fetch_all(
+            "SELECT event_name, COUNT(*) AS event_count FROM event_outbox "
+            "WHERE run_id = ? GROUP BY event_name ORDER BY event_name",
+            (rig.run_id,),
+        )
+        outbox_counts = {
+            row["event_name"]: row["event_count"] for row in outbox_rows
+        }
+        assert (binding_count, plan_count, action_count) == (1, 2, 2)
+        assert outbox_counts == {
+            "action.authorized": 2,
+            "action.committed": 1,
+            "action.outcome": 2,
+            "action.started": 2,
+            "incident.created": 1,
+            "plan.authorized": 2,
+            "plan.proposed": 2,
+        }
+        assert await rig.ledger.get_attempt_outcome(probes[0].action_id, 1)
+
+        for _ in range(3):
+            assert not await rig.controller.tick(rig.run_id)
+        assert await rig.ledger._count("SELECT COUNT(*) FROM probe_bindings", ()) == 1
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
+        assert rig.executors["release.publish"].attempt_ids == [1]
+        assert rig.executors["release.probe"].attempt_ids == [1]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("disposition", "reason_code"),
     (
@@ -1902,6 +2253,7 @@ async def test_indeterminate_dispatches_one_bound_probe_then_blocks_pending_task
         assert rig.executors["release.publish"].attempt_ids == [1]
         assert rig.executors["release.probe"].attempt_ids == [1]
         assert len(await rig.ledger.list_actions(rig.run_id)) == 2
+        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
 
 
 @pytest.mark.asyncio

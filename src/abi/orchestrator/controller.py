@@ -15,7 +15,7 @@ from abi.orchestrator.reconcile import Reconciler
 from abi.planning.context import SnapshotBuilder
 from abi.planning.policy import PolicyEngine
 from abi.planning.scheduler import Scheduler
-from abi.project.run_ledger import ActionRecord, RunLedger
+from abi.project.run_ledger import ActionRecord, LedgerClaimConflict, RunLedger
 from abi.types.orchestration import (
     ActionArgument,
     ActionOutcomeEnvelope,
@@ -99,6 +99,12 @@ class DynamicController:
                 await self._complete(run_id)
                 await self._projector.flush(run_id)
                 return False
+            if any(
+                action.status is ActionStatus.RUNNING
+                for action in await self._ledger.list_actions(run_id)
+            ):
+                await self._projector.flush(run_id)
+                return True
             plan = await self._ledger.pending_plan(run_id)
             authorization_snapshot = context.policy_snapshot
             if plan is None:
@@ -140,10 +146,15 @@ class DynamicController:
                 await self._projector.flush(run_id)
                 return False
 
-        attempts = tuple(
-            [await self._authorized_attempt(action) for action in batch]
-        )
-        await asyncio.gather(
+        dispatchable: list[tuple[ActionRecord, int]] = []
+        for action in batch:
+            attempt = await self._authorized_attempt(action)
+            if attempt is not None:
+                dispatchable.append((action, attempt))
+        if not dispatchable:
+            await self._projector.flush(run_id)
+            return (await self._ledger.get_run(run_id)).status is RunStatus.RUNNING
+        results = await asyncio.gather(
             *(
                 self._dispatch_one(
                     run_id=run_id,
@@ -151,9 +162,12 @@ class DynamicController:
                     snapshot=snapshot,
                     attempt=attempt,
                 )
-                for action, attempt in zip(batch, attempts, strict=True)
+                for action, attempt in dispatchable
             )
         )
+        if not any(result is not None for result in results):
+            await self._projector.flush(run_id)
+            return (await self._ledger.get_run(run_id)).status is RunStatus.RUNNING
         # Executor return values are never a business authority. Dispatcher persists
         # an immutable receipt before returning; only reconciliation may classify it.
         current = await self._reconciler.reconcile(run_id)
@@ -195,25 +209,26 @@ class DynamicController:
         action: ActionRecord,
         snapshot: RunSnapshot,
         attempt: int,
-    ) -> object:
+    ) -> object | None:
         self._invoke_hook("before_dispatch", (action, attempt))
-        return await self._dispatcher.execute(
-            run_id=run_id,
-            action=action,
-            snapshot=snapshot,
-            attempt=attempt,
-        )
+        try:
+            return await self._dispatcher.execute(
+                run_id=run_id,
+                action=action,
+                snapshot=snapshot,
+                attempt=attempt,
+            )
+        except LedgerClaimConflict:
+            return None
 
-    async def _authorized_attempt(self, action: ActionRecord) -> int:
+    async def _authorized_attempt(self, action: ActionRecord) -> int | None:
         """Resolve the one explicitly authorized attempt for dispatch."""
         attempts = await self._ledger.attempt_numbers(action.action_id)
         if not attempts:
             return 1
         attempt = await self._ledger.get_attempt(action.action_id, attempts[-1])
         if attempt.status is not ActionStatus.AUTHORIZED:
-            raise RuntimeError(
-                f"latest attempt for {action.action_id} is not authorized for dispatch"
-            )
+            return None
         return attempt.attempt
 
     async def _authorize_pending_probes(self, run_id: str) -> None:
@@ -245,9 +260,10 @@ class DynamicController:
                 operation_key=envelope.outcome.operation_key,
                 probe_capability=probe_capability,
             )
+            binding_parameters_json = binding.model_dump_json()
             if any(
                 action.capability == probe_capability
-                and action.parameters_json == binding.model_dump_json()
+                and action.parameters_json == binding_parameters_json
                 for action in actions
             ):
                 continue
@@ -276,16 +292,12 @@ class DynamicController:
                     "external operation."
                 ),
             )
-            plan = await self._ledger.append_plan(run_id, patch)
             decision = self._policy.authorize(
-                context.policy_snapshot, patch, next_plan_version=plan.version
+                context.policy_snapshot,
+                patch,
+                next_plan_version=context.policy_snapshot.plan_version + 1,
             )
-            if not decision.authorized:
-                await self._ledger.record_plan_rejection(
-                    run_id,
-                    plan_version=plan.version,
-                    reason_codes=decision.reason_codes,
-                )
+            if not decision.authorized or len(decision.actions) != 1:
                 await self._ledger.record_incident(
                     run_id,
                     error_code="indeterminate_probe_invalid",
@@ -297,7 +309,13 @@ class DynamicController:
                 )
                 await self._block(run_id, "indeterminate_probe_invalid")
                 return
-            await self._ledger.authorize_actions(run_id, decision.actions)
+            await self._ledger.authorize_probe_action(
+                run_id,
+                binding=binding,
+                patch=patch,
+                action=decision.actions[0],
+                expected_previous_plan_version=context.policy_snapshot.plan_version,
+            )
             actions = await self._ledger.list_actions(run_id)
 
     async def on_cycles_exhausted(self, run_id: str, max_cycles: int) -> None:

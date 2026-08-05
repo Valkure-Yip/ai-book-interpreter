@@ -19,6 +19,7 @@ class StructuredPlanRouter(Protocol):
         *,
         agent_name: str,
         prompt_version: str,
+        metadata: dict[str, Any],
         max_retries: int,
     ) -> tuple[PlanPatch, object]: ...
 
@@ -43,6 +44,12 @@ class Planner:
             messages,
             agent_name="orchestration.planner",
             prompt_version="dynamic-plan-v1",
+            metadata={
+                "logical_invocation_id": (
+                    f"planner:{context.policy_snapshot.run_id}:"
+                    f"plan:{context.policy_snapshot.plan_version + 1}"
+                )
+            },
             max_retries=2,
         )
         if not 1 <= len(patch.proposed_actions) <= self._horizon:

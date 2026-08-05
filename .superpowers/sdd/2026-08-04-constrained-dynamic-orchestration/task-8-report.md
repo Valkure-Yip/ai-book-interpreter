@@ -159,3 +159,77 @@ TDD and recovery evidence:
 
 No Task 9 `probe_resolutions` row or original-attempt disposition is created here; the pending raw
 receipt is intentionally preserved for that atomic resolver and its full disposition/crash matrix.
+
+## Phase B review fix round 1/5 — uncertain effects, probe serialization, durable incidents, and provider identity
+
+### RED evidence
+
+- Side-effect timeout: `.venv/bin/pytest tests/test_dynamic_controller.py -q -k
+  'side_effecting_timeout or side_effect_free_timeout'` produced `1 failed, 1 passed, 59
+  deselected`. A timeout on a retryable side-effecting capability was incorrectly receipted as
+  `RetryableFailure(provider_timeout)` instead of `Indeterminate`; the side-effect-free bounded
+  retry already passed.
+- Probe concurrency: `.venv/bin/pytest
+  tests/test_dynamic_controller.py::test_concurrent_ticks_authorize_exactly_one_durable_probe_binding
+  -q` produced `1 failed`. Eight barrier-aligned ticks raced the check/append/authorize sequence,
+  producing stale transition failures and a blocked run instead of one durable binding.
+- Commit boundary exceptions: `.venv/bin/pytest
+  tests/test_dynamic_controller.py::test_committer_boundary_exception_durably_compensates_once -q`
+  produced `2 failed` (`registry`, `validator`). Both ordinary `Exception`s escaped after the
+  immutable success receipt and staging existed, without durable compensation.
+- Repair incident projection: the focused bundle/outcome/validator/probe command produced `14
+  failed, 49 deselected`. Every durable `incident.created` payload omitted the incident row's exact
+  `repair_class`, `repair_source`, and `reason_code`.
+- Provider event identity: `.venv/bin/pytest tests/test_llm_router_events.py -q` produced `1 failed`.
+  Two legitimate same-agent/same-prompt/same-attempt calls yielded observability tuple
+  `(event_count, distinct_event_ids, distinct_call_ids, metrics_calls) = (1, 1, 1, 2)` instead of
+  `(2, 2, 2, 2)`.
+
+### GREEN implementation and evidence
+
+- Dispatcher now uses the existing canonical failure-signature helper and derives the operation
+  key only from frozen action ID, attempt, authorized capability, and authorized canonical
+  parameters. A side-effecting timeout is always `Indeterminate` and cannot enter retry; a
+  side-effect-free timeout still follows the frozen bounded retry policy.
+- `probe_bindings` gives each original action/attempt one ledger-enforced binding and also uniquely
+  constrains the full original-action/original-attempt/operation/capability tuple. The controller
+  submits an already Policy-authorized deterministic probe to one `BEGIN IMMEDIATE` ledger method,
+  which revalidates the indeterminate receipt and current plan facts and atomically inserts the
+  plan, outbox facts, Action, authorized attempt, and binding. Exact replay returns the existing
+  binding; a divergent binding is independently compensated as integrity. A dedicated durable
+  claim-conflict path prevents concurrent losers from redispatching or planning over `RUNNING`
+  work.
+- The eight-tick barrier plus three repeated blocked-run ticks pass with exactly 2 plans, 2 Actions,
+  1 probe binding, 1 attempt and dispatch for the original, 1 attempt/dispatch/outcome receipt for
+  the probe, and outbox counts: `plan.proposed=2`, `plan.authorized=2`,
+  `action.authorized=2`, `action.started=2`, `action.outcome=2`, `action.committed=1`, and
+  `incident.created=1`.
+- Committer catches only ordinary `Exception` around registry resolution/validator execution,
+  durably records stable `gate_binding_conflict` integrity compensation, preserves receipt and
+  staging, and then raises `ArtifactConflictError` for Reconciler's existing recovery boundary.
+  Repeated reconciliation is idempotent.
+- Repair classifications are now written on the incident's initial INSERT and copied into the one
+  `incident.created` outbox payload in the same transaction. The post-insert classification UPDATE
+  paths were removed.
+- `invoke_structured` allocates one logical invocation identity at entry, reuses it across parse
+  attempts, and forms call/event IDs from logical identity plus attempt. The durable Planner caller
+  supplies `planner:{run_id}:plan:{next_version}`; fallback identities distinguish actual calls.
+  Metrics and budget accounting remain at two for two actual provider calls.
+
+Verification after the fix:
+
+- Consolidated five-finding selection: `19 passed, 44 deselected`; router collision regression:
+  `1 passed`.
+- Authoritative focused set (`scheduler`, `dynamic_controller`, `policy_engine`, `run_ledger`,
+  `action_registry`, `llm_router_events`): `150 passed, 1` pre-existing IR `utcnow()` warning.
+- Full dynamic controller: `63 passed, 1` pre-existing warning. Provider runtime plus the new router
+  regression: `91 passed` (`90` existing `test_agent_runtime` cases plus `1` router case; the prior
+  report's `100` used a wider provider/offline/planner command scope). Planner/router affected
+  tests: `5 passed`.
+- Full pytest: `500 passed, 21` pre-existing `utcnow()` warnings.
+- Architecture SDK boundary: exit 0. Full Ruff: PASS. Python 3.12 strict mypy over the 10 changed
+  production/test files: PASS. `git diff --check`: PASS.
+- Phase-B legacy scans for `prepare_promotion`, `Succeeded(staging_relpath`, and canonical-project
+  validator invocation forms each returned exit 1 with no matches. Production
+  `logical_invocation_id` coverage shows the provider allocation/ID construction and the durable
+  Planner caller.

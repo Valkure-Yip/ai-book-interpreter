@@ -60,6 +60,10 @@ class LedgerTransitionError(LedgerError):
     """Raised when an attempted run or action transition is not legal."""
 
 
+class LedgerClaimConflict(LedgerTransitionError):
+    """Raised when another controller already claimed the same durable attempt."""
+
+
 class LedgerConflictError(LedgerError):
     """Raised when a replay disagrees with a previously committed business fact."""
 
@@ -69,6 +73,10 @@ class LedgerNotFoundError(LedgerError):
 
 
 class _ValidatorFailureReplayConflict(RuntimeError):
+    """Internal signal used to roll back before independent compensation."""
+
+
+class _ProbeBindingConflict(RuntimeError):
     """Internal signal used to roll back before independent compensation."""
 
 
@@ -494,6 +502,219 @@ class RunLedger:
                 )
         return tuple([await self.get_action(action.action_id) for action in actions])
 
+    async def authorize_probe_action(
+        self,
+        run_id: str,
+        *,
+        binding: ProbeActionInput,
+        patch: PlanPatch,
+        action: AuthorizedAction,
+        expected_previous_plan_version: int,
+    ) -> tuple[ActionRecord, bool]:
+        """Atomically bind, plan, authorize, and reserve one probe attempt."""
+        now = self._now()
+        created = False
+        binding_parameters_json = binding.model_dump_json()
+        try:
+            async with self.transaction() as db:
+                cursor = await db.execute(
+                    "SELECT * FROM probe_bindings WHERE original_action_id = ? "
+                    "AND original_attempt = ?",
+                    (binding.original_action_id, binding.original_attempt),
+                )
+                prior = await cursor.fetchone()
+                if prior is not None:
+                    exact = (
+                        prior["operation_key"] == binding.operation_key
+                        and prior["probe_capability"] == binding.probe_capability
+                        and prior["probe_action_id"] == action.action_id
+                        and prior["plan_version"] == action.plan_version
+                    )
+                    existing = await self._require_action(
+                        db, prior["probe_action_id"]
+                    )
+                    exact = exact and (
+                        existing["capability"] == binding.probe_capability
+                        and existing["parameters_json"]
+                        == action.parameters_json
+                        == binding_parameters_json
+                    )
+                    if not exact:
+                        raise _ProbeBindingConflict
+                else:
+                    await self._require_running_run(db, run_id)
+                    original = await self._require_action(
+                        db, binding.original_action_id
+                    )
+                    original_attempt = await self._attempt_row(
+                        db, binding.original_action_id, binding.original_attempt
+                    )
+                    if (
+                        original["run_id"] != run_id
+                        or _action_status(original["status"], "actions.status")
+                        is not ActionStatus.INDETERMINATE
+                        or _action_status(
+                            original_attempt["status"], "action_attempts.status"
+                        )
+                        is not ActionStatus.INDETERMINATE
+                    ):
+                        raise _ProbeBindingConflict
+                    cursor = await db.execute(
+                        "SELECT canonical_outcome_json FROM attempt_outcome_receipts "
+                        "WHERE action_id = ? AND attempt = ?",
+                        (binding.original_action_id, binding.original_attempt),
+                    )
+                    receipt = await cursor.fetchone()
+                    if receipt is None:
+                        raise _ProbeBindingConflict
+                    envelope = ActionOutcomeEnvelope.model_validate_json(
+                        receipt["canonical_outcome_json"]
+                    )
+                    if (
+                        not isinstance(envelope.outcome, Indeterminate)
+                        or envelope.outcome.operation_key != binding.operation_key
+                    ):
+                        raise _ProbeBindingConflict
+                    latest = await self._latest_plan_version(db, run_id)
+                    current_version = latest or 0
+                    next_version = current_version + 1
+                    if (
+                        current_version != expected_previous_plan_version
+                        or action.plan_version != next_version
+                        or len(patch.proposed_actions) != 1
+                        or action.capability != binding.probe_capability
+                        or action.parameters_json != binding_parameters_json
+                    ):
+                        raise LedgerTransitionError(
+                            "probe authorization facts are stale; rebuild the policy decision "
+                            f"from the latest durable snapshot (current={current_version}, "
+                            f"expected={expected_previous_plan_version}, action={action.plan_version}, "
+                            f"next={next_version}, count={len(patch.proposed_actions)}, "
+                            f"capability_match={action.capability == binding.probe_capability}, "
+                            f"parameters_match={action.parameters_json == binding_parameters_json})"
+                        )
+                    await db.execute(
+                        "INSERT INTO plan_versions (run_id, version, objective, rationale, "
+                        "patch_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            run_id,
+                            next_version,
+                            patch.objective,
+                            patch.rationale,
+                            patch.model_dump_json(),
+                            now,
+                        ),
+                    )
+                    await self._insert_outbox(
+                        db,
+                        run_id=run_id,
+                        event_name="plan.proposed",
+                        aggregate_id=f"plan:{run_id}:{next_version}",
+                        payload_json=json.dumps(
+                            {"plan_version": next_version}, sort_keys=True
+                        ),
+                        idempotency_key=f"plan.proposed:plan:{run_id}:{next_version}",
+                        now=now,
+                    )
+                    await self._insert_outbox(
+                        db,
+                        run_id=run_id,
+                        event_name="plan.authorized",
+                        aggregate_id=f"plan:{run_id}:{next_version}",
+                        payload_json=json.dumps(
+                            {"plan_version": next_version}, sort_keys=True
+                        ),
+                        idempotency_key=f"plan.authorized:plan:{run_id}:{next_version}",
+                        now=now,
+                    )
+                    await db.execute(
+                        "INSERT INTO actions (action_id, run_id, plan_version, capability, "
+                        "parameters_json, dependencies_json, priority, read_set_json, write_set_json, "
+                        "status, idempotency_key, expected_manifest_json, expected_manifest_digest, "
+                        "expected_evidence_refs_json, retry_policy_json, retry_policy_fingerprint) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            action.action_id,
+                            run_id,
+                            action.plan_version,
+                            action.capability,
+                            action.parameters_json,
+                            _dump_tuple(action.dependencies),
+                            action.priority,
+                            _dump_tuple(action.read_set),
+                            _dump_tuple(action.write_set),
+                            ActionStatus.AUTHORIZED.value,
+                            action.idempotency_key,
+                            canonical_manifest_json(action.expected_artifact_manifest),
+                            action.expected_artifact_manifest_digest,
+                            _dump_tuple(action.expected_evidence_refs),
+                            canonical_model_json(action.retry_policy),
+                            action.retry_policy_fingerprint,
+                        ),
+                    )
+                    await db.execute(
+                        "INSERT INTO action_attempts (action_id, attempt, status, parameters_json, "
+                        "expected_manifest_json, expected_manifest_digest, expected_evidence_refs_json, "
+                        "retry_policy_json, retry_policy_fingerprint, retry_of_attempt, staging_relpath) "
+                        "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                        (
+                            action.action_id,
+                            ActionStatus.AUTHORIZED.value,
+                            action.parameters_json,
+                            canonical_manifest_json(action.expected_artifact_manifest),
+                            action.expected_artifact_manifest_digest,
+                            _dump_tuple(action.expected_evidence_refs),
+                            canonical_model_json(action.retry_policy),
+                            action.retry_policy_fingerprint,
+                            f"state/staging/{action.action_id}/1",
+                        ),
+                    )
+                    await self._insert_outbox(
+                        db,
+                        run_id=run_id,
+                        event_name="action.authorized",
+                        aggregate_id=action.action_id,
+                        payload_json=json.dumps(
+                            {
+                                "action_id": action.action_id,
+                                "capability": action.capability,
+                                "plan_version": action.plan_version,
+                            },
+                            sort_keys=True,
+                        ),
+                        idempotency_key=f"action.authorized:{action.action_id}",
+                        now=now,
+                    )
+                    await db.execute(
+                        "INSERT INTO probe_bindings (original_action_id, original_attempt, "
+                        "operation_key, probe_capability, probe_action_id, plan_version, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            binding.original_action_id,
+                            binding.original_attempt,
+                            binding.operation_key,
+                            binding.probe_capability,
+                            action.action_id,
+                            action.plan_version,
+                            now,
+                        ),
+                    )
+                    created = True
+        except _ProbeBindingConflict as exc:
+            await self.mark_bundle_conflict(
+                binding.original_action_id,
+                binding.original_attempt,
+                reason_code="probe_binding_conflict",
+                message=(
+                    "A probe binding disagrees with the original indeterminate operation; "
+                    "preserve both facts and inspect before resuming."
+                ),
+            )
+            raise LedgerConflictError(
+                "probe binding conflicts with durable facts"
+            ) from exc
+        return await self.get_action(action.action_id), created
+
     async def get_action(self, action_id: str) -> ActionRecord:
         row = await self._fetch_one("SELECT * FROM actions WHERE action_id = ?", (action_id,))
         if row is None:
@@ -512,6 +733,10 @@ class RunLedger:
             await self._require_running_run(db, action["run_id"])
             status = _action_status(action["status"], "actions.status")
             if status is not ActionStatus.AUTHORIZED:
+                if status is ActionStatus.RUNNING:
+                    raise LedgerClaimConflict(
+                        f"action {action_id} attempt {attempt} was already claimed"
+                    )
                 raise LedgerTransitionError(
                     f"action {action_id} is {status.value}; authorize or schedule a retry before starting an attempt"
                 )
@@ -542,6 +767,12 @@ class RunLedger:
                 )
             else:
                 if _action_status(row["status"], "action_attempts.status") is not ActionStatus.AUTHORIZED:
+                    if _action_status(
+                        row["status"], "action_attempts.status"
+                    ) is ActionStatus.RUNNING:
+                        raise LedgerClaimConflict(
+                            f"attempt {attempt} for {action_id} was already claimed"
+                        )
                     raise LedgerTransitionError(
                         f"attempt {attempt} for {action_id} is {row['status']}; never re-enter a claimed attempt"
                     )
@@ -1093,6 +1324,9 @@ class RunLedger:
                             "incident_id": incident_id,
                             "action_id": action_id,
                             "error_code": effective_reason,
+                            "repair_class": effective_class,
+                            "repair_source": effective_source,
+                            "reason_code": effective_reason,
                         },
                         sort_keys=True,
                     ),
@@ -1266,7 +1500,7 @@ class RunLedger:
                 now=now,
             )
             subject = f"probe:{probe_action_id}:{probe_attempt}"
-            incident = await self._insert_incident(
+            await self._insert_incident(
                 db,
                 run_id=probe["run_id"],
                 error_code=reason_code,
@@ -1276,12 +1510,10 @@ class RunLedger:
                 ),
                 action_id=original_action_id,
                 subject=subject,
+                repair_class="integrity",
+                repair_source="integrity_guard",
+                reason_code=reason_code,
                 now=now,
-            )
-            await db.execute(
-                "UPDATE incidents SET repair_class = 'integrity', "
-                "repair_source = 'integrity_guard', reason_code = ? WHERE incident_id = ?",
-                (reason_code, incident.incident_id),
             )
             await db.execute(
                 "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
@@ -2143,19 +2375,17 @@ class RunLedger:
         )
         prior = await cursor.fetchone()
         if prior is None:
-            incident = await self._insert_incident(
+            await self._insert_incident(
                 db,
                 run_id=action["run_id"],
                 error_code=reason_code,
                 message=message,
                 action_id=action["action_id"],
                 subject=subject,
+                repair_class="integrity",
+                repair_source="integrity_guard",
+                reason_code=reason_code,
                 now=now,
-            )
-            await db.execute(
-                "UPDATE incidents SET repair_class = 'integrity', "
-                "repair_source = 'integrity_guard', reason_code = ? WHERE incident_id = ?",
-                (reason_code, incident.incident_id),
             )
 
     async def _count(self, sql: str, parameters: tuple[object, ...]) -> int:
@@ -2330,30 +2560,40 @@ class RunLedger:
         message: str,
         action_id: str | None,
         subject: str | None = None,
+        repair_class: RepairClass | None = None,
+        repair_source: RepairSource | None = None,
+        reason_code: str | None = None,
         now: str,
     ) -> IncidentRecord:
         record = IncidentRecord(
             incident_id=str(uuid4()), run_id=run_id, error_code=error_code, subject=subject, message=message,
-            action_id=action_id, status="OPEN", created_at=_parse_time(now)
+            action_id=action_id, repair_class=repair_class, repair_source=repair_source,
+            reason_code=reason_code, status="OPEN", created_at=_parse_time(now)
         )
         await db.execute(
-            "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (record.incident_id, run_id, action_id, error_code, subject, message, record.status, now),
+            "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, "
+            "repair_class, repair_source, reason_code, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (record.incident_id, run_id, action_id, error_code, subject, message,
+             repair_class, repair_source, reason_code, record.status, now),
         )
+        incident_payload: dict[str, object] = {
+            "incident_id": record.incident_id,
+            "action_id": action_id,
+            "error_code": error_code,
+        }
+        if repair_class is not None:
+            incident_payload.update(
+                repair_class=repair_class,
+                repair_source=repair_source,
+                reason_code=reason_code,
+            )
         await self._insert_outbox(
             db,
             run_id=run_id,
             event_name="incident.created",
             aggregate_id=action_id or run_id,
-            payload_json=json.dumps(
-                {
-                    "incident_id": record.incident_id,
-                    "action_id": action_id,
-                    "error_code": error_code,
-                },
-                sort_keys=True,
-            ),
+            payload_json=json.dumps(incident_payload, sort_keys=True),
             idempotency_key=f"incident.created:{record.incident_id}",
             now=now,
         )

@@ -122,8 +122,24 @@ class Committer:
             )
             raise ArtifactConflictError("commit receipt or bundle binding failed") from exc
 
-        resolved = self._registry.resolve_json(action.capability, action.parameters_json)
-        decision = resolved.definition.validator(view, resolved.parameters, bundle)
+        try:
+            resolved = self._registry.resolve_json(
+                action.capability, action.parameters_json
+            )
+            decision = resolved.definition.validator(
+                view, resolved.parameters, bundle
+            )
+        except Exception as exc:
+            await self._integrity_conflict(
+                action,
+                attempt,
+                reason_code="gate_binding_conflict",
+                message=(
+                    "Validator registry/implementation failed after the durable outcome "
+                    f"receipt: {type(exc).__name__}"
+                ),
+            )
+            raise ArtifactConflictError("validator execution boundary failed") from exc
         expected_validator = resolved.definition.spec.validator
         if (
             decision.validator_id != expected_validator

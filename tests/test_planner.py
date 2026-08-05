@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from abi.actions.contracts import ActionDefinition, ActionExecutionContext
+from abi.actions.evidence import StagingEvidenceView
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.planning.context import SnapshotBuilder
@@ -55,8 +56,20 @@ async def _execute_unused(
     raise AssertionError("snapshot and planner tests must not execute actions")
 
 
-def _validate_unused(project: object, parameters: FrozenModel) -> GateDecision:
-    return GateDecision(passed=True, reason_code="ok", message="valid")
+def _validate_unused(
+    evidence_view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
+) -> GateDecision:
+    return GateDecision(
+        passed=True,
+        reason_code="ok",
+        message="valid",
+        validator_id="source_manifest",
+        validator_version="1",
+        bundle_digest=evidence_view.bundle_digest,
+        artifact_checksums=evidence_view.artifact_checksums,
+    )
 
 
 def _expand_unused(
@@ -428,6 +441,7 @@ async def test_planner_returns_valid_patch_from_structured_provider_boundary() -
     assert kwargs == {
         "agent_name": "orchestration.planner",
         "prompt_version": "dynamic-plan-v1",
+        "metadata": {"logical_invocation_id": "planner:run-1:plan:1"},
         "max_retries": 2,
     }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 
 from pydantic import ValidationError
@@ -101,7 +102,28 @@ class Dispatcher:
             envelope = ActionOutcomeEnvelope.model_validate(raw)
         except TimeoutError:
             definition = self._registry.get(action.capability)
-            if "provider_timeout" in durable_attempt.retry_policy.retryable_codes:
+            if definition.spec.may_have_side_effects:
+                error_code = "provider_timeout"
+                envelope = ActionOutcomeEnvelope(
+                    action_id=action.action_id,
+                    attempt=durable_attempt.attempt,
+                    outcome=Indeterminate(
+                        operation_key=_stable_operation_key(
+                            action, durable_attempt.attempt
+                        ),
+                        error_code=error_code,
+                        failure_signature=canonical_failure_signature(
+                            action.capability,
+                            durable_attempt.parameters_json,
+                            error_code,
+                        ),
+                        message=(
+                            "Action timed out after a possible external side effect; run its "
+                            "registered probe before any retry"
+                        ),
+                    ),
+                )
+            elif "provider_timeout" in durable_attempt.retry_policy.retryable_codes:
                 envelope = ActionOutcomeEnvelope(
                     action_id=action.action_id,
                     attempt=durable_attempt.attempt,
@@ -140,7 +162,9 @@ class Dispatcher:
                     action_id=action.action_id,
                     attempt=durable_attempt.attempt,
                     outcome=Indeterminate(
-                        operation_key=action.idempotency_key,
+                        operation_key=_stable_operation_key(
+                            action, durable_attempt.attempt
+                        ),
                         error_code=error_code,
                         failure_signature=canonical_failure_signature(
                             action.capability,
@@ -171,7 +195,6 @@ class Dispatcher:
         await self._ledger.record_attempt_outcome(self._receipt(envelope))
         self._invoke_hook("after_action_output", envelope)
         return envelope
-
     def _classify_boundary(
         self,
         action: ActionRecord,
@@ -334,3 +357,18 @@ class Dispatcher:
     def _invoke_hook(self, point: str, envelope: ActionOutcomeEnvelope) -> None:
         if self._test_hook is not None:
             self._test_hook(point, envelope)
+
+
+def _stable_operation_key(action: ActionRecord, attempt: int) -> str:
+    """Bind external-operation identity only to frozen invocation facts."""
+    invocation_json = json.dumps(
+        {
+            "action_id": action.action_id,
+            "attempt": attempt,
+            "capability": action.capability,
+            "parameters_json": action.parameters_json,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"operation:{sha256_canonical_json(invocation_json)}"

@@ -82,6 +82,20 @@ CREATE TABLE IF NOT EXISTS action_attempts (
     UNIQUE (action_id, retry_of_attempt)
 );
 
+CREATE TABLE IF NOT EXISTS probe_bindings (
+    original_action_id TEXT NOT NULL REFERENCES actions(action_id),
+    original_attempt INTEGER NOT NULL,
+    operation_key TEXT NOT NULL,
+    probe_capability TEXT NOT NULL,
+    probe_action_id TEXT NOT NULL UNIQUE REFERENCES actions(action_id),
+    plan_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (original_action_id, original_attempt),
+    UNIQUE (original_action_id, original_attempt, operation_key, probe_capability),
+    FOREIGN KEY (original_action_id, original_attempt)
+        REFERENCES action_attempts(action_id, attempt)
+);
+
 CREATE TABLE IF NOT EXISTS attempt_outcome_receipts (
     action_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,

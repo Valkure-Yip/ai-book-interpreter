@@ -15,6 +15,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -171,13 +172,23 @@ class LLMRouter:
         the path used by eval judges to point at a stronger model than the
         translator without reconfiguring the rest of the pipeline.
         """
+        call_metadata = dict(metadata or {})
+        supplied_invocation_id = call_metadata.get("logical_invocation_id")
+        if supplied_invocation_id is None:
+            logical_invocation_id = f"provider-invocation:{uuid4()}"
+            call_metadata["logical_invocation_id"] = logical_invocation_id
+        elif isinstance(supplied_invocation_id, str) and supplied_invocation_id:
+            logical_invocation_id = supplied_invocation_id
+        else:
+            raise ValueError("logical_invocation_id metadata must be a non-empty string")
         # Try built-in structured output first, fall back to JSON mode + manual parse.
         last_err: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
                 parsed, resp = await self._call_with_schema(
                     schema, messages, agent_name=agent_name,
-                    prompt_version=prompt_version, metadata=metadata, attempt=attempt,
+                    prompt_version=prompt_version, metadata=call_metadata, attempt=attempt,
+                    logical_invocation_id=logical_invocation_id,
                     model_override=model_override,
                 )
                 return parsed, resp
@@ -229,6 +240,7 @@ class LLMRouter:
         prompt_version: str,
         metadata: dict[str, Any] | None,
         attempt: int,
+        logical_invocation_id: str,
         model_override: str | None = None,
     ) -> tuple[T, LLMResponse]:
         active_model = model_override or self._config.model
@@ -292,9 +304,9 @@ class LLMRouter:
         )
         self._events.event(
             "agent.call",
-            event_id=f"agent.call:{agent_name}:{prompt_hash}:{attempt}",
+            event_id=f"agent.call:{logical_invocation_id}:attempt:{attempt}",
             agent=agent_name,
-            call_id=f"{agent_name}:{prompt_hash}:{attempt}",
+            call_id=f"{logical_invocation_id}:attempt:{attempt}",
             prompt_version=prompt_version,
             prompt_hash=prompt_hash,
             model=active_model,
