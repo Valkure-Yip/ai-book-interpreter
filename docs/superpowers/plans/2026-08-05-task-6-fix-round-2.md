@@ -139,3 +139,22 @@ symlinks still fail closed. Do not add multiprocess or distributed locking.
   checkpoint-storage classifications.
 - [x] Run focused/offline, architecture, Ruff, strict mypy 3.12, full pytest,
   diff checks; append evidence and commit.
+
+### Breaker Exception Scoped Fix: Five Important findings
+
+**Files:** same runtime/type/test/design/report surface as the breaker exception.
+
+- [x] RED/GREEN: replace the synthetic parallel fixture with a real two-branch
+  graph; after partial A completion, exclude A's retained interrupt/result and
+  resume only B's public ID while preserving same-task sequential interrupts.
+- [x] RED/GREEN: replace loop-bound initialization locks with a thread-safe,
+  cancellation-safe path registry proven by two threads and two event loops.
+- [x] RED/GREEN: atomically publish the owner sidecar through a unique temp,
+  file fsync, no-overwrite link, and parent fsync; clean every injected failure
+  and permit a fresh retry without replacing an existing final.
+- [x] RED/GREEN: configure and expose only ABI-supported approve/reject HITL
+  decisions; intersect unexpected SDK policies or repair when none remain.
+- [x] RED/GREEN: derive pause tool accounting from this invocation's
+  actual-start tracker, including the pause-A/resume-A/pause-B/resume-B chain.
+- [x] Run focused/offline, architecture, full Ruff, strict mypy 3.12, full
+  pytest, format/diff checks; append evidence and create a new commit.

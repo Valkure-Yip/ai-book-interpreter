@@ -243,9 +243,7 @@ class PendingHitlActionReview(FrozenModel):
     tool_name: str
     arguments_json: str
     description: str | None = None
-    allowed_decisions: tuple[Literal["approve", "edit", "reject", "respond"], ...] = Field(
-        min_length=1
-    )
+    allowed_decisions: tuple[Literal["approve", "reject"], ...] = Field(min_length=1)
 
 
 class PendingHitlInterrupt(FrozenModel):

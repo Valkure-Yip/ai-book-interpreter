@@ -392,10 +392,12 @@ Harness 使用 LangChain v1 `create_agent`，运行在 LangGraph 上，并配置
 - 结构化 `ActionOutcome`。
 
 真实 HITL pause 的 public `Paused` 携带 ABI-owned `PendingHitlInterrupt`，逐个给出 interrupt ID、按序
-action review 与 allowed decisions。controller 只凭该结果构造强类型 resume；不得读取 LangGraph saver
-或把 SDK `Interrupt` 传播出 provider。resume 校验使用 LangGraph 公共 state snapshot 的 current tasks，
-并在任何模型或工具执行前完成，因此同一 node 的连续 interrupt 与 parallel partial resume 都不会被
-历史 `__resume__` 写入误删。
+action review 与 ABI 支持的 `approve` / `reject`；provider 意外给出 `edit` / `respond` 时只取支持交集，
+交集为空则 repair。controller 只凭该结果构造强类型 resume；不得读取 LangGraph saver 或把 SDK
+`Interrupt` 传播出 provider。resume 校验使用 LangGraph 公共 state snapshot 的 current tasks，并排除
+带实质 result/error 的 completed task（历史 resume 产生的空 `{}` result 除外），所以同一 node 的连续
+interrupt 与 parallel partial resume 都不会被历史写入误判。pause/success 的 `tool_calls` / `tool_log`
+只来自本次 invocation 的 actual-start tracker，不重算 checkpoint 历史。
 
 Skills 按 Action 渐进加载。翻译 Action 仍只得到原文、5–8 条文体规则和命中术语；QA、EPUB 和
 release 规则不能混入翻译上下文。
@@ -448,10 +450,12 @@ CANCELLED
 `state/graph-checkpoints.sqlite` 保存 LangGraph 运行游标、Planner/agent 消息、待恢复 Action 与
 interrupt。它不是业务真相。
 
-该路径由 ABI 在本地单进程内拥有。所有 runtime instance 共享 path-scoped async 初始化协调；fresh
-先写 versioned ownership sidecar，再初始化 schema 并提交 DB marker，等待者只在 marker 可见后复用。
-schema 后、marker 前失败可由下一次 fresh 调用补完。每次 invocation 仍只使用一个 saver；symlink
-fail closed。外部、foreign 或 dirty/hot-journal SQLite 属于 invalid input，不承诺 inspection
+该路径由 ABI 在本地单进程内拥有。所有 runtime instance、线程和 event loop 共享 path-scoped
+thread-safe 初始化协调；async waiter 用 non-blocking acquire 轮询并在取消时清理 registry 引用。fresh
+以 unique temp + fsync + no-overwrite hard link + parent fsync 原子发布 versioned ownership sidecar，再
+初始化 schema 并提交 DB marker，等待者只在 marker 可见后复用。发布失败不留下 temp/final，不能覆盖
+现存 sidecar；schema 后、marker 前失败可由下一次 fresh 调用补完。每次 invocation 仍只使用一个 saver；
+symlink fail closed。外部、foreign 或 dirty/hot-journal SQLite 属于 invalid input，不承诺 inspection
 mutation-free；第一版不提供 multiprocess/distributed lock。
 
 每次启动和恢复先运行 Reconciler：

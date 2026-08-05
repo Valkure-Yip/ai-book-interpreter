@@ -569,12 +569,16 @@ Action harness 已使用 `AsyncSqliteSaver` 和调用者提供的稳定 `thread_
 #### Checkpoint 所有权与初始化协调
 
 checkpoint path 是 ABI 管理的本地文件路径，不是“可安全探测任意 SQLite”的公共接口。fresh invocation
-在打开 SQLite 前先创建同目录 ownership sidecar（`<checkpoint>.abi-owner`，格式版本 1），随后在一个
-saver context 内初始化 LangGraph 的 `checkpoints` / `writes` 表并提交
+在打开 SQLite 前先原子发布同目录 ownership sidecar（`<checkpoint>.abi-owner`，格式版本 1）：唯一
+临时文件以 `O_EXCL` / `O_NOFOLLOW` 打开，完整写入并 fsync 后用 hard-link no-overwrite 发布 final，删除
+临时文件，再 fsync 父目录；write/fsync/publish 任一步失败都清理本次 temp 和本次已发布 final，不能覆盖
+已存在 sidecar。随后在一个 saver context 内初始化 LangGraph 的 `checkpoints` / `writes` 表并提交
 `abi_checkpoint_metadata(marker_key='abi_action_checkpoint', format_version=1)`。进程级 coordinator 按
-绝对 checkpoint path 在所有 `AgentRuntime` 实例间共享 async lock；lock 覆盖路径检查、ownership
-claim、saver enter、schema 初始化/预检和 DB marker commit，marker 可见后即释放，不串行后续 graph
-执行。每次 invocation 仍只打开一个 saver context。
+绝对 checkpoint path 在所有 `AgentRuntime` 实例、线程和 event loop 间共享 `threading.Lock`；async
+等待者用 non-blocking acquire + 有界轮询，不把 registry entry 绑定到某个 loop。取消路径精确撤销 waiter
+引用，最后 holder/waiter 离开时删除 registry entry。lock 覆盖路径检查、ownership claim、saver enter、
+schema 初始化/预检和 DB marker commit，marker 可见后即释放，不串行后续 graph 执行。每次 invocation
+仍只打开一个 saver context。
 
 若 schema 初始化后、DB marker 提交前失败，valid sidecar 证明该 partial DB 是本进程认领的 ABI 路径；
 后续 **fresh** invocation 可在同一协调边界内补完初始化，不会永久误判为 foreign。等待中的同路径调用
@@ -603,16 +607,24 @@ journal mutation-free；调用者必须只提供 ABI-owned、quiescent local che
 `CheckpointTuple.pending_writes` 是写入历史，不能用“同一 task 曾出现任意 `__resume__`”判断当前
 pending；一个 node 可在保留旧 resume list 的同时产生第二个 interrupt。ABI 在构图后、任何
 `ainvoke` / 模型 / 工具执行前读取 LangGraph 公共 `aget_state(config)`，以
-`StateSnapshot.tasks[*].interrupts` 作为当前 pending 真相。parallel task 中已恢复项不会出现在该集合，
-同 task 的后续 interrupt 则仍然保留。
+`StateSnapshot.tasks[*]` 作为当前 pending 真相。LangGraph 的 public `PregelTask` 可能让已完成 parallel
+task 同时携带非空 `result` 和历史 `interrupts`；ABI 排除有 error 或实质 result 的 task，只解析仍可执行
+task 的 interrupt。上游因历史 `__resume__` 给同 task 的后续 interrupt 生成的空 `{}` result 不是完成
+结果，必须继续保留，才能支持同一 node 的连续 interrupt。
 
 实际 pause 返回的 SDK interrupt 会立即转换为 ABI-owned `PendingHitlInterrupt`：包含稳定
 `interrupt_id` 和按原顺序排列的 `PendingHitlActionReview`（tool、JSON arguments、description、
-allowed decisions），放入 public `Paused.pending_hitl_interrupts`。controller 只读 public result 即可构造
+allowed decisions），放入 public `Paused.pending_hitl_interrupts`。第一版 decision policy 只支持
+`approve` / `reject`：middleware 显式配置这两项，SDK payload 在边界处只暴露与该集合的交集；交集为空
+返回 repair，绝不公开 controller 无法构造的 `edit` / `respond`。controller 只读 public result 即可构造
 `HitlResume`，无需读取 saver 或 import LangGraph。请求 id 集合必须与公共 snapshot 的真实 pending id
 集合精确相等，每组再验证工具数量、Action approval allowlist 与 allowed decisions，随后统一映射为
 `Command(resume={interrupt_id: {"decisions": [...]}, ...})`；单 interrupt 不走特殊分支。错误 resume 在
 模型和工具执行前返回 `RepairRequired`。
+
+每次 `run_action()` 都用本次 invocation 的 actual-start tracker 生成 `tool_calls` / `tool_log`。因此初始
+approval pause 为 0；批准 A、实际执行 A 后再 pause B 的结果只记录 A；最终批准 B 的 invocation 只记录
+B，不把 checkpoint 历史工具重复计入本次结果。
 
 SQLite 错误先匹配完整扩展码，再退回 base code：`IOERR_ACCESS` / `IOERR_AUTH` 等权限扩展返回
 `checkpoint_permission_denied`，busy/locked 可重试，corrupt/not-a-database 要求修复，其余读取 I/O

@@ -9,10 +9,12 @@ import re
 import sqlite3
 import stat
 import threading
+from _thread import LockType
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
@@ -119,7 +121,7 @@ class _PendingHitlAction:
     tool_name: str
     arguments_json: str
     description: str | None
-    allowed_decisions: tuple[str, ...]
+    allowed_decisions: tuple[Literal["approve", "reject"], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +131,12 @@ class _PendingHitlInterrupt:
     task_id: str
     interrupt_id: str
     actions: tuple[_PendingHitlAction, ...]
+
+
+_SUPPORTED_HITL_DECISIONS: tuple[Literal["approve", "reject"], ...] = (
+    "approve",
+    "reject",
+)
 
 
 def _parse_pending_hitl_interrupt(
@@ -149,12 +157,19 @@ def _parse_pending_hitl_interrupt(
     for action, review in zip(request.action_requests, request.review_configs, strict=True):
         if action.name != review.action_name:
             return None
+        supported_decisions = tuple(
+            decision
+            for decision in _SUPPORTED_HITL_DECISIONS
+            if decision in review.allowed_decisions
+        )
+        if not supported_decisions:
+            return None
         actions.append(
             _PendingHitlAction(
                 tool_name=action.name,
                 arguments_json=json.dumps(action.args, ensure_ascii=False, sort_keys=True),
                 description=action.description,
-                allowed_decisions=tuple(review.allowed_decisions),
+                allowed_decisions=supported_decisions,
             )
         )
     return _PendingHitlInterrupt(
@@ -510,9 +525,9 @@ _CHECKPOINT_OWNER_BYTES = b"abi_action_checkpoint:1\n"
 
 @dataclass(slots=True)
 class _CheckpointInitializationEntry:
-    """One event-loop lock shared by every runtime using the same local path."""
+    """One process/thread lock shared by every runtime using the same local path."""
 
-    lock: asyncio.Lock
+    lock: LockType
     users: int = 0
 
 
@@ -525,20 +540,28 @@ class _CheckpointInitializationLease:
     released: bool = False
 
     def release(self) -> None:
-        if self.released:
-            return
-        self.released = True
-        self.entry.lock.release()
         with _CHECKPOINT_INITIALIZATIONS_GUARD:
-            self.entry.users -= 1
-            if self.entry.users == 0:
-                current = _CHECKPOINT_INITIALIZATIONS.get(self.key)
-                if current is self.entry:
-                    del _CHECKPOINT_INITIALIZATIONS[self.key]
+            if self.released:
+                return
+            self.released = True
+        self.entry.lock.release()
+        _drop_checkpoint_initialization_user(self.key, self.entry)
 
 
 _CHECKPOINT_INITIALIZATIONS: dict[str, _CheckpointInitializationEntry] = {}
 _CHECKPOINT_INITIALIZATIONS_GUARD = threading.Lock()
+_CHECKPOINT_INITIALIZATION_POLL_SECONDS = 0.005
+
+
+def _drop_checkpoint_initialization_user(
+    key: str,
+    entry: _CheckpointInitializationEntry,
+) -> None:
+    """Drop one holder/waiter reference and remove an unused registry entry."""
+    with _CHECKPOINT_INITIALIZATIONS_GUARD:
+        entry.users -= 1
+        if entry.users == 0 and _CHECKPOINT_INITIALIZATIONS.get(key) is entry:
+            del _CHECKPOINT_INITIALIZATIONS[key]
 
 
 async def _acquire_checkpoint_initialization(
@@ -549,16 +572,18 @@ async def _acquire_checkpoint_initialization(
     with _CHECKPOINT_INITIALIZATIONS_GUARD:
         entry = _CHECKPOINT_INITIALIZATIONS.get(key)
         if entry is None:
-            entry = _CheckpointInitializationEntry(lock=asyncio.Lock())
+            entry = _CheckpointInitializationEntry(lock=threading.Lock())
             _CHECKPOINT_INITIALIZATIONS[key] = entry
         entry.users += 1
+    acquired = False
     try:
-        await entry.lock.acquire()
+        while not entry.lock.acquire(blocking=False):
+            await asyncio.sleep(_CHECKPOINT_INITIALIZATION_POLL_SECONDS)
+        acquired = True
     except BaseException:
-        with _CHECKPOINT_INITIALIZATIONS_GUARD:
-            entry.users -= 1
-            if entry.users == 0 and _CHECKPOINT_INITIALIZATIONS.get(key) is entry:
-                del _CHECKPOINT_INITIALIZATIONS[key]
+        if acquired:
+            entry.lock.release()
+        _drop_checkpoint_initialization_user(key, entry)
         raise
     return _CheckpointInitializationLease(key=key, entry=entry)
 
@@ -588,30 +613,79 @@ def _inspect_checkpoint_owner(checkpoint_path: Path) -> bool | AgentRunResult:
 
 
 def _claim_checkpoint_owner(checkpoint_path: Path) -> AgentRunResult | None:
-    """Create the ABI ownership sidecar once before SQLite initialization."""
+    """Atomically publish the ABI ownership sidecar before SQLite initialization."""
     owner_path = _checkpoint_owner_path(checkpoint_path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        file_descriptor = os.open(owner_path, flags, 0o600)
-    except FileExistsError:
-        inspected = _inspect_checkpoint_owner(checkpoint_path)
-        if inspected is True:
-            return None
-        if isinstance(inspected, AgentRunResult):
-            return inspected
-        return _checkpoint_foreign_database()
-    except OSError as error:
-        return _checkpoint_read_failure(error)
+    temp_path: Path | None = None
+    file_descriptor = -1
+    for _attempt in range(8):
+        candidate = owner_path.with_name(f".{owner_path.name}.{uuid4().hex}.tmp")
+        try:
+            file_descriptor = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            return _checkpoint_read_failure(error)
+        temp_path = candidate
+        break
+    if temp_path is None:
+        return _checkpoint_read_failure(OSError("could not allocate ownership temp file"))
+
+    published_identity: tuple[int, int] | None = None
     try:
         view = memoryview(_CHECKPOINT_OWNER_BYTES)
         while view:
             written = os.write(file_descriptor, view)
+            if written <= 0:
+                raise OSError("ownership sidecar write made no progress")
             view = view[written:]
         os.fsync(file_descriptor)
+        temp_stat = os.fstat(file_descriptor)
+        published_identity = (temp_stat.st_dev, temp_stat.st_ino)
+        try:
+            os.link(temp_path, owner_path, follow_symlinks=False)
+        except FileExistsError:
+            inspected = _inspect_checkpoint_owner(checkpoint_path)
+            if inspected is True:
+                return None
+            if isinstance(inspected, AgentRunResult):
+                return inspected
+            return _checkpoint_foreign_database()
+        temp_path.unlink()
+        temp_path = None
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory_descriptor = os.open(owner_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except OSError as error:
+        if published_identity is not None:
+            try:
+                owner_stat = owner_path.lstat()
+                if (owner_stat.st_dev, owner_stat.st_ino) == published_identity:
+                    owner_path.unlink()
+                    directory_descriptor = os.open(
+                        owner_path.parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    try:
+                        os.fsync(directory_descriptor)
+                    finally:
+                        os.close(directory_descriptor)
+            except OSError:
+                pass
         return _checkpoint_read_failure(error)
     finally:
-        os.close(file_descriptor)
+        with suppress(OSError):
+            os.close(file_descriptor)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
     return None
 
 
@@ -673,6 +747,10 @@ def _pending_hitl_interrupts(
     pending: list[_PendingHitlInterrupt] = []
     interrupt_ids: set[str] = set()
     for task in state_snapshot.tasks:
+        # LangGraph maps a historical resume write to {} while the same task re-interrupts.
+        empty_resume_result = isinstance(task.result, dict) and not task.result
+        if task.error is not None or (task.result is not None and not empty_resume_result):
+            continue
         for interrupt_value in task.interrupts:
             parsed = _parse_pending_hitl_interrupt(interrupt_value, task_id=task.id)
             if parsed is None or parsed.interrupt_id in interrupt_ids:
@@ -1054,7 +1132,10 @@ class AgentRuntime:
                         middleware=(
                             [
                                 HumanInTheLoopMiddleware(
-                                    interrupt_on={name: True for name in hitl_middleware_tools}
+                                    interrupt_on={
+                                        name: {"allowed_decisions": ["approve", "reject"]}
+                                        for name in hitl_middleware_tools
+                                    }
                                 )
                             ]
                             if hitl_middleware_tools or isinstance(request.resume, HitlResume)
@@ -1097,9 +1178,10 @@ class AgentRuntime:
                         pending_hitl_interrupts=_public_pending_hitl_interrupts(pending_interrupts),
                     ),
                     llm_calls=callback.llm_calls,
-                    tool_calls=0,
+                    tool_calls=len(callback.tool_log),
                     cost_usd=callback.cost_usd,
                     stopped_reason="paused",
+                    tool_log=tuple(callback.tool_log),
                 )
             else:
                 envelope = ActionOutcomeEnvelope.model_validate(raw_result["structured_response"])

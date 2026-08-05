@@ -6,12 +6,14 @@ import asyncio
 import importlib
 import inspect
 import json
+import operator
 import sqlite3
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 import httpx
@@ -23,7 +25,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Interrupt, PregelTask, StateSnapshot, interrupt
+from langgraph.types import Command, Interrupt, PregelTask, StateSnapshot, interrupt
 from pydantic import Field
 from typing_extensions import TypedDict
 
@@ -144,6 +146,12 @@ class _DeliveryInput(FrozenModel):
 
 class _SequentialInterruptState(TypedDict, total=False):
     messages: list[object]
+    structured_response: object
+
+
+class _ParallelInterruptState(TypedDict, total=False):
+    messages: list[object]
+    effects: Annotated[list[str], operator.add]
     structured_response: object
 
 
@@ -646,9 +654,13 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
         (
             "deliver",
             "{}",
-            ("approve", "edit", "reject", "respond"),
+            ("approve", "reject"),
         )
     ]
+    assert tuple(
+        runner.HitlDecision(decision=decision).decision
+        for decision in pending_interrupt.action_reviews[0].allowed_decisions
+    ) == ("approve", "reject")
     serialized = first.model_dump(mode="json")
     assert serialized["outcome"]["pending_hitl_interrupts"] == [
         {
@@ -658,7 +670,7 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
                     "tool_name": "deliver",
                     "arguments_json": "{}",
                     "description": pending_interrupt.action_reviews[0].description,
-                    "allowed_decisions": ["approve", "edit", "reject", "respond"],
+                    "allowed_decisions": ["approve", "reject"],
                 }
             ],
         }
@@ -760,6 +772,8 @@ async def test_same_action_resumes_two_sequential_public_hitl_interrupts(
 
     first = await runtime.run_action(_request(tmp_path, **request_args))
     assert first.outcome.kind == "paused"
+    assert first.tool_calls == 0
+    assert first.tool_log == ()
     (first_interrupt,) = first.outcome.pending_hitl_interrupts
     assert [review.tool_name for review in first_interrupt.action_reviews] == ["deliver_a"]
 
@@ -778,9 +792,13 @@ async def test_same_action_resumes_two_sequential_public_hitl_interrupts(
         )
     )
     assert second.outcome.kind == "paused"
+    assert second.tool_calls == 1
+    assert [(record.name, record.arguments_json) for record in second.tool_log] == [
+        ("deliver_a", "{}")
+    ]
+    assert executions == ["deliver_a"]
     (second_interrupt,) = second.outcome.pending_hitl_interrupts
     assert [review.tool_name for review in second_interrupt.action_reviews] == ["deliver_b"]
-
     completed = await runtime.run_action(
         _request(
             tmp_path,
@@ -797,6 +815,10 @@ async def test_same_action_resumes_two_sequential_public_hitl_interrupts(
     )
 
     assert completed.outcome.kind == "succeeded"
+    assert completed.tool_calls == 1
+    assert [(record.name, record.arguments_json) for record in completed.tool_log] == [
+        ("deliver_b", "{}")
+    ]
     assert executions == ["deliver_a", "deliver_b"]
     assert set(model.human_counts) == {1}
 
@@ -917,29 +939,151 @@ def test_hitl_resume_rejects_unsupported_decisions() -> None:
         )
 
 
-def test_pending_hitl_interrupts_use_current_public_tasks_for_parallel_partial_resume() -> None:
+def test_public_hitl_policy_intersects_unexpected_provider_decisions_or_repairs() -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
-    snapshot = _state_snapshot(
-        PregelTask(id="task-a", name="approval", path=(), interrupts=()),
-        PregelTask(
-            id="task-b",
-            name="approval",
-            path=(),
-            interrupts=(_hitl_interrupt("interrupt-b", "deliver_b"),),
-        ),
+
+    def provider_interrupt(interrupt_id: str, decisions: list[str]) -> Interrupt:
+        return Interrupt(
+            value={
+                "action_requests": [{"name": "deliver", "args": {}}],
+                "review_configs": [
+                    {
+                        "action_name": "deliver",
+                        "allowed_decisions": decisions,
+                    }
+                ],
+            },
+            id=interrupt_id,
+        )
+
+    mixed = runner._parse_pending_hitl_interrupt(
+        provider_interrupt("mixed", ["edit", "approve", "respond", "reject"]),
+        task_id="task-a",
+    )
+    assert mixed is not None
+    assert mixed.actions[0].allowed_decisions == ("approve", "reject")
+    assert runner._public_pending_hitl_interrupts((mixed,))[0].action_reviews[
+        0
+    ].allowed_decisions == ("approve", "reject")
+
+    unsupported_only = runner._parse_pending_hitl_interrupt(
+        provider_interrupt("unsupported", ["edit", "respond"]),
+        task_id="task-b",
+    )
+    assert unsupported_only is None
+    with pytest.raises(ValueError):
+        runner.PendingHitlActionReview(
+            tool_name="deliver",
+            arguments_json="{}",
+            allowed_decisions=("edit",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_parallel_partial_resume_excludes_completed_task_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "parallel-partial.sqlite"
+    thread_id = "run-1/parallel/1"
+
+    def approval_node(tool_name: str) -> Any:
+        def node(_state: _ParallelInterruptState) -> dict[str, list[str]]:
+            interrupt(_hitl_interrupt("provider-generated", tool_name).value)
+            return {"effects": [tool_name]}
+
+        return node
+
+    def finish(state: _ParallelInterruptState) -> dict[str, object]:
+        return {
+            "structured_response": {
+                "outcome": {
+                    "kind": "succeeded",
+                    "staging_relpath": "state/staging/parallel/result.json",
+                    "evidence_refs": state["effects"],
+                }
+            }
+        }
+
+    def build_graph(checkpointer: Any) -> Any:
+        return (
+            StateGraph(_ParallelInterruptState)
+            .add_node("approval_a", approval_node("deliver_a"))
+            .add_node("approval_b", approval_node("deliver_b"))
+            .add_node("finish", finish)
+            .add_edge(START, "approval_a")
+            .add_edge(START, "approval_b")
+            .add_edge("approval_a", "finish")
+            .add_edge("approval_b", "finish")
+            .add_edge("finish", END)
+            .compile(checkpointer=checkpointer)
+        )
+
+    def real_parallel_agent(*args: Any, **kwargs: Any) -> Any:
+        return build_graph(kwargs["checkpointer"])
+
+    monkeypatch.setattr(runner, "create_agent", real_parallel_agent)
+    tools = (
+        ToolBinding("deliver_a", "First delivery.", _NoopInput, lambda: "a"),
+        ToolBinding("deliver_b", "Second delivery.", _NoopInput, lambda: "b"),
+    )
+    request_args = {
+        "checkpoint_path": checkpoint_path,
+        "thread_id": thread_id,
+        "tools": tools,
+        "approval_tools": ("deliver_a", "deliver_b"),
+    }
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+
+    first = await runtime.run_action(_request(tmp_path, **request_args))
+    assert first.outcome.kind == "paused"
+    public_by_tool = {
+        pending.action_reviews[0].tool_name: pending.interrupt_id
+        for pending in first.outcome.pending_hitl_interrupts
+    }
+    assert set(public_by_tool) == {"deliver_a", "deliver_b"}
+
+    config = {"configurable": {"thread_id": thread_id}}
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_graph(saver)
+        partial = await graph.ainvoke(
+            Command(resume={public_by_tool["deliver_a"]: {"decisions": [{"type": "approve"}]}}),
+            config=config,
+        )
+        snapshot = await graph.aget_state(config)
+
+    assert partial.get("__interrupt__")
+    completed_tasks = [task for task in snapshot.tasks if task.result is not None]
+    assert len(completed_tasks) == 1
+    assert public_by_tool["deliver_a"] in {
+        interrupt_value.id for interrupt_value in completed_tasks[0].interrupts
+    }
+    unfinished_ids = {
+        interrupt_value.id
+        for task in snapshot.tasks
+        if task.result is None and task.error is None
+        for interrupt_value in task.interrupts
+    }
+    assert unfinished_ids == {public_by_tool["deliver_b"]}
+
+    completed = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=public_by_tool["deliver_b"],
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
+            ),
+        )
     )
 
-    pending = runner._pending_hitl_interrupts(snapshot)
-
-    assert pending is not None
-    assert [
-        (
-            interrupt.task_id,
-            interrupt.interrupt_id,
-            tuple(action.tool_name for action in interrupt.actions),
-        )
-        for interrupt in pending
-    ] == [("task-b", "interrupt-b", ("deliver_b",))]
+    assert completed.outcome.kind == "succeeded"
+    assert set(completed.outcome.evidence_refs) == {"deliver_a", "deliver_b"}
 
 
 def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> None:
@@ -1725,6 +1869,86 @@ async def test_fresh_invocation_may_create_checkpoint_parent_and_database(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["write", "file_fsync", "publish", "parent_fsync"],
+)
+async def test_owner_sidecar_publish_failure_leaves_no_final_and_fresh_retry_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "atomic-owner" / "graph.sqlite"
+    checkpoint_path.parent.mkdir()
+    owner_path = checkpoint_path.with_name(f"{checkpoint_path.name}.abi-owner")
+    real_write = runner.os.write
+    real_fsync = runner.os.fsync
+    fsync_calls = 0
+
+    def injected_write(file_descriptor: int, data: object) -> int:
+        if failure_stage == "write":
+            raise OSError("injected sidecar write failure")
+        return real_write(file_descriptor, data)
+
+    def injected_fsync(file_descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if failure_stage == "file_fsync" and fsync_calls == 1:
+            raise OSError("injected sidecar file fsync failure")
+        if failure_stage == "parent_fsync" and fsync_calls == 2:
+            raise OSError("injected sidecar parent fsync failure")
+        real_fsync(file_descriptor)
+
+    with monkeypatch.context() as failure_patch:
+        failure_patch.setattr(runner.os, "write", injected_write)
+        failure_patch.setattr(runner.os, "fsync", injected_fsync)
+        if failure_stage == "publish":
+
+            def fail_link(*args: object, **kwargs: object) -> None:
+                raise OSError("injected sidecar publish failure")
+
+            failure_patch.setattr(runner.os, "link", fail_link)
+        failed = runner._claim_checkpoint_owner(checkpoint_path)
+
+    assert failed is not None
+    assert failed.outcome.kind == "repair_required"
+    assert owner_path.exists() is False
+    assert list(checkpoint_path.parent.iterdir()) == []
+
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    recovered = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
+
+    assert recovered.outcome.kind == "succeeded"
+    assert owner_path.read_bytes() == b"abi_action_checkpoint:1\n"
+    assert set(checkpoint_path.parent.iterdir()) == {checkpoint_path, owner_path}
+
+
+@pytest.mark.parametrize("owner_bytes", [b"abi_action_checkpoint:1\n", b"foreign-owner\n"])
+def test_owner_sidecar_claim_never_overwrites_existing_final(
+    tmp_path: Path,
+    owner_bytes: bytes,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "existing-owner" / "graph.sqlite"
+    checkpoint_path.parent.mkdir()
+    owner_path = checkpoint_path.with_name(f"{checkpoint_path.name}.abi-owner")
+    owner_path.write_bytes(owner_bytes)
+    inode_before = owner_path.stat().st_ino
+
+    result = runner._claim_checkpoint_owner(checkpoint_path)
+
+    if owner_bytes == b"abi_action_checkpoint:1\n":
+        assert result is None
+    else:
+        assert result is not None
+        assert result.outcome.defect_codes == ("checkpoint_foreign_database",)
+    assert owner_path.read_bytes() == owner_bytes
+    assert owner_path.stat().st_ino == inode_before
+    assert set(checkpoint_path.parent.iterdir()) == {owner_path}
+
+
+@pytest.mark.asyncio
 async def test_resume_rejects_unmarked_external_sqlite_as_invalid_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1835,6 +2059,131 @@ async def test_shared_first_initialization_hides_schema_until_marker_commit(
     assert second.outcome.kind == "succeeded"
     assert first_model.human_counts == [1]
     assert second_model.human_counts == [1]
+
+
+def test_shared_initialization_crosses_threads_and_event_loops_without_leaking_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "cross-loop" / "graph.sqlite"
+    initialization_started = threading.Event()
+    release_initialization = threading.Event()
+    probe_waiting = threading.Event()
+    probe_cancelled = threading.Event()
+    second_acquire_entered = threading.Event()
+    second_acquire_returned = threading.Event()
+    first_loop: list[asyncio.AbstractEventLoop] = []
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+    result_guard = threading.Lock()
+    real_initializer = runner._initialize_checkpoint_database
+    real_acquire = runner._acquire_checkpoint_initialization
+    initialization_calls = 0
+    initialization_guard = threading.Lock()
+
+    async def paused_first_initializer(checkpointer: Any) -> None:
+        nonlocal initialization_calls
+        with initialization_guard:
+            initialization_calls += 1
+            first_call = initialization_calls == 1
+        if first_call:
+            await checkpointer.setup()
+            first_loop.append(asyncio.get_running_loop())
+            initialization_started.set()
+            await asyncio.to_thread(release_initialization.wait)
+        await real_initializer(checkpointer)
+
+    async def tracked_acquire(path: Path) -> Any:
+        if threading.current_thread().name == "checkpoint-loop-b":
+            second_acquire_entered.set()
+            try:
+                return await real_acquire(path)
+            finally:
+                second_acquire_returned.set()
+        return await real_acquire(path)
+
+    monkeypatch.setattr(
+        runner,
+        "_initialize_checkpoint_database",
+        paused_first_initializer,
+    )
+    monkeypatch.setattr(runner, "_acquire_checkpoint_initialization", tracked_acquire)
+
+    def thread_target(label: str) -> None:
+        async def run() -> object:
+            runtime_dir = tmp_path / f"runtime-{label}"
+            runtime_dir.mkdir()
+            runtime = _runtime(runtime_dir, _RecordingOutcomeModel(human_counts=[]))
+            return await runtime.run_action(
+                _request(
+                    runtime_dir,
+                    checkpoint_path=checkpoint_path,
+                    thread_id=f"run-1/{label}/1",
+                )
+            )
+
+        try:
+            value = asyncio.run(run())
+        except BaseException as error:
+            with result_guard:
+                errors[label] = error
+        else:
+            with result_guard:
+                results[label] = value
+
+    first_thread = threading.Thread(
+        target=thread_target,
+        args=("a",),
+        name="checkpoint-loop-a",
+        daemon=True,
+    )
+    second_thread = threading.Thread(
+        target=thread_target,
+        args=("b",),
+        name="checkpoint-loop-b",
+        daemon=True,
+    )
+    first_thread.start()
+    try:
+        assert initialization_started.wait(timeout=5)
+
+        async def cancelled_same_loop_waiter() -> None:
+            waiter = asyncio.create_task(real_acquire(checkpoint_path))
+            await asyncio.sleep(0)
+            probe_waiting.set()
+            try:
+                await waiter
+            finally:
+                probe_cancelled.set()
+
+        probe_future = asyncio.run_coroutine_threadsafe(
+            cancelled_same_loop_waiter(),
+            first_loop[0],
+        )
+        assert probe_waiting.wait(timeout=5)
+        probe_future.cancel()
+        assert probe_cancelled.wait(timeout=5)
+        with runner._CHECKPOINT_INITIALIZATIONS_GUARD:
+            assert runner._CHECKPOINT_INITIALIZATIONS[str(checkpoint_path)].users == 1
+
+        second_thread.start()
+        assert second_acquire_entered.wait(timeout=5)
+        returned_while_first_held = second_acquire_returned.wait(timeout=0.25)
+    finally:
+        release_initialization.set()
+        first_thread.join(timeout=5)
+        if second_thread.ident is not None:
+            second_thread.join(timeout=5)
+
+    assert returned_while_first_held is False
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert errors == {}
+    assert set(results) == {"a", "b"}
+    assert all(result.outcome.kind == "succeeded" for result in results.values())
+    with runner._CHECKPOINT_INITIALIZATIONS_GUARD:
+        assert runner._CHECKPOINT_INITIALIZATIONS == {}
 
 
 @pytest.mark.asyncio
