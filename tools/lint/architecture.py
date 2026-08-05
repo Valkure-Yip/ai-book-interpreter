@@ -19,6 +19,17 @@ _LEGACY_CONTROL_SYMBOLS = frozenset(
         "StageSpec",
     }
 )
+_LEGACY_CONTROL_MODULE_PREFIXES = (
+    "abi.orchestrator.driver",
+    "abi.project.state",
+    "abi.prompts.stages",
+    "abi.stages",
+)
+_LEGACY_PACKAGE_EXPORTS = {
+    "abi.orchestrator": frozenset({"Orchestrator"}),
+    "abi.project": frozenset({"HAPPY_PATH", "PipelineState", "Status"}),
+    "abi.prompts": frozenset({"STAGE_BY_PRODUCES", "STAGE_SEQUENCE", "StageSpec"}),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +48,13 @@ def _is_provider_module(relative_path: Path) -> bool:
 def _is_forbidden_sdk(module: str) -> bool:
     top_level = module.split(".", 1)[0]
     return top_level in _PROVIDER_SDKS
+
+
+def _is_legacy_control_module(module: str) -> bool:
+    return any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for prefix in _LEGACY_CONTROL_MODULE_PREFIXES
+    )
 
 
 def scan_tree(root: Path) -> tuple[Violation, ...]:
@@ -58,8 +76,32 @@ def scan_tree(root: Path) -> tuple[Violation, ...]:
             modules: tuple[str, ...]
             if isinstance(node, ast.Import):
                 modules = tuple(alias.name for alias in node.names)
+                for alias in node.names:
+                    if _is_legacy_control_module(alias.name):
+                        violations.append(
+                            Violation(
+                                rule="fixed-macro-control",
+                                path=relative_path.as_posix(),
+                                line=node.lineno,
+                                module=alias.name,
+                                symbol=alias.asname or alias.name.rsplit(".", 1)[-1],
+                            )
+                        )
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 modules = (node.module,)
+                for alias in node.names:
+                    if _is_legacy_control_module(node.module) or alias.name in (
+                        _LEGACY_PACKAGE_EXPORTS.get(node.module, frozenset())
+                    ):
+                        violations.append(
+                            Violation(
+                                rule="fixed-macro-control",
+                                path=relative_path.as_posix(),
+                                line=node.lineno,
+                                module=node.module,
+                                symbol=alias.name,
+                            )
+                        )
             else:
                 continue
             for module in modules:

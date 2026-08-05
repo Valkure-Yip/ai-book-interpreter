@@ -12,10 +12,12 @@ from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     ActionStatus,
+    ArtifactMetadata,
     GateDecision,
     Indeterminate,
     Paused,
     ProbeResolution,
+    RetryableFailure,
     RunStatus,
     Succeeded,
     canonical_bundle_json,
@@ -23,6 +25,10 @@ from abi.types.orchestration import (
     canonical_model_json,
     sha256_canonical_json,
 )
+
+
+class _ArtifactMetadataList(FrozenModel):
+    items: tuple[ArtifactMetadata, ...]
 
 
 class GateIntegrityItem(FrozenModel):
@@ -110,6 +116,9 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
     outcomes = {
         (item.action_id, item.attempt): item for item in durable.outcome_receipts
     }
+    effective_outcomes = {
+        (item.action_id, item.attempt): item for item in durable.effective_outcomes
+    }
     intents_by_attempt = {
         key: tuple(
             sorted(
@@ -125,12 +134,72 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
     }
     integrity: list[GateIntegrityItem] = []
     policy_failures: list[str] = []
+    parsed_outcomes: dict[tuple[str, int], ActionOutcomeEnvelope] = {}
+    for key, outcome_receipt in outcomes.items():
+        try:
+            parsed_envelope = ActionOutcomeEnvelope.model_validate_json(
+                outcome_receipt.canonical_outcome_json
+            )
+        except ValueError:
+            policy_failures.append(f"{key[0]} outcome receipt is not typed canonical JSON")
+            continue
+        if (
+            outcome_receipt.outcome_digest
+            != sha256_canonical_json(outcome_receipt.canonical_outcome_json)
+            or parsed_envelope.action_id != key[0]
+            or parsed_envelope.attempt != key[1]
+        ):
+            policy_failures.append(
+                f"{key[0]} outcome receipt digest or envelope identity disagrees"
+            )
+            continue
+        parsed_outcomes[key] = parsed_envelope
+    gate_receipts_by_attempt = {
+        key: tuple(
+            item
+            for item in durable.gate_receipts
+            if (item.action_id, item.attempt) == key
+        )
+        for key in {(item.action_id, item.attempt) for item in durable.gate_receipts}
+    }
+    effective_success_keys: set[tuple[str, int]] = set()
+    for key, success_attempt in attempts.items():
+        action = actions.get(key[0])
+        effective_record = effective_outcomes.get(key)
+        canonical_outcome_json = (
+            effective_record.canonical_outcome_json
+            if effective_record is not None
+            else outcomes[key].canonical_outcome_json
+            if key in outcomes
+            else None
+        )
+        if canonical_outcome_json is None:
+            continue
+        try:
+            effective_envelope = ActionOutcomeEnvelope.model_validate_json(
+                canonical_outcome_json
+            )
+        except ValueError:
+            continue
+        if (
+            isinstance(effective_envelope.outcome, Succeeded)
+            and action is not None
+            and action.status is ActionStatus.SUCCEEDED
+            and success_attempt.status is ActionStatus.SUCCEEDED
+        ):
+            effective_success_keys.add(key)
+    for key in effective_success_keys:
+        if len(gate_receipts_by_attempt.get(key, ())) != 1:
+            policy_failures.append(
+                f"{key[0]} ordinary effective success requires exactly one gate receipt chain"
+            )
     for receipt in durable.gate_receipts:
         key = (receipt.action_id, receipt.attempt)
         failures: list[str] = []
         action = actions.get(receipt.action_id)
         attempt = attempts.get(key)
-        outcome_receipt = outcomes.get(key)
+        gate_outcome_receipt = outcomes.get(key)
+        effective_outcome = effective_outcomes.get(key)
         try:
             decision = GateDecision.model_validate_json(
                 receipt.canonical_gate_decision_json
@@ -150,12 +219,16 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
         ):
             failures.append("authorization and attempt expected manifest facts disagree")
         bundle = None
-        if outcome_receipt is None:
+        if gate_outcome_receipt is None:
             failures.append("attempt outcome receipt is missing")
         else:
             try:
-                envelope = ActionOutcomeEnvelope.model_validate_json(
-                    outcome_receipt.canonical_outcome_json
+                envelope = (
+                    ActionOutcomeEnvelope.model_validate_json(
+                        effective_outcome.canonical_outcome_json
+                    )
+                    if effective_outcome is not None
+                    else parsed_outcomes.get(key)
                 )
             except ValueError:
                 envelope = None
@@ -164,10 +237,22 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             else:
                 bundle = envelope.outcome.artifact_bundle
                 bundle_json = canonical_bundle_json(bundle)
+                recorded_bundle_json = (
+                    bundle_json
+                    if effective_outcome is not None
+                    and effective_outcome.source == "hitl_continuation"
+                    else gate_outcome_receipt.canonical_bundle_json
+                )
+                recorded_bundle_digest = (
+                    sha256_canonical_json(bundle_json)
+                    if effective_outcome is not None
+                    and effective_outcome.source == "hitl_continuation"
+                    else gate_outcome_receipt.bundle_digest
+                )
                 if (
-                    outcome_receipt.canonical_bundle_json != bundle_json
-                    or outcome_receipt.bundle_digest != sha256_canonical_json(bundle_json)
-                    or receipt.bundle_digest != outcome_receipt.bundle_digest
+                    recorded_bundle_json != bundle_json
+                    or recorded_bundle_digest != sha256_canonical_json(bundle_json)
+                    or receipt.bundle_digest != recorded_bundle_digest
                 ):
                     failures.append("canonical bundle digest binding disagrees")
         if decision is not None and (
@@ -204,6 +289,34 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             if not actual or actual != expected:
                 failures.append("ordinary success bundle is empty or not the exact manifest")
         intents = intents_by_attempt.get(key, ())
+        exact_artifact_identity = bool(
+            bundle is not None
+            and len(bundle.entries) == len(receipt.artifacts) == len(intents)
+            and all(
+                intent.ordinal == ordinal
+                and intent.action_id == receipt.action_id
+                and intent.attempt == receipt.attempt
+                and intent.staged_relpath == gate_artifact.staged_relpath
+                == bundle_entry.staged_relpath
+                and intent.canonical_relpath == gate_artifact.canonical_relpath
+                == bundle_entry.canonical_relpath
+                and intent.checksum == gate_artifact.checksum
+                and intent.media_type == bundle_entry.media_type
+                and intent.evidence_role == bundle_entry.evidence_role
+                and intent.metadata_json
+                == canonical_model_json(_ArtifactMetadataList(items=bundle_entry.metadata))
+                for ordinal, (bundle_entry, gate_artifact, intent) in enumerate(
+                    zip(bundle.entries, receipt.artifacts, intents, strict=True)
+                )
+            )
+        )
+        if not exact_artifact_identity:
+            failures.append(
+                "bundle, gate receipt, and promotion intent artifact identity disagrees"
+            )
+            policy_failures.append(
+                f"{receipt.action_id} exact artifact identity replay failed"
+            )
         if (
             len(intents) != len(receipt.artifacts)
             or tuple(intent.ordinal for intent in intents) != tuple(range(len(intents)))
@@ -253,13 +366,34 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
         evidence_matches = tuple(
             evidence
             for evidence in durable.snapshot.gate_evidence
-            if evidence.gate == receipt.validator_id
+            if evidence.passed
+            and evidence.gate == receipt.validator_id
             and evidence.validator_version == receipt.validator_version
             and evidence.artifact_checksums
             == tuple(item.checksum for item in receipt.artifacts)
         )
-        if not evidence_matches:
+        action_bound_evidence = tuple(
+            evidence
+            for evidence in durable.committed_gate_evidence
+            if evidence.action_id == receipt.action_id
+            and evidence.passed
+            and evidence.gate == receipt.validator_id
+            and evidence.validator_version == receipt.validator_version
+            and evidence.artifact_checksums
+            == tuple(item.checksum for item in receipt.artifacts)
+            and evidence.gate_decision_digest == receipt.gate_decision_digest
+            and evidence.bundle_digest == receipt.bundle_digest
+            and evidence.evidence_refs == receipt.evidence_refs
+            and action is not None
+            and action.committed_at is not None
+            and evidence.committed_at <= action.committed_at
+        )
+        if len(evidence_matches) != 1 or len(action_bound_evidence) != 1:
             failures.append("committed gate evidence artifact checksums disagree")
+        if failures:
+            policy_failures.append(
+                f"{receipt.action_id} gate integrity replay failed: {'; '.join(failures)}"
+            )
         integrity.append(
             GateIntegrityItem(
                 gate=receipt.validator_id,
@@ -291,33 +425,94 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             exact_successors = [
                 item for item in ordered if item.retry_of_attempt == successor.retry_of_attempt
             ]
+            predecessor = predecessors[0] if len(predecessors) == 1 else None
+            predecessor_receipt = (
+                outcomes.get((action_id, predecessor.attempt))
+                if predecessor is not None
+                else None
+            )
+            predecessor_envelope = (
+                parsed_outcomes.get((action_id, predecessor.attempt))
+                if predecessor is not None
+                else None
+            )
+            predecessor_outcome = (
+                predecessor_envelope.outcome
+                if predecessor_envelope is not None
+                else None
+            )
+            retry_authorized = bool(
+                predecessor is not None
+                and predecessor_receipt is not None
+                and isinstance(predecessor_outcome, RetryableFailure)
+                and predecessor_receipt.error_code == predecessor_outcome.error_code
+                and predecessor_outcome.error_code in predecessor.retry_policy.retryable_codes
+                and predecessor.attempt < predecessor.retry_policy.max_attempts
+                and predecessor.retry_policy_fingerprint
+                == sha256_canonical_json(canonical_model_json(predecessor.retry_policy))
+            )
+            start_events = tuple(
+                event
+                for event in durable.outbox_events
+                if event.event_name == "action.started"
+                and json.loads(event.payload_json).get("action_id") == action_id
+                and json.loads(event.payload_json).get("attempt") == successor.attempt
+            )
+            outcome_events = tuple(
+                event
+                for event in durable.outbox_events
+                if event.event_name == "action.outcome"
+                and json.loads(event.payload_json).get("action_id") == action_id
+                and json.loads(event.payload_json).get("attempt")
+                == successor.retry_of_attempt
+            )
+            successor_chronology = bool(
+                successor.status is ActionStatus.AUTHORIZED
+                or (
+                    len(start_events) == 1
+                    and len(outcome_events) == 1
+                    and outcome_events[0].sequence < start_events[0].sequence
+                    and successor.started_at is not None
+                )
+            )
             valid = (
-                len(predecessors) == 1
+                retry_authorized
                 and len(exact_successors) == 1
-                and successor.attempt == predecessors[0].attempt + 1
-                and predecessors[0].status is ActionStatus.RETRY_WAIT
-                and successor.status is ActionStatus.AUTHORIZED
+                and predecessor is not None
+                and successor.attempt == predecessor.attempt + 1
+                and predecessor.status is ActionStatus.RETRY_WAIT
+                and successor_chronology
                 and action is not None
-                and action.status is ActionStatus.RETRY_WAIT
+                and action.status is successor.status
                 and successor.expected_artifact_manifest
-                == predecessors[0].expected_artifact_manifest
+                == predecessor.expected_artifact_manifest
                 and successor.expected_manifest_digest
-                == predecessors[0].expected_manifest_digest
-                and successor.retry_policy == predecessors[0].retry_policy
+                == predecessor.expected_manifest_digest
+                and successor.parameters_json == predecessor.parameters_json
+                and successor.expected_evidence_refs == predecessor.expected_evidence_refs
+                and successor.retry_policy == predecessor.retry_policy
                 and successor.retry_policy_fingerprint
-                == predecessors[0].retry_policy_fingerprint
+                == predecessor.retry_policy_fingerprint
                 and successor.staging_relpath
                 == f"state/staging/{action_id}/{successor.attempt}"
-                and successor.staging_relpath != predecessors[0].staging_relpath
+                and successor.staging_relpath != predecessor.staging_relpath
             )
             if not valid:
-                policy_failures.append(
-                    f"{action_id} retry successor changed frozen facts or reused staging"
+                reason = (
+                    "lacks eligible RetryableFailure/error/policy authority"
+                    if not retry_authorized
+                    else "changed frozen facts, reused staging, or violated attempt chronology"
                 )
+                policy_failures.append(f"{action_id} retry successor {reason}")
 
     for repair in durable.repair_facts:
         action = actions.get(repair.action_id)
         attempt = attempts.get((repair.action_id, repair.attempt))
+        original_receipt = outcomes.get((repair.action_id, repair.attempt))
+        if original_receipt is None or repair.outcome_digest != original_receipt.outcome_digest:
+            policy_failures.append(
+                f"{repair.action_id} repair fact outcome digest is not bound to its original receipt"
+            )
         if repair.repair_class == "semantic":
             if any(
                 resolution.source_action_id == repair.action_id
@@ -337,10 +532,22 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 if any(candidate.plan_version == plan.version for plan in superseding_plans)
                 and candidate.action_id != repair.action_id
             )
+            direct_replacements = tuple(
+                candidate
+                for candidate in replacements
+                if any(
+                    candidate.plan_version == plan.version
+                    and any(
+                        proposed.capability == candidate.capability
+                        for proposed in plan.patch.proposed_actions
+                    )
+                    for plan in superseding_plans
+                )
+            )
             replacement_attempts = tuple(
                 candidate
                 for candidate in durable.attempts
-                if any(candidate.action_id == item.action_id for item in replacements)
+                if any(candidate.action_id == item.action_id for item in direct_replacements)
             )
             valid = (
                 action is not None
@@ -352,11 +559,12 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 and action.reason_code == repair.reason_code
                 and durable.run.status is RunStatus.RUNNING
                 and len(superseding_plans) == 1
-                and len(replacements) == 1
+                and superseding_plans[0].version == action.plan_version + 1
+                and len(direct_replacements) == 1
                 and len(replacement_attempts) == 1
                 and replacement_attempts[0].attempt == 1
                 and replacement_attempts[0].staging_relpath
-                == f"state/staging/{replacements[0].action_id}/1"
+                == f"state/staging/{direct_replacements[0].action_id}/1"
                 and replacement_attempts[0].staging_relpath != attempt.staging_relpath
             )
             if not valid:
@@ -365,32 +573,43 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 )
             continue
 
-        replacements = tuple(
-            candidate
-            for candidate in durable.actions
-            if candidate.action_id != repair.action_id
-            and candidate.plan_version > (action.plan_version if action is not None else 0)
+        superseding_plans = tuple(
+            plan
+            for plan in durable.plan_versions
+            if repair.action_id in plan.patch.superseded_action_ids
         )
         matching_unblocks = tuple(
             resolution
             for resolution in durable.unblock_resolutions
             if resolution.source_action_id == repair.action_id
-            and resolution.replacement_action_id
-            in {candidate.action_id for candidate in replacements}
-            and resolution.plan_version
-            in {candidate.plan_version for candidate in replacements}
+            and resolution.replacement_action_id is not None
+            and resolution.plan_version is not None
             and resolution.staging_relpath
             == f"state/staging/{resolution.replacement_action_id}/1"
             and resolution.request.source_action_id == repair.action_id
             and resolution.request_digest
             == sha256_canonical_json(canonical_model_json(resolution.request))
+            and any(
+                candidate.action_id == resolution.replacement_action_id
+                and candidate.plan_version == resolution.plan_version
+                and any(
+                    plan.version == resolution.plan_version
+                    and any(
+                        proposed.capability == candidate.capability
+                        for proposed in plan.patch.proposed_actions
+                    )
+                    for plan in superseding_plans
+                )
+                for candidate in durable.actions
+            )
         )
         blocked_without_replacement = (
-            durable.run.status is RunStatus.BLOCKED and not replacements
+            durable.run.status is RunStatus.BLOCKED
+            and not superseding_plans
+            and not matching_unblocks
         )
         unblocked_with_one_replacement = (
             durable.run.status is RunStatus.RUNNING
-            and len(replacements) == 1
             and len(matching_unblocks) == 1
         )
         if not (
@@ -502,28 +721,36 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 f"{resolution.original_action_id} probe resolution violates immutable authority"
             )
 
-    for outcome_key, outcome_record in outcomes.items():
+    for outcome_key in outcomes:
         try:
-            routed_envelope = ActionOutcomeEnvelope.model_validate_json(
-                outcome_record.canonical_outcome_json
+            routed_envelope = (
+                ActionOutcomeEnvelope.model_validate_json(
+                    effective_outcomes[outcome_key].canonical_outcome_json
+                )
+                if outcome_key in effective_outcomes
+                else parsed_outcomes.get(outcome_key)
             )
         except ValueError:
+            routed_envelope = None
+        if routed_envelope is None:
             continue
         routed_action = actions.get(outcome_key[0])
         routed_attempt = attempts.get(outcome_key)
         if (
             not isinstance(routed_envelope.outcome, (Succeeded, ProbeResolution))
-            and (routed_action is not None and routed_action.status is ActionStatus.SUCCEEDED)
-            and (routed_attempt is not None and routed_attempt.status is ActionStatus.SUCCEEDED)
+            and (
+                (routed_action is not None and routed_action.status is ActionStatus.SUCCEEDED)
+                or (
+                    routed_attempt is not None
+                    and routed_attempt.status is ActionStatus.SUCCEEDED
+                )
+            )
             and outcome_key not in valid_probe_successes
         ):
             policy_failures.append(
-                f"{outcome_key[0]} non-probe outcome was incorrectly treated as success"
+                f"{outcome_key[0]} non-probe outcome has contradictory terminal status"
             )
 
-    effective_outcomes = {
-        (item.action_id, item.attempt): item for item in durable.effective_outcomes
-    }
     continuations_by_interrupt = {
         hitl_decision.interrupt_id: tuple(
             item

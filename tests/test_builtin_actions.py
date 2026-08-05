@@ -48,7 +48,13 @@ def fake_context() -> SimpleNamespace:
         rel=lambda path: path.relative_to(root).as_posix(),
         append_log=lambda line: None,
     )
-    return SimpleNamespace(project=project, resolve=lambda path: root / path)
+    snapshot = RunSnapshot(run_id="test-run", status=RunStatus.RUNNING)
+    return SimpleNamespace(
+        project=project,
+        run_id="test-run",
+        get_run_snapshot=lambda: snapshot,
+        resolve=lambda path: root / path,
+    )
 
 
 def test_builtin_catalog_has_closed_dependencies_and_validators() -> None:
@@ -85,14 +91,12 @@ def test_deterministic_content_tool_does_not_mutate_control_state(tmp_path: Path
     project.source_raw.parent.mkdir(parents=True)
     project.source_raw.write_text("Chapter 1\n\nA source paragraph.", encoding="utf-8")
 
-    def forbidden_state_access() -> object:
-        raise AssertionError("content work must not read or mutate control state")
-
+    snapshot = RunSnapshot(run_id="test-run", status=RunStatus.RUNNING)
     context = SimpleNamespace(
         project=project,
-        config=SimpleNamespace(refine_toc=False),
-        state=forbidden_state_access,
-        save_state=lambda state: forbidden_state_access(),
+        services=SimpleNamespace(),
+        run_id="test-run",
+        get_run_snapshot=lambda: snapshot,
         resolve=lambda relpath: (project.root / relpath).resolve(),
     )
     ingest_source = next(
@@ -104,6 +108,8 @@ def test_deterministic_content_tool_does_not_mutate_control_state(tmp_path: Path
     assert "ingested" in result
     assert project.source_clean.exists()
     assert project.source_manifest.exists()
+    assert not hasattr(context, "state")
+    assert not hasattr(context, "save_state")
 
 
 def test_action_receives_only_allowlisted_tools_and_paths() -> None:

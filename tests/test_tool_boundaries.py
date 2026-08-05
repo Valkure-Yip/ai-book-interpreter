@@ -20,6 +20,7 @@ from abi.providers.agent_runtime.tooling import to_langchain_tool
 from abi.providers.llm.budget import BudgetGate
 from abi.tools.belt import build_belt
 from abi.tools.content import make_content_tools
+from abi.tools.context import ToolContext
 from abi.tools.permissions import ActionPathPermissions
 from abi.tools.subagent import make_subagent_tools
 from abi.types._base import FrozenModel
@@ -58,6 +59,35 @@ def test_architecture_linter_reports_legacy_control_symbols(tmp_path: Path) -> N
     ]
 
 
+def test_architecture_linter_rejects_legacy_modules_aliases_and_scoped_status(
+    tmp_path: Path,
+) -> None:
+    """Catch aliased legacy imports without banning unrelated Status classes."""
+    module = tmp_path / "src/abi/orchestrator/aliases.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(
+        "from abi.project.state import HAPPY_PATH as path\n"
+        "from abi.stages.runner import run_stage as execute\n"
+        "from abi.project import Status as ProjectStatus\n"
+        "class Status:\n"
+        "    pass\n"
+        "current = Status()\n",
+        encoding="utf-8",
+    )
+
+    violations = _architecture_linter("legacy_alias_fixture").scan_tree(
+        tmp_path / "src/abi"
+    )
+
+    assert [
+        (item.rule, item.line, item.module, item.symbol) for item in violations
+    ] == [
+        ("fixed-macro-control", 1, "abi.project.state", "HAPPY_PATH"),
+        ("fixed-macro-control", 2, "abi.stages.runner", "run_stage"),
+        ("fixed-macro-control", 3, "abi.project", "Status"),
+    ]
+
+
 def test_repository_has_no_legacy_control_symbols() -> None:
     """Catch the removed fixed stage/state path surviving under another import or alias."""
     violations = _architecture_linter("repository_legacy_symbols").scan_tree(
@@ -88,7 +118,13 @@ class _Project:
 
 def _context(tmp_path: Path) -> SimpleNamespace:
     project = _Project(tmp_path)
-    return SimpleNamespace(project=project, resolve=lambda path: tmp_path / path)
+    snapshot = RunSnapshot(run_id="test-run", status=RunStatus.RUNNING)
+    return SimpleNamespace(
+        project=project,
+        run_id="test-run",
+        get_run_snapshot=lambda: snapshot,
+        resolve=lambda path: tmp_path / path,
+    )
 
 
 def _success(action_id: str = "review-child", attempt: int = 1) -> Succeeded:
@@ -137,6 +173,25 @@ def test_content_tools_expose_only_read_only_run_snapshot(tmp_path: Path) -> Non
     get_snapshot = next(tool for tool in tools if tool.name == "get_run_snapshot")
     payload = json.loads(get_snapshot.callable())
     assert payload == snapshot.model_dump(mode="json")
+
+
+def test_tool_context_requires_durable_read_only_run_identity(tmp_path: Path) -> None:
+    """Catch tool construction that omits its run identity or snapshot authority."""
+    project = BookProject(tmp_path)
+    services = SimpleNamespace()
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+
+    with pytest.raises(TypeError):
+        ToolContext(project=project, services=services)  # type: ignore[arg-type,call-arg]
+
+    context = ToolContext(
+        project=project,
+        services=services,  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+    assert not hasattr(context, "config")
+    assert context.get_run_snapshot() == snapshot
 
 
 class _EchoInput(FrozenModel):

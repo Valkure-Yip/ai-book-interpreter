@@ -167,6 +167,7 @@ async def test_default_composition_reaches_dynamic_controller_and_loop(
 ) -> None:
     """Catch lifecycle defaults that require a hidden factory instead of real assembly."""
     planner_calls: list[str] = []
+    tool_contexts: list[object] = []
 
     class _Router:
         async def invoke_structured(self, schema, messages, **kwargs):  # type: ignore[no-untyped-def]
@@ -201,6 +202,11 @@ async def test_default_composition_reaches_dynamic_controller_and_loop(
         "abi.providers.services.build_run_services",
         lambda **kwargs: services,
     )
+    def recording_registry(*, tool_context):  # type: ignore[no-untyped-def]
+        tool_contexts.append(tool_context)
+        return build_action_registry(tool_context=tool_context)
+
+    monkeypatch.setattr("abi.actions.builtins.build_action_registry", recording_registry)
     source = tmp_path / "source.txt"
     source.write_text("A short public-domain source.", encoding="utf-8")
     config = RunConfig(orchestration=OrchestrationConfig(max_cycles=1, max_parallel_actions=1))
@@ -222,6 +228,10 @@ async def test_default_composition_reaches_dynamic_controller_and_loop(
     assert actions[0].capability == "source.ingest"
     assert receipt.outcome_digest
     assert first.status is replay.status is RunStatus.BLOCKED
+    assert tool_contexts
+    assert all(context.run_id == first.run_id for context in tool_contexts)
+    assert all(context.get_run_snapshot().run_id == first.run_id for context in tool_contexts)
+    assert all(not hasattr(context, "config") for context in tool_contexts)
 
 
 async def _seed_inspectable_project(root: Path) -> Path:

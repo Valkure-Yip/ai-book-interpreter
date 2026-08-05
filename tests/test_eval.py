@@ -525,6 +525,7 @@ def test_l1_replays_committed_gate_evidence_against_ledger_policy(tmp_path) -> N
     )
     facts = facts.model_copy(
         update={
+            "run": facts.run.model_copy(update={"status": RunStatus.COMPLETED}),
             "snapshot": facts.snapshot.model_copy(
                 update={"gate_evidence": (bad_evidence,)}
             )
@@ -536,6 +537,104 @@ def test_l1_replays_committed_gate_evidence_against_ledger_policy(tmp_path) -> N
     assert report.gate_integrity_ok is False
     assert report.gate_integrity[0].consistent is False
     assert "artifact checksums" in report.gate_integrity[0].replay_reason
+    assert report.verdict == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("staged_relpath", "state/staging/eval-action/1/reports/other.json"),
+        ("media_type", "text/plain"),
+        ("evidence_role", "other"),
+        ("metadata_json", '{"items":[{"name":"other","value_json":"1"}]}'),
+    ),
+)
+def test_l1_replays_exact_zipped_bundle_gate_and_intent_identity(
+    tmp_path, field: str, value: str
+) -> None:
+    """Catch L1 accepting an intent that drifted from its bundle and gate identity."""
+    root = tmp_path / f"intent-{field}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    bad_intent = facts.promotion_intents[0].model_copy(update={field: value})
+
+    report = trace_project(
+        proj, facts=facts.model_copy(update={"promotion_intents": (bad_intent,)})
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("artifact identity" in item for item in report.skipped_states)
+
+
+def test_l1_requires_passed_committed_gate_evidence(tmp_path) -> None:
+    """Catch L1 accepting a committed evidence row whose PASS bit was cleared."""
+    root = tmp_path / "gate-evidence-passed"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    failed = facts.snapshot.gate_evidence[0].model_copy(update={"passed": False})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "snapshot": facts.snapshot.model_copy(update={"gate_evidence": (failed,)})
+            }
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("committed gate evidence" in item for item in report.skipped_states)
+
+
+@pytest.mark.asyncio
+async def test_run_ledger_exposes_action_bound_committed_gate_evidence(tmp_path) -> None:
+    """Catch eval losing the producer Action identity from committed gate evidence."""
+    root = tmp_path / "gate-evidence-producer"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    await _seed_committed_gate(proj)
+    async with RunLedger.open(proj.run_db) as ledger:
+        method = getattr(ledger, "list_committed_gate_evidence", None)
+        assert callable(method), "RunLedger needs a typed committed gate-evidence read"
+        records = await method("eval-run")
+    assert len(records) == 1
+    assert records[0].action_id == "eval-action"
+    assert records[0].passed is True
+    assert len(records[0].gate_decision_digest) == 64
+    assert len(records[0].bundle_digest) == 64
+    assert records[0].evidence_refs == ("report",)
+
+
+@pytest.mark.parametrize("tamper", ("missing", "duplicate"))
+def test_l1_rejects_completed_ordinary_success_without_exactly_one_gate_chain(
+    tmp_path, tamper: str
+) -> None:
+    """Catch completed ordinary success without one exact gate/intent/commit chain."""
+    root = tmp_path / f"ordinary-gate-{tamper}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    receipts = () if tamper == "missing" else facts.gate_receipts * 2
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "run": facts.run.model_copy(update={"status": RunStatus.COMPLETED}),
+                "gate_receipts": receipts,
+                "promotion_intents": () if tamper == "missing" else facts.promotion_intents,
+            }
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert report.verdict == "FAIL"
+    assert any("exactly one gate" in item for item in report.skipped_states)
 
 
 async def _seed_retry_lineage(proj: BookProject) -> None:
@@ -732,6 +831,200 @@ def test_l1_rejects_retry_successor_with_mutated_frozen_facts_and_reused_staging
 
     assert report.path_conformance_ok is False
     assert any("retry successor" in item for item in report.skipped_states)
+
+
+def test_l1_accepts_valid_retry_successor_after_attempt_two_started(tmp_path) -> None:
+    """Keep immutable retry authority valid after its successor advances to RUNNING."""
+    root = tmp_path / "retry-started"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_retry_lineage(proj))
+
+    async def start_successor() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.start_attempt("retry-action", attempt=2)
+
+    asyncio.run(start_successor())
+
+    report = trace_project(proj)
+
+    assert report.path_conformance_ok is True
+
+
+def test_l1_accepts_explicit_unblock_replacement_with_unrelated_downstream_action(
+    tmp_path,
+) -> None:
+    """Bind integrity recovery to the unblock replacement, not every later Action."""
+    root = tmp_path / "integrity-downstream"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_repair_lineage(proj, repair_class="integrity"))
+
+    async def add_downstream() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            plan = await ledger.append_plan(
+                "integrity-run",
+                PlanPatch(
+                    objective="continue unrelated work",
+                    proposed_actions=(
+                        ProposedAction(
+                            proposal_id="downstream-proposal",
+                            capability="report.downstream",
+                        ),
+                    ),
+                    rationale="the explicit replacement already owns recovery",
+                ),
+            )
+            await ledger.authorize_actions(
+                "integrity-run",
+                (
+                    _eval_authorized_action(
+                        action_id="downstream-action",
+                        proposal_id="downstream-proposal",
+                        plan_version=plan.version,
+                        capability="report.downstream",
+                    ),
+                ),
+            )
+
+    asyncio.run(add_downstream())
+
+    report = trace_project(proj)
+
+    assert report.path_conformance_ok is True
+
+
+@pytest.mark.parametrize("tamper", ("digest", "envelope_identity"))
+def test_l1_rejects_outcome_receipt_digest_or_envelope_identity_tamper(
+    tmp_path, tamper: str
+) -> None:
+    """Recompute every outcome receipt digest and bind its envelope to the row key."""
+    root = tmp_path / f"outcome-{tamper}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    receipt = facts.outcome_receipts[0]
+    if tamper == "digest":
+        bad_receipt = receipt.model_copy(update={"outcome_digest": "0" * 64})
+    else:
+        envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
+        bad_json = canonical_model_json(
+            envelope.model_copy(update={"action_id": "different-action"})
+        )
+        bad_receipt = receipt.model_copy(
+            update={
+                "canonical_outcome_json": bad_json,
+                "outcome_digest": sha256_canonical_json(bad_json),
+            }
+        )
+
+    report = trace_project(
+        proj, facts=facts.model_copy(update={"outcome_receipts": (bad_receipt,)})
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("outcome receipt" in item for item in report.skipped_states)
+
+
+@pytest.mark.parametrize(
+    "tamper", ("ineligible_retry", "repair_digest", "terminal_status")
+)
+def test_l1_rejects_invalid_outcome_authority_bindings(tmp_path, tamper: str) -> None:
+    """Reject ineligible retry, unbound repair, and one-sided terminal success facts."""
+    root = tmp_path / f"authority-{tamper}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    if tamper == "ineligible_retry":
+        asyncio.run(_seed_retry_lineage(proj))
+        facts = load_eval_run_facts(proj)
+        predecessor = facts.outcome_receipts[0]
+        failure_json = canonical_model_json(
+            ActionOutcomeEnvelope(
+                action_id="retry-action",
+                attempt=1,
+                outcome=PermanentFailure(error_code="fatal", message="not retryable"),
+            )
+        )
+        bad_facts = facts.model_copy(
+            update={
+                "outcome_receipts": (
+                    predecessor.model_copy(
+                        update={
+                            "canonical_outcome_json": failure_json,
+                            "outcome_digest": sha256_canonical_json(failure_json),
+                            "error_code": "fatal",
+                        }
+                    ),
+                )
+            }
+        )
+        expected = "eligible RetryableFailure"
+    elif tamper == "repair_digest":
+        asyncio.run(_seed_repair_lineage(proj, repair_class="semantic"))
+        facts = load_eval_run_facts(proj)
+        bad_facts = facts.model_copy(
+            update={
+                "repair_facts": (
+                    facts.repair_facts[0].model_copy(
+                        update={"outcome_digest": "0" * 64}
+                    ),
+                )
+            }
+        )
+        expected = "repair fact outcome digest"
+    else:
+        action_id = "terminal-action"
+        authorized = _eval_authorized_action(
+            action_id=action_id,
+            proposal_id="terminal-proposal",
+            capability="report.fail",
+        )
+        failure_json = canonical_model_json(
+            ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=1,
+                outcome=PermanentFailure(error_code="fatal", message="failed"),
+            )
+        )
+
+        async def seed_terminal_failure() -> None:
+            async with RunLedger.open(proj.run_db) as ledger:
+                await _create_authorized_attempt(
+                    ledger,
+                    run_id="terminal-run",
+                    authorized=authorized,
+                    objective="record failure",
+                    rationale="exercise terminal authority",
+                )
+                await ledger.record_attempt_outcome(
+                    AttemptOutcomeReceiptPayload(
+                        action_id=action_id,
+                        attempt=1,
+                        canonical_outcome_json=failure_json,
+                        outcome_digest=sha256_canonical_json(failure_json),
+                        error_code="fatal",
+                    )
+                )
+                await ledger.finish_attempt(
+                    action_id, attempt=1, status=ActionStatus.PERMANENT_FAILED
+                )
+
+        asyncio.run(seed_terminal_failure())
+        facts = load_eval_run_facts(proj)
+        bad_facts = facts.model_copy(
+            update={
+                "actions": (
+                    facts.actions[0].model_copy(update={"status": ActionStatus.SUCCEEDED}),
+                )
+            }
+        )
+        expected = "terminal status"
+
+    report = trace_project(proj, facts=bad_facts)
+
+    assert report.path_conformance_ok is False
+    assert any(expected in item for item in report.skipped_states)
 
 
 def test_l1_rejects_semantic_repair_without_exactly_one_superseding_action(tmp_path) -> None:
@@ -1241,7 +1534,9 @@ def test_l1_rejects_probe_action_masquerading_as_ordinary_success(tmp_path) -> N
     assert any("probe" in item and "ordinary success" in item for item in report.skipped_states)
 
 
-async def _seed_hitl_continuation(proj: BookProject, *, block_started: bool = False):
+async def _seed_hitl_continuation(
+    proj: BookProject, *, block_started: bool = False, complete_success: bool = False
+):
     action_id = "hitl-action"
     manifest = ExpectedArtifactManifest(
         action_id=action_id,
@@ -1345,6 +1640,64 @@ async def _seed_hitl_continuation(proj: BookProject, *, block_started: bool = Fa
                 outcome=Succeeded(artifact_bundle=bundle, evidence_refs=("report",)),
             ),
         )
+        if complete_success:
+            checksum = "c" * 64
+            bundle_json = canonical_bundle_json(bundle)
+            bundle_digest = sha256_canonical_json(bundle_json)
+            decision = GateDecision(
+                passed=True,
+                reason_code="evidence_valid",
+                message="valid",
+                validator_id="report.hitl",
+                validator_version="1",
+                bundle_digest=bundle_digest,
+                artifact_checksums=(checksum,),
+                evidence_refs=("report",),
+            )
+            decision_json = canonical_model_json(decision)
+            _, intents = await ledger.create_gate_receipt_and_bundle_intents(
+                GateReceiptPayload(
+                    action_id=action_id,
+                    attempt=1,
+                    validator_id="report.hitl",
+                    validator_version="1",
+                    canonical_gate_decision_json=decision_json,
+                    gate_decision_digest=sha256_canonical_json(decision_json),
+                    bundle_digest=bundle_digest,
+                    artifacts=(
+                        GateArtifactIdentity(
+                            staged_relpath=bundle.entries[0].staged_relpath,
+                            canonical_relpath=bundle.entries[0].canonical_relpath,
+                            checksum=checksum,
+                        ),
+                    ),
+                    evidence_refs=("report",),
+                )
+            )
+            await ledger.commit_promotion_intent(intents[0].intent_id)
+            await ledger.commit_success(
+                SuccessCommit(
+                    action_id=action_id,
+                    artifacts=(
+                        ArtifactCommit(
+                            artifact_id="artifact:hitl",
+                            relpath="reports/hitl.json",
+                            sha256=checksum,
+                            producer_action_id=action_id,
+                            media_type="application/json",
+                        ),
+                    ),
+                    gate_evidence=(
+                        GateEvidence(
+                            evidence_id="gate:hitl",
+                            gate="report.hitl",
+                            passed=True,
+                            validator_version="1",
+                            artifact_checksums=(checksum,),
+                        ),
+                    ),
+                )
+            )
         effective = await ledger.get_effective_attempt_outcome(action_id, 1)
         return original, continuation, effective
 
@@ -1375,6 +1728,34 @@ def test_l1_hitl_continuation_preserves_pause_and_cannot_skip_gate_authority(tmp
 
     assert report.path_conformance_ok is False
     assert any("HITL" in item for item in report.skipped_states)
+
+
+def test_l1_replays_gate_against_effective_hitl_continuation_success(tmp_path) -> None:
+    """Catch gate replay incorrectly reading immutable Paused instead of effective success."""
+    root = tmp_path / "hitl-effective-success"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    original, continuation, effective = asyncio.run(
+        _seed_hitl_continuation(proj, complete_success=True)
+    )
+    facts = load_eval_run_facts(proj)
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "hitl_continuations": (continuation,),
+                "effective_outcomes": (effective,),
+            }
+        ),
+    )
+
+    assert isinstance(
+        ActionOutcomeEnvelope.model_validate_json(original.canonical_outcome_json).outcome,
+        Paused,
+    )
+    assert report.gate_integrity_ok is True
+    assert report.path_conformance_ok is True
 
 
 def test_l1_rejects_started_hitl_indeterminate_that_does_not_remain_blocked(tmp_path) -> None:

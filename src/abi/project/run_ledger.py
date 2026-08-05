@@ -323,6 +323,21 @@ class GateReceiptRecord(GateReceiptPayload):
     recorded_at: datetime
 
 
+class CommittedGateEvidenceRecord(FrozenModel):
+    """One committed gate fact retaining its producer Action identity."""
+
+    evidence_id: str
+    action_id: str
+    gate: str
+    passed: bool
+    validator_version: str
+    artifact_checksums: tuple[str, ...]
+    gate_decision_digest: str
+    bundle_digest: str
+    evidence_refs: tuple[str, ...]
+    committed_at: datetime
+
+
 class ValidatorFailureReceiptRecord(FrozenModel):
     """Immutable raw failed-validator fact; it can never authorize promotion."""
 
@@ -3642,6 +3657,39 @@ class RunLedger:
             (run_id,),
         )
         return tuple(self._gate_receipt_from_row(row) for row in rows)
+
+    async def list_committed_gate_evidence(
+        self, run_id: str
+    ) -> tuple[CommittedGateEvidenceRecord, ...]:
+        """List typed committed gate facts with their producer Action identity."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT evidence.evidence_id, evidence.action_id, evidence.gate, "
+            "evidence.passed, evidence.validator_version, evidence.artifact_checksums_json, "
+            "evidence.committed_at, receipt.gate_decision_digest, receipt.bundle_digest, "
+            "receipt.evidence_refs_json FROM gate_evidence evidence "
+            "JOIN actions action ON action.action_id = evidence.action_id "
+            "JOIN gate_receipts receipt ON receipt.action_id = evidence.action_id "
+            "AND receipt.validator_id = evidence.gate "
+            "AND receipt.validator_version = evidence.validator_version "
+            "WHERE action.run_id = ? ORDER BY evidence.committed_at, evidence.evidence_id",
+            (run_id,),
+        )
+        return tuple(
+            CommittedGateEvidenceRecord(
+                evidence_id=row["evidence_id"],
+                action_id=row["action_id"],
+                gate=row["gate"],
+                passed=bool(row["passed"]),
+                validator_version=row["validator_version"],
+                artifact_checksums=tuple(json.loads(row["artifact_checksums_json"])),
+                gate_decision_digest=row["gate_decision_digest"],
+                bundle_digest=row["bundle_digest"],
+                evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+                committed_at=_parse_time(row["committed_at"]),
+            )
+            for row in rows
+        )
 
     async def list_repair_facts(self, run_id: str) -> tuple[RepairFactRecord, ...]:
         """List receipt-bound repair classifications for one run."""

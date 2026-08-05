@@ -14,16 +14,14 @@ from pathlib import Path
 from abi.project.layout import BookProject
 from abi.providers.services import RunServices
 from abi.types.orchestration import RunSnapshot
-from abi.types.run import RunConfig
 
 
 @dataclass
 class ToolContext:
     project: BookProject
     services: RunServices
-    config: RunConfig | None = None
-    run_id: str | None = None
-    get_run_snapshot: Callable[[], RunSnapshot] | None = None
+    run_id: str
+    get_run_snapshot: Callable[[], RunSnapshot]
 
     def resolve(self, relpath: str) -> Path:
         """Resolve a project-relative path, enforcing the sandbox."""

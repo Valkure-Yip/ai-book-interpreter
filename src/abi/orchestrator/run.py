@@ -160,6 +160,7 @@ class _DefaultHitlContinuation:
         ledger: RunLedger,
         run: RunRecord,
         config: RunConfig,
+        snapshot: RunSnapshot,
     ) -> None:
         from abi.actions.builtins import build_action_registry
         from abi.providers.services import build_run_services
@@ -171,7 +172,12 @@ class _DefaultHitlContinuation:
         self._run = run
         self._services = build_run_services(config=config, events=events, metrics=metrics)
         self._registry = build_action_registry(
-            tool_context=ToolContext(project=project, services=self._services, config=config)
+            tool_context=ToolContext(
+                project=project,
+                services=self._services,
+                run_id=run.run_id,
+                get_run_snapshot=lambda: snapshot,
+            )
         )
 
     async def _binding(self, request: HitlContinuationRequest) -> tuple[object, object, object]:
@@ -363,8 +369,14 @@ async def default_run_service_factory(
     services = build_run_services(
         config=context.config, events=context.events, metrics=context.metrics
     )
+    initial_snapshot = await context.ledger.load_snapshot(context.run.run_id)
     registry = build_action_registry(
-        tool_context=ToolContext(project=context.project, services=services, config=context.config)
+        tool_context=ToolContext(
+            project=context.project,
+            services=services,
+            run_id=context.run.run_id,
+            get_run_snapshot=lambda: initial_snapshot,
+        )
     )
     artifacts = ArtifactStore(context.project, context.ledger)
     committer = Committer(
@@ -703,6 +715,7 @@ async def approve_interrupt(
                 ledger=ledger,
                 run=run,
                 config=config,
+                snapshot=await ledger.load_snapshot(run.run_id),
             )
             boundary = owned_continuation
         try:

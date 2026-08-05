@@ -39,7 +39,7 @@ from abi.providers.observability.langfuse_client import LangfuseStatus
 from abi.tools.context import ToolContext
 from abi.types._base import FrozenModel
 from abi.types.orchestration import Paused, RunSnapshot, RunStatus
-from abi.types.run import LLMConfig, RunConfig
+from abi.types.run import LLMConfig
 from abi.types.tools import ToolBinding
 
 
@@ -777,7 +777,10 @@ async def test_default_output_finalize_reaches_real_hitl_from_registry_policy(
         tool_context=ToolContext(
             project=project,
             services=services,  # type: ignore[arg-type]
-            config=RunConfig(),
+            run_id="run-1",
+            get_run_snapshot=lambda: RunSnapshot(
+                run_id="run-1", status=RunStatus.RUNNING
+            ),
         )
     )
     resolved = registry.resolve_json("output.finalize", "{}")

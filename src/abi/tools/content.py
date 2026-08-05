@@ -43,6 +43,7 @@ def make_content_tools(
     permissions: ActionPathPermissions | None = None,
 ) -> list[ToolBinding]:
     project = ctx.project
+    snapshot_callback = get_run_snapshot or ctx.get_run_snapshot
 
     def require_read(path: str) -> None:
         canonical_artifact_key(path)
@@ -112,8 +113,6 @@ def make_content_tools(
         """Run Pass 0.5 LLM TOC refinement if the heuristic result is suspect."""
         if not refine_toc:
             return book
-        if ctx.config is not None and not ctx.config.refine_toc:
-            return book
         if not needs_refinement(book, warnings):
             return book
         _log.info(
@@ -166,12 +165,9 @@ def make_content_tools(
 
     def read_run_snapshot() -> str:
         """Return the Action-scoped, read-only RunLedger snapshot as JSON."""
-        if get_run_snapshot is None:
-            return (
-                "ERROR: this Action has no run snapshot callback. "
-                "Bind get_run_snapshot when constructing its tool belt."
-            )
-        return json.dumps(get_run_snapshot().model_dump(mode="json"), ensure_ascii=False, indent=2)
+        return json.dumps(
+            snapshot_callback().model_dump(mode="json"), ensure_ascii=False, indent=2
+        )
 
     return [
         ToolBinding(

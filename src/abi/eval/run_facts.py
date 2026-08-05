@@ -9,6 +9,7 @@ from abi.project.run_ledger import (
     ActionAttemptRecord,
     ActionRecord,
     AttemptOutcomeReceiptRecord,
+    CommittedGateEvidenceRecord,
     EffectiveAttemptOutcomeRecord,
     GateReceiptRecord,
     HitlContinuationReceiptRecord,
@@ -48,6 +49,7 @@ class EvalRunFacts(FrozenModel):
     hitl_continuations: tuple[HitlContinuationReceiptRecord, ...] = ()
     effective_outcomes: tuple[EffectiveAttemptOutcomeRecord, ...] = ()
     outbox_events: tuple[OutboxEventRecord, ...] = ()
+    committed_gate_evidence: tuple[CommittedGateEvidenceRecord, ...] = ()
 
 
 async def _load_eval_run_facts(project: BookProject) -> EvalRunFacts:
@@ -79,6 +81,7 @@ async def _load_eval_run_facts(project: BookProject) -> EvalRunFacts:
             attempts=tuple(attempt_records),
             outcome_receipts=await ledger.list_attempt_outcome_receipts(run.run_id),
             gate_receipts=await ledger.list_gate_receipts(run.run_id),
+            committed_gate_evidence=await ledger.list_committed_gate_evidence(run.run_id),
             promotion_intents=await ledger.promotion_intents(run.run_id),
             plan_versions=await ledger.list_plan_versions(run.run_id),
             repair_facts=await ledger.list_repair_facts(run.run_id),
