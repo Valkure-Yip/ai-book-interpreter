@@ -1251,9 +1251,9 @@ dict/Any。
 
 ### 19.1 Task 12 实现完成证据（2026-08-06）
 
-- **提交范围：** 实现与协议提交从 `fa0bd60197656668ebd2479aa2a908296a44a739` 到
-  `3ce5c2b6731f704278663aa2695f58b947793b25`（含首尾）；相对 `main` 的 merge-base 为
-  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...3ce5c2b` 共 52 个提交。
+- **提交范围：** 实现、协议与独立审查修复从 `fa0bd60197656668ebd2479aa2a908296a44a739` 到
+  `babd6209ccecd96636396ebff37504c3bdd17c6f`（含首尾）；相对 `main` 的 merge-base 为
+  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...babd620` 共 54 个提交。
 - **持久化边界：** 业务真相固定为 `state/run.db`；LangGraph checkpoint 固定为
   `state/graph_checkpoints.sqlite`。ledger schema version 为 `1`，由单一
   `LEDGER_SCHEMA_VERSION = 1` 与 SQLite `PRAGMA user_version = 1` 共同标记；已有 v0 或未知版本
@@ -1263,7 +1263,7 @@ dict/Any。
   `langgraph-checkpoint-sqlite==3.1.1`、`aiosqlite==0.22.1`、`langfuse==2.60.10`、
   `pydantic==2.13.4`；验证工具为 `pytest==9.1.1`、`ruff==0.15.20`、`mypy==2.1.0`。
 - **全量自动化：** Python 3.12.11 fresh process 执行 `.venv/bin/pytest`，结果为
-  `667 passed, 22 warnings`，无失败或跳过；告警均为既有 `datetime.utcnow()` 弃用告警。
+  `680 passed, 22 warnings`，无失败或跳过；告警均为既有 `datetime.utcnow()` 弃用告警。
   recovery/control/offline 独立集合为 `153 passed, 1 warning`。Ruff 全量通过。
 - **类型检查：** mypy 检查 98 个 source files；本方案修改文件为 0 errors。仅有 6 个未触碰的
   基线 `type-arg` 错误：`src/abi/epub/result.py:16` 与
@@ -1281,6 +1281,14 @@ dict/Any。
   replay；semantic repair fact/replan/authorization 全 crash matrix 的唯一 replacement action，integrity、
   缺失/未知分类与 permanent failure 的阻断；HITL claim/start/continuation、public checkpoint inspection、
   budget pause、outbox 去重/重启顺序、max-cycle 阻断，以及离线动态 replan/batching/commit 完成。
+- **独立审查修复：** 初次全分支审查发现 1 个 Critical 与 2 个 Important。章节产物链现固定为不可变的
+  `chapters/translated/{chapter}.md` → `chapters/controlled/{chapter}.md` →
+  `chapters/final/{chapter}.md`，真实 translate/control manifests 可依次晋升且不覆盖 canonical；章节
+  Action 的参数化 exact access set 只展开一次，由 Policy 冲突检查与 `AuthorizedAction` 共用并持久化，
+  attempt/retry 只引用该不可变授权，Scheduler 使用同一 prefix-aware 资源冲突规则，因此不同章节可并行，
+  同章或目录/后代资源仍互斥；permissioned agent 读取统一拒绝任一 symlink component，`read_file`、grep、
+  content 与 prompt/skill context 的字节读取使用 pinned dirfd + `O_NOFOLLOW`，平台缺少所需能力即 fail
+  closed，并覆盖 leaf/directory symlink、check/read 竞态与 fd 关闭回归。
 
 ## 20. 实现完成判据
 
