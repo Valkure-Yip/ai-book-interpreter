@@ -1252,8 +1252,8 @@ dict/Any。
 ### 19.1 Task 12 实现完成证据（2026-08-06）
 
 - **提交范围：** 实现、协议与独立审查修复从 `fa0bd60197656668ebd2479aa2a908296a44a739` 到
-  `314740245b13975d9c4871e5bd360b9c1d35eb8d`（含首尾）；相对 `main` 的 merge-base 为
-  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...3147402` 共 58 个提交。
+  `a40d7776268bc3f28035f5d13769093a86adcdd7`（含首尾）；相对 `main` 的 merge-base 为
+  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...a40d777` 共 60 个提交。
 - **持久化边界：** 业务真相固定为 `state/run.db`；LangGraph checkpoint 固定为
   `state/graph_checkpoints.sqlite`。ledger schema version 为 `1`，由单一
   `LEDGER_SCHEMA_VERSION = 1` 与 SQLite `PRAGMA user_version = 1` 共同标记；已有 v0 或未知版本
@@ -1263,7 +1263,7 @@ dict/Any。
   `langgraph-checkpoint-sqlite==3.1.1`、`aiosqlite==0.22.1`、`langfuse==2.60.10`、
   `pydantic==2.13.4`；验证工具为 `pytest==9.1.1`、`ruff==0.15.20`、`mypy==2.1.0`。
 - **全量自动化：** Python 3.12.11 fresh process 执行 `.venv/bin/pytest`，结果为
-  `692 passed, 25 warnings`，无失败或跳过；告警为既有 `datetime.utcnow()` 弃用告警及 EPUB 库告警。
+  `695 passed, 25 warnings`，无失败或跳过；告警为既有 `datetime.utcnow()` 弃用告警及 EPUB 库告警。
   recovery/control/offline 独立集合为 `154 passed, 1 warning`。Ruff 全量通过。
 - **类型检查：** mypy 检查 98 个 source files；本方案修改文件为 0 errors。仅有 1 个未触碰的
   基线 `type-arg` 错误：`src/abi/epub/result.py:16`。本次因引入 bytes ingest 触碰
@@ -1299,6 +1299,9 @@ dict/Any。
 - **第二次定向复审修复：** scoped review 确认上述 I1-I3 关闭，但复现旧 PASS 块掩盖最新 FAIL round。
   `314740245b13975d9c4871e5bd360b9c1d35eb8d` 将 control report 绑定到 EOF 终止的单一连续 8 字段块，
   拒绝最新 round 内重复字段、末轮 FAIL 和字段仅存在于旧轮次的报告。
+- **第三次定向复审修复：** scoped review 继续复现空行绕过 latest-round duplicate 检查。
+  `a40d7776268bc3f28035f5d13769093a86adcdd7` 要求最后 8 个 physical lines 连续且精确匹配，并以最后
+  explicit `round:` marker 界定最新轮；同一轮内的 FAIL/重复字段不能再由空行或后置 PASS 块掩盖。
 
 ## 20. 实现完成判据
 
