@@ -7,6 +7,10 @@
 > 的授权 breaker amendment。修订后的接口不兼容此前草案或已生成的任务/状态，不保留旧的
 > 单文件 `Succeeded` 形状。
 >
+> **恢复闭环修订：已批准、具有约束力。** 2026-08-05 fix round 1；durable outcome/gate receipts、
+> receipt-driven recovery、durable retry facts、统一 bundle 后验和不可变 conflict lifecycle 修复前一版
+> 在 executor/validator 与 promotion 之间的未持久化窗口。以下正文是唯一当前契约。
+>
 > 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
 > [`agentic-pipeline.md`](./agentic-pipeline.md) 和
@@ -31,7 +35,8 @@ ABI 将保留“LLM 负责开放式工作、确定性代码负责裁决”的原
 - Validator 只在 staging-aware evidence view 上根据确定性证据裁决；Committer 先持久化完整
   bundle 的全部 promotion intents，再逐项提升，最后才在一个 SQLite 事务中提交业务事实与成功状态。
 - SQLite `RunLedger` 是唯一业务真相；LangGraph checkpointer 只保存运行时游标与 agent 上下文。
-- 业务提交追求 exactly-once；Action 执行允许 at-least-once，但必须幂等或可对账。
+- 业务提交追求 exactly-once；同一 `RUNNING` attempt 的 executor 不自动重跑，缺 receipt 时只重建或阻断。
+  只有 durable failure receipt + retry policy 明确允许时才创建下一 attempt，副作用仍必须幂等或可对账。
 - 不兼容旧 `pipeline_state.json`、旧 run 或旧状态枚举；不提供迁移器。
 
 选型为**定制领域控制平面 + LangGraph durable runtime + LangChain v1 Action Harness**。
@@ -154,21 +159,22 @@ flowchart TB
 
     subgraph EVIDENCE["工件与确定性证据"]
         STAGING["Attempt-scoped Staging Bundle<br/>state/staging/action/attempt"]
+        OUTREC["Attempt Outcome Receipt<br/>typed outcome + bundle digest"]
         ART["Committed Canonical Workspace<br/>source · chapters · glossary · EPUB"]
         VALID["Staging-aware Validators<br/>本 attempt 覆盖 canonical 输出"]
-        GATE["Gate Evidence<br/>报告 · checksum · provenance"]
+        GATEREC["Gate Receipt + all intents<br/>同一 SQLite 事务"]
 
         DET --> STAGING
         HARNESS --> STAGING
         SUB --> STAGING
-        STAGING --> VALID
+        STAGING --> OUTREC --> VALID
         ART -. "其余依赖只读" .-> VALID
-        VALID --> GATE
+        VALID --> GATEREC
     end
 
-    GATE -- "PASS + bundle digest" --> COMMIT
-    GATE -- "FAIL" --> INCIDENT
-    COMMIT -- "create all intents, then promote all" --> ART
+    GATEREC -- "PASS receipt + complete intent set" --> COMMIT
+    VALID -- "FAIL" --> INCIDENT
+    COMMIT -- "promote all + unified postcheck" --> ART
 
     subgraph DURABLE["持久化与运行保障"]
         LEDGER["RunLedger / run.db<br/>唯一业务真相"]
@@ -194,8 +200,12 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-    START(["新建或恢复 Run"]) --> RECON["Reconcile<br/>读取 RunLedger、checkpoint 与实际工件"]
-    RECON --> OBS["生成 RunSnapshot<br/>工件、gate、incident、预算"]
+    START(["新建或恢复 Run"]) --> RECON["Reconcile<br/>ledger receipts + intents + filesystem"]
+    RECON --> RUNNING{"RUNNING attempt<br/>有 outcome receipt？"}
+    RUNNING -- "否" --> REBUILD["从 durable expected manifest<br/>安全扫描 staging 并精确重建 receipt"]
+    REBUILD -- "完整且无额外" --> RECEIPT
+    REBUILD -- "缺失 / 额外 / unsafe" --> CONFLICT
+    RUNNING -- "是或无待恢复 attempt" --> OBS["生成 RunSnapshot<br/>工件、gate、incident、预算"]
     OBS --> ELIG["PolicyEngine 计算 eligible actions"]
     ELIG --> PLAN["Planner 生成 PlanPatch<br/>未来 1–5 个动作"]
 
@@ -204,7 +214,8 @@ flowchart TD
     REJECT --> PLAN
 
     PLANOK -- "是" --> BATCH["选择一个 Action<br/>或无写冲突的并行 batch"]
-    BATCH --> PRECP["提交 AUTHORIZED<br/>写执行前 checkpoint"]
+    BATCH --> AUTH["AUTHORIZED 持久化<br/>expected manifest + retry policy/fingerprint"]
+    AUTH --> PRECP["RUNNING attempt 快照 durable facts<br/>写执行前 checkpoint"]
     PRECP --> DISPATCH["Dispatcher 派发 Action"]
 
     DISPATCH --> KIND{"Action 类型"}
@@ -212,21 +223,23 @@ flowchart TD
     KIND -- "Agent" --> AGENT["创建隔离 Action Harness<br/>最小上下文、skills 与工具"]
     KIND -- "复合" --> MULTI["运行受限子 agents<br/>独立上下文与 fan-out"]
 
-    DET --> OUTCOME
-    AGENT --> OUTCOME
-    MULTI --> OUTCOME
+    DET --> RAWOUTCOME
+    AGENT --> RAWOUTCOME
+    MULTI --> RAWOUTCOME
 
-    OUTCOME{"执行结果"} -- "Succeeded(bundle)" --> BUNDLE["验证 typed bundle<br/>identity · permissions · exact effects"]
+    RAWOUTCOME{"typed executor return"} --> RECEIPT["一个 SQLite 事务<br/>AttemptOutcomeReceipt"]
+    RECEIPT --> HOOK["after_action_output hook<br/>仅在 receipt durable 后"]
+    HOOK -- "Succeeded(bundle)" --> BUNDLE["验证 typed bundle<br/>identity · permissions · exact effects"]
     BUNDLE --> VIEW["构造 staging-aware evidence view<br/>本 attempt 输出覆盖 canonical"]
     VIEW --> VALIDATE["确定性 validator<br/>绑定 bundle digest 与 checksum"]
-    OUTCOME -- "可重试异常" --> RETRY{"重试额度剩余？"}
+    HOOK -- "可重试异常" --> RETRY{"durable policy 允许？"}
     RETRY -- "是" --> PRECP
     RETRY -- "否" --> INCIDENT["提交 incident<br/>标记 REPAIR_REQUIRED"]
     INCIDENT --> OBS
 
-    OUTCOME -- "预算耗尽" --> PB["PAUSED_BUDGET"]
-    OUTCOME -- "需要人工判断" --> PH["PAUSED_HITL"]
-    OUTCOME -- "Indeterminate" --> PROBE["只读 probe Action<br/>返回 ProbeResolution"]
+    HOOK -- "预算耗尽" --> PB["PAUSED_BUDGET"]
+    HOOK -- "需要人工判断" --> PH["PAUSED_HITL"]
+    HOOK -- "Indeterminate(error_code)" --> PROBE["只读 probe Action<br/>返回 ProbeResolution"]
     PROBE --> RESOLVE{"disposition"}
     RESOLVE -- "succeeded" --> PROBEOK["原 Action = SUCCEEDED<br/>禁止重发"]
     RESOLVE -- "absent" --> RETRY
@@ -239,11 +252,13 @@ flowchart TD
     PASS -- "否" --> REPAIR["提交 gate failure 与修复证据"]
     REPAIR --> OBS
 
-    PASS -- "是" --> INTENTS["一个 SQLite 事务创建<br/>bundle 全部 promotion intents"]
+    PASS -- "是" --> INTENTS["同一个 SQLite 事务<br/>GateReceipt + bundle 全部 intents"]
     INTENTS --> PROMOTE["逐项 promote / reconcile<br/>文件系统非原子"]
     PROMOTE --> ALL{"全部 intents COMMITTED？"}
-    ALL -- "否 / CONFLICT" --> INCIDENT
-    ALL -- "是" --> COMMIT["一个 SQLite 事务<br/>artifact + gate + attempt/action success"]
+    ALL -- "否 / CONFLICT" --> CONFLICT["attempt/action = REPAIR_REQUIRED<br/>run = BLOCKED · 保留全部证据"]
+    ALL -- "是" --> POSTCHECK["统一 bundle 后验<br/>name · inode · checksum · dirchain"]
+    POSTCHECK -- "FAIL" --> CONFLICT
+    POSTCHECK -- "PASS" --> COMMIT["一个 SQLite 事务<br/>artifact + gate + attempt/action success"]
     COMMIT --> COMPLETE{"所有硬门禁和必需产物完成？"}
 
     COMPLETE -- "否" --> OBS
@@ -253,6 +268,7 @@ flowchart TD
     INCIDENT --> RECOVERABLE{"仍可自动或外部恢复？"}
     RECOVERABLE -- "是" --> OBS
     RECOVERABLE -- "否" --> BLOCKED["BLOCKED<br/>保留完整恢复点"]
+    CONFLICT --> BLOCKED
     BLOCKED --> RESUME
 ```
 
@@ -358,6 +374,16 @@ class ArtifactBundle(BaseModel):
     attempt: int
     entries: tuple[ArtifactBundleEntry, ...]
 
+class ExpectedArtifact(BaseModel):
+    canonical_relpath: str
+    media_type: str
+    evidence_role: str
+    metadata: tuple[ArtifactMetadata, ...] = ()
+
+class ExpectedArtifactManifest(BaseModel):
+    action_id: str
+    entries: tuple[ExpectedArtifact, ...]
+
 class Succeeded(BaseModel):
     kind: Literal["succeeded"] = "succeeded"
     artifact_bundle: ArtifactBundle
@@ -370,6 +396,13 @@ class ProbeResolution(BaseModel):
     evidence_refs: tuple[str, ...]
     message: str
 
+class Indeterminate(BaseModel):
+    kind: Literal["indeterminate"] = "indeterminate"
+    operation_key: str
+    error_code: str
+    failure_signature: str
+    message: str
+
 ActionOutcome = Annotated[
     Succeeded
     | RetryableFailure
@@ -380,6 +413,11 @@ ActionOutcome = Annotated[
     | Paused,
     Field(discriminator="kind"),
 ]
+
+class ActionOutcomeEnvelope(BaseModel):
+    action_id: str
+    attempt: int
+    outcome: ActionOutcome
 ```
 
 ActionRunner 必须返回该联合类型。未能解析为 `ActionOutcome` 本身是 `ModelBehaviorFailure`，按
@@ -391,15 +429,21 @@ relpath、精确的 portable-lowercase canonical relpath、media type、稳定 e
 `ArtifactMetadata` 表达的必要元数据。目录、glob、重复 staged path、重复 canonical path、绝对路径、
 跨 attempt 路径或任何非 regular file 都 fail closed。
 
-bundle 以 `(canonical_relpath, staged_relpath)` 排序；每项 metadata 按 `name` 排序且 name 唯一。
+调用方必须已按 canonical key 提交 bundle：entries 严格按 `(canonical_relpath, staged_relpath)` 升序，
+每项 metadata 严格按 `name` 升序且 name 唯一。边界 validator 对乱序或重复直接拒绝，**不得自动排序**。
 序列化使用 Pydantic JSON 模式、UTF-8、sorted keys 和紧凑 separators，禁止浮动表示、隐式路径归一化
 或实现自选顺序。该 canonical JSON 计算 `sha256` 得到 `bundle_digest`，并且 JSON 内的
 `action_id + attempt` 必须与 ledger 当前 attempt、`ActionOutcomeEnvelope` 完全一致。canonical 路径
 精确保留输入的小写 key，不做 casefold、Unicode normalization 或 dot normalization。
 
-参数展开必须生成同样排序的 `ExpectedArtifactManifest`，其中列出 ActionSpec 允许且本次参数实际要求的
-canonical path、media type、evidence role 和必需 metadata keys。实际 bundle 与 expected manifest
+参数展开必须生成已经 canonical 排序的 `ExpectedArtifactManifest`，其中列出 ActionSpec 允许且本次参数
+实际要求的 canonical path、media type、evidence role 和精确 metadata。实际 bundle 与 expected manifest
 必须逐项精确相等；额外、缺失或重复条目都拒绝。`write_set` 只是权限上界，不能代替 expected manifest。
+
+`Indeterminate.error_code` 必填；`failure_signature` 唯一规范为
+`sha256(capability + "\n" + canonical_parameters_json + "\n" + error_code)`，Dispatcher 必须重算并
+拒绝不一致值。`operation_key`、error code 和 failure signature 一起进入 attempt outcome receipt；后续
+probe 的 `absent` 路由不得从当前 Registry 配置重新解释失败。
 
 `ProbeResolution` 是专用 evidence-only outcome，而不是空的 `Succeeded`。Registry 启动时要求
 `probe_capability` 指向独立 capability；该 probe 的 write/effect set 为空、`may_have_side_effects=False`，
@@ -414,10 +458,40 @@ executor 只能读取外部状态并提交 evidence refs。probe Action 的授�
 artifact manifest 读取。view 不提供任意项目根路径，也不能看到未提交的其他 attempt。validator 因而不能
 依靠 action 预先写 canonical 来通过。
 
-`GateDecision` 除 pass/reason/message 外必须携带 `bundle_digest`、按 bundle 顺序排列的
+`GateDecision` 除 pass/reason/message 外必须携带 validator ID/version、`bundle_digest`、按 bundle 顺序排列的
 `artifact_checksums` 和稳定 `evidence_refs`（或等价的 typed evidence records）。Committer 只接受与当前
 bundle digest、当前 staged checksum 和 validator version 完全绑定的 PASS；任一引用缺失或重放到另一
 attempt 都 fail closed。
+
+### 7.6 Durable handoff receipts
+
+授权事务必须持久化 parameter-expanded `ExpectedArtifactManifest` canonical JSON/digest、stable expected
+evidence refs，以及完整
+`RetryPolicySpec`（`retryable_codes + max_attempts + delays`）canonical JSON/fingerprint。`start_attempt()`
+在把 attempt 置为 `RUNNING` 的同一事务中把这些 immutable facts 快照到 attempt row；因此它们在调用
+executor 前已经 durable，不能被后续 catalog drift 改写。
+
+Dispatcher 收到并校验 `ActionOutcomeEnvelope(action_id, attempt, outcome)` 后，必须先调用
+`RunLedger.record_attempt_outcome()`：在一个 SQLite 事务中写 `attempt_outcome_receipts`，字段至少包括
+`action_id`、`attempt`、canonical outcome JSON/digest、Succeeded 时的 bundle JSON/digest、evidence refs、
+error code/failure signature 等 failure fields 和 `recorded_at`。同一 identity 的完全一致重放幂等，任何
+不同 outcome/bundle/evidence/failure facts 都冲突。receipt 只是 executor 已返回的 durable handoff，
+**不是** gate PASS、promotion authorization 或 Action success。controller 的 `after_action_output` hook 只
+能位于 receipt transaction 成功之后。
+
+如果进程恰在 executor return 与 outcome receipt transaction 之间崩溃，Reconciler 仍不得重跑 Action。
+它只能用 attempt-scoped no-follow 安全遍历、durable expected manifest 和确定性 canonical→staged 映射
+重建一个完全匹配的 `Succeeded` receipt：所有 expected regular files 必须存在、没有额外 leaf/目录/
+unsafe entry，media type/evidence role/metadata 来自 durable manifest，checksums 现场计算，evidence refs
+来自 durable expected evidence identity。缺失、额外、unsafe 或无法唯一重建时进入第 12 节的 immutable
+conflict lifecycle：attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`，绝不重派 executor。空/evidence-only
+manifest 或可能返回 failure/probe 而没有唯一文件证据的 attempt 不能猜测 outcome，必须走同一阻断路径。
+
+validator PASS 后，Committer 调用一个 ledger API，在**同一个 SQLite 事务**中写
+`gate_receipts` 和该 bundle 的完整 promotion-intent 集。Gate receipt 至少包含 validator ID/version、
+canonical `GateDecision` JSON/digest、bundle digest、按 bundle 顺序的 staged checksum/identity 和 evidence
+refs。该 receipt 同样不是 success。只有 outcome receipt、gate receipt 和完整 intent 集都 durable 后才
+允许复制第一个 canonical byte；部分 intent 集是 durable corruption，不能补插缺项。
 
 ## 8. Planner 与 PolicyEngine
 
@@ -443,6 +517,8 @@ PolicyEngine 是纯确定性模块，输入
 
 - capability 在 registry 且当前 eligible；
 - 参数可解析；
+- 已解析参数可确定性展开为 caller-canonical `ExpectedArtifactManifest`，并与完整 retry policy 一起成为
+  authorization durable facts；
 - 依赖无环且已满足或在同一计划中可满足；
 - 所有硬门禁不可跳过；
 - 不得读取/写入越权路径；
@@ -501,9 +577,11 @@ runs
 plan_versions
 actions
 action_attempts
+attempt_outcome_receipts
 artifacts
 artifact_bundles
 gate_evidence
+gate_receipts
 promotion_intents
 probe_resolutions
 incidents
@@ -516,6 +594,10 @@ event_outbox
 
 - Plan 不可原地修改；replan 创建新 version。
 - Action 状态只能经仓储方法和合法 transition 更新。
+- actions 和 action_attempts 持久化 expected manifest JSON/digest、完整 retry policy JSON/fingerprint；attempt
+  在 executor 启动前取得 immutable snapshot。
+- attempt outcome receipt 唯一绑定 action/attempt 和 canonical outcome/bundle/failure facts；它不是 PASS。
+- gate receipt 与完整 promotion-intent 集在同一事务中创建；它不是 success，也不能在部分 intent 集上重放。
 - Gate 必须关联 evidence ID、validator version 和输入 artifact checksums。
 - Artifact 记录路径、hash、producer action、attempt 和 committed_at。
 - artifact bundle 记录 canonical JSON/digest、`action_id + attempt`；同一成功 attempt 只能有一个完全一致的
@@ -540,10 +622,10 @@ CANCELLED
 仍可恢复。
 
 `RunLedger.resolve_indeterminate()` 是解析外部副作用不确定性的唯一原子 API。调用前由 Registry/
-ProbeResolver 验证 probe capability 与原 ActionSpec 的绑定，并把原 retry policy 的稳定 fingerprint 与
-已授权 action 一起交给 ledger；事务内再次验证原 attempt/action 均为 `INDETERMINATE`、operation key
-一致、probe attempt 仍为 `RUNNING`、probe capability/evidence identity 正确、retry policy fingerprint
-匹配 durable authorization：
+ProbeResolver 验证 probe capability 与原 ActionSpec 的绑定；事务内再次验证原 attempt/action 均为
+`INDETERMINATE`、operation key 一致、probe attempt 仍为 `RUNNING`、probe capability/evidence identity
+正确，并且 outcome receipt 的 durable `error_code + failure_signature` 与 authorization/attempt 中的完整
+retry policy JSON/fingerprint 一致。resolve 路由不得读取当前 catalog 中可能漂移的 policy：
 
 - `succeeded`：evidence-only 提交 probe attempt/action，并把原 attempt/action 解析为 `SUCCEEDED`；原操作
   不重发。
@@ -582,22 +664,24 @@ LangGraph checkpoint
 
 | 中断位置 | 恢复行为 |
 | --- | --- |
-| Action 执行前 | 重新派发 |
-| 执行中且没有工件 | 按 retry policy 重试 |
-| bundle 已返回、全部 intents 尚未 durable | attempt 保持 `RUNNING`；不复制 canonical，按同一 bundle 重建全部 intents |
-| bundle 全部 intents 已 durable、部分仍为 `PENDING` | 按第 12 节逐项 create-only 补完；不重跑 Action，不提前提交成功 |
-| 任一 bundle intent 为 `CONFLICT` | attempt 不成功，记录 subject-scoped incident，继续对账该 run/action/attempt 的其余 intents |
-| 全部 promotion 已 `COMMITTED` 但 Action 尚未成功 | Reconciler 复核完整 bundle 与 gate binding，在一个 SQLite 事务中提交 artifacts/evidence/attempt/action success |
-| promotion 已 `COMMITTED` 但进程尚未完成文件系统后验 | Reconciler 只重做 canonical inode/checksum/目录链检查；canonical drift 时补偿为 `CONFLICT`，staging 残留不参与裁决 |
-| ledger 已 commit 但 graph 未 checkpoint | Reconciler 发现已成功并跳过执行 |
+| Action 尚为 `AUTHORIZED`、attempt 未启动 | 可以首次派发；`start_attempt` 先 durable manifest/policy snapshot |
+| attempt=`RUNNING`、outcome receipt 缺失 | **不得重跑 Action**；仅按 durable expected manifest 安全扫描 staging 并精确重建 receipt；缺失/额外/unsafe 则进入 conflict lifecycle |
+| outcome receipt 已 durable、controller 尚未路由 | 按 receipt discriminant 幂等路由；Succeeded 构造 staging-aware view/validator，failure/probe 只用 durable attempt policy/facts；`after_action_output` hook 位于 receipt 之后 |
+| validator 已返回但 gate receipt/intent tx 尚未 durable | 若全部 staging 仍安全存在，可重跑 validator且 canonical decision 必须相同；否则 fail closed，不把内存 PASS 当事实 |
+| gate receipt + 完整 intent 集已 durable、部分仍为 `PENDING` | 按第 12 节逐项 create-only 补完；不重跑 Action；staging 已清理的 `COMMITTED` 条目由 receipt+intent+canonical checksums 证明 |
+| 只有部分 intent rows 或 receipt/intents identity 不一致 | durable corruption；进入 conflict lifecycle，不补插缺项、不复制 canonical |
+| 任一 bundle intent 为 `CONFLICT` | attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`；幂等 subject incident；继续只读对账其余 intents，禁止自动重跑/replan |
+| 全部 promotion 已 `COMMITTED` 但 Action 尚未成功 | 用 gate receipt + intents 对完整 canonical bundle 做统一后验；通过后在一个 SQLite 事务中提交 artifacts/evidence/attempt/action success |
+| ledger 已 success 但 graph 未 checkpoint | Reconciler 重做全部 committed-intent/canonical 后验；一致则跳过执行，drift 则 conflict lifecycle + run `BLOCKED` |
 | gate FAIL | 保留证据并 replan 修复动作 |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
 | 需要人工判断 | `PAUSED_HITL`；以 interrupt/Command 恢复 |
 | 原 Action 为 `INDETERMINATE` | 只授权其绑定的 evidence-only probe；用 `ProbeResolution` 原子解析，禁止重发原操作 |
 | 外部条件缺失 | `BLOCKED`；条件修复后恢复 |
 
-业务事实提供 exactly-once commit。执行是 at-least-once，因此所有 Action 必须有稳定
-`action_id + plan_version + attempt + idempotency_key`，且副作用必须幂等或可对账。
+业务事实提供 exactly-once commit。executor 可能被 runtime 调用一次，但一旦 attempt 已是 `RUNNING`，
+Reconciler 不会自动再次调用它；恢复依赖 stable `action_id + plan_version + attempt + idempotency_key`、
+durable manifest/policy snapshot 和 receipts。新的执行只能来自人工处理后的新 plan version/new action ID。
 
 ## 12. 工件隔离与提交
 
@@ -605,7 +689,9 @@ LangGraph checkpoint
 reservation 和本节的 create-only 协议；进程外写入被视为 drift，Reconciler 只能检测和补偿，不能
 把 POSIX 路径名声明为不可变。
 
-机器管理的 canonical relpath 使用跨 Linux/macOS 一致的便携小写命名空间：分隔符只能是 `/`，
+机器管理的 canonical relpath 使用跨 Linux/macOS 一致的便携小写命名空间。纯 lexical validator 位于
+`types/artifact_paths.py`，只能依赖标准库/`types`；`project`、Registry、ArtifactStore 和 RunLedger 复用
+或 re-export 它，禁止 `types` 反向 import `project`。分隔符只能是 `/`，
 每个 component 只能匹配 `[a-z0-9._-]+`。唯一的词法边界验证器拒绝 uppercase、Unicode/casefold
 别名、空 component、`.`、`..`、绝对路径、反斜杠以及 `state/staging` 前缀；不做大小写折叠、
 Unicode normalization 或 dot 归一化，也不兼容旧路径。`ArtifactStore` 在 canonical 文件系统遍历前
@@ -636,13 +722,15 @@ file，并在所有成功/异常路径关闭 fd；symlink 被拒绝，FIFO 不�
 
 Committer 对一个普通成功 bundle 按以下顺序处理，顺序是 binding contract：
 
-1. 验证 frozen bundle、唯一排序/canonical JSON、`bundle_digest`、`action_id + attempt`、所有 staged
+1. 要求 Dispatcher 已 durable 写入完全一致的 outcome receipt；验证 frozen bundle、canonical 排序/
+   canonical JSON、`bundle_digest`、`action_id + attempt`、所有 staged
    regular files、portable canonical keys、media type/evidence role/metadata、write permissions，并与参数展开
-   得到的 `ExpectedArtifactManifest` 精确匹配；
+   后在 authorization/attempt 中持久化的 `ExpectedArtifactManifest` 精确匹配；
 2. 构造 staging-aware evidence view，运行确定性 validator，取得绑定相同 bundle digest、staged checksums、
    validator version 和 evidence refs 的 `GateDecision(PASS)`；
-3. 在一个 SQLite 事务中为 bundle **所有**条目创建 `PENDING` promotion intents。该事务全部成功后才允许
-   对任何 canonical 文件执行复制；不允许一边创建 intent 一边 promote；
+3. 在**同一个 SQLite 事务**中写入 gate receipt 并为 bundle **所有**条目创建 `PENDING` promotion
+   intents。事务必须验证 outcome receipt、gate receipt、expected manifest 和全部 intents identity 完全
+   闭合；该事务全部成功后才允许复制任何 canonical 文件，不允许一边创建 intent 一边 promote；
 4. 对每项固定持有 canonical parent dirfd，复核项目根、目录链、staging checksum。canonical 名称若已
    存在，只读验证 regular-file/inode/checksum；相同 checksum 是幂等候选，不同 checksum 进入
    `CONFLICT`；
@@ -653,22 +741,29 @@ Committer 对一个普通成功 bundle 按以下顺序处理，顺序是 binding
    `PENDING → COMMITTED`；逐项重复直至 bundle 全部 intents 已处理；
 7. 每项 intent commit 返回后再次检查 canonical fd checksum、名称/inode 和目录链。任何失败都立即在
    SQLite 中原子补偿 `COMMITTED → CONFLICT` 并创建 subject-scoped incident。
-8. 只有所有 intents 都为 `COMMITTED` 时，才在**一个 SQLite 事务**中写 artifact rows、bundle-bound
+8. 所有 intents 都为 `COMMITTED` 后，对**完整 bundle**再次统一验证每个 canonical name/inode/checksum/
+   dirchain 与 outcome receipt、gate receipt 和 intents 完全一致；任一失败进入 bundle conflict lifecycle；
+9. 统一后验通过后，才在**一个 SQLite 事务**中写 artifact rows、bundle-bound
    gate evidence、成本/outbox，并把当前 attempt 与 Action 标记 `SUCCEEDED`。任何 `PENDING` 或
    `CONFLICT` 都禁止成功提交。
 
-文件系统多文件 promotion 明确不是原子操作；第 8 步提供的是 ledger 完整性边界，而不是跨介质或
-跨文件原子性。第 3–8 步任一点崩溃时 attempt 保持 `RUNNING`。启动 Reconciler 按
+文件系统多文件 promotion 明确不是原子操作；第 9 步提供的是 ledger 完整性边界，而不是跨介质或
+跨文件原子性。第 8 步统一后验与第 9 步 success transaction 之间仍有不可消除的 FS/SQLite 窗口，
+协议不隐瞒也不宣称原子。第 3–9 步任一点崩溃时 attempt 保持 `RUNNING`。启动 Reconciler 按
 `run_id/action_id/attempt` 加载完整 bundle 与全部 intents，恢复未完成 promotions，并在完整 bundle 达标后
-调用同一个 success transaction；它不得重新执行 Action。任一 intent 为 `CONFLICT` 时 attempt/action
-不成功，记录 incident，且仍继续对账其他 intents 以保留完整证据。
+调用同一个统一后验和 success transaction；它不得重新执行 Action。
+
+若已有部分 intents `COMMITTED` 且其 staged 文件已安全清理，Reconciler 不再要求 staged residue，也不
+重跑 validator；它使用 durable gate receipt 的 ordered staged checksums/identity、相应 intents 和 canonical
+checksums 继续恢复。只有所有 staging 仍安全存在时才允许重新运行 validator，并且新 GateDecision
+canonical JSON/digest 必须与 durable gate receipt 完全相同，否则 fail closed。
 
 权威边界随 durable 状态变化：`PENDING` 期间 staged 是 promotion 输入，所有现有 checksum、regular
 file、dirfd 与目录链检查继续生效；canonical 和 ledger 成功进入 `COMMITTED` 后，canonical + ledger
-立即成为唯一权威事实，staged 降级为非权威运行残留。COMMITTED reconcile 不再解析、打开或 hash
+立即成为唯一权威事实，staged 降级为非权威运行残留。单项 COMMITTED reconcile 不再解析、打开或 hash
 staged 路径；staged 被修改、删除或清理不会产生 incident，也不会触发 `CONFLICT`。这条裁决只改变
 staged 的 post-commit 地位，不删除或弱化 canonical 的 commit-window 后验，以及重启后的
-checksum、名称/inode、pinned root 和目录链复核。
+checksum、名称/inode、pinned root 和目录链复核；完整 bundle 的统一后验仍使用 receipt/intents/canonical。
 
 每项 intent 在第 6 步之前的最后一次文件系统检查与 SQLite 更新之间存在不可消除的窗口；本文
 **不宣称文件系统与 SQLite 原子**。若进程在 intent commit 后、第 7 步之前崩溃，durable 状态暂为
@@ -690,6 +785,18 @@ canonical 与 staged 证据，记录
 “repair ledger”。crash 后只知道 canonical checksum 不同时可记 `artifact_checksum_conflict`，仍须
 保留所有文件供人工选择。
 
+任一 intent `CONFLICT`、部分 intent 集、receipt/intents identity 不一致或完整性检查失败，统一进入
+不可变 conflict lifecycle：在一个 SQLite 补偿事务中把 attempt 与 Action 置为 `REPAIR_REQUIRED`（状态机
+必须允许 `RUNNING/SUCCEEDED → REPAIR_REQUIRED` 的补偿 transition），run 置为 `BLOCKED`，保留原
+outcome/gate receipts、intents、artifact/gate history 与所有 staged/canonical/partial 文件，并按
+`run/action/attempt/subject/error_code` 幂等创建 incident。不得自动 retry、rerun 或 replan。
+
+人工 resolve/unblock 不能复活旧 Action：必须先显式选择/清理 canonical 冲突，再创建新 plan version、
+新 action ID 和新的 staging namespace。旧 receipt/intent/conflict/incident 是不可变历史；旧
+`CONFLICT → COMMITTED` 永远非法。success transaction 之后的下一轮 Reconciler 仍复核全部 intents 和
+canonical 后验；若发现 drift，执行同一补偿 transition 并将 run `BLOCKED`，不能因为此前已记录 success
+而忽略窗口。
+
 下表是 bundle 内**单个** Promotion intent 的合法状态与恢复语义；bundle success 仍要求同一 attempt 的
 所有 intent 均为 `COMMITTED`：
 
@@ -697,16 +804,17 @@ canonical 与 staged 证据，记录
 | --- | --- | --- |
 | `PENDING` | staged 有效、canonical 不存在 | 执行 create-only copy 和受保护 commit |
 | `PENDING` | canonical checksum 相同；staged 不存在或相同 | 完成受保护 commit，转 `COMMITTED` |
-| `PENDING` | staged/canonical 都不存在 | 保持 `PENDING`，幂等记录 `artifact_promotion_missing` |
+| `PENDING` | staged/canonical 都不存在 | intent → `CONFLICT`，执行 bundle conflict lifecycle；幂等记录 `artifact_promotion_missing` |
 | `PENDING` | canonical 不同或 partial、staged checksum 不同、intent 路径不安全 | 原子转 `CONFLICT` 并记录对应 incident；不删文件 |
 | `COMMITTED` | canonical 名称/inode/checksum/目录链一致；staged 为任意内容或不存在 | 保持 `COMMITTED`；staged 是非权威残留，不记录 incident |
 | `COMMITTED` | canonical 缺失或 drift、canonical identity/目录链复核失败 | 原子补偿为 `CONFLICT`；不得从 staging 重建 canonical |
-| `CONFLICT` | 任意 | 观察到该状态的调用不再 commit、写入或删除；返回已有冲突，同时继续对账后续 intents；已在途的旧 `PENDING` worker 只能保留候选并在 commit 处失败 |
+| `CONFLICT` | 任意 | 不再 commit、promote、重试、replan、写入或删除；只读检查 siblings 并返回已有冲突；已在途的旧 `PENDING` worker 只能保留候选并在 commit 处失败 |
 
 ledger 只允许验证后的 `PENDING → COMMITTED`、幂等 `COMMITTED → COMMITTED`，以及原子的
 `PENDING/COMMITTED → CONFLICT + incident`。重复补偿保持 `CONFLICT` 且不重复 incident；
 `CONFLICT → COMMITTED` 非法。`reconcile_all()` 处理全部 intents 后才汇总抛错，一个冲突不得阻断
-后续可恢复 intent。本 Task 不实现自动清理；COMMITTED 后外部或后续安全清理 staging 不影响
+后续只读后验与证据收集，但一旦 bundle conflict 已 durable，不再 promote 任何 sibling `PENDING` intent。
+本 Task 不实现自动清理；COMMITTED 后外部或后续安全清理 staging 不影响
 promotion 状态，未来若加入自动 GC 仍须另行证明 no-follow ownership/unlink 安全。
 
 发布、上传等不可逆动作采用 `prepare → commit → reconcile` 协议并携带 idempotency key。
@@ -745,7 +853,7 @@ flowchart TD
 | `RetryableFailure` | 同一输入再次执行可能成功 | 429、5xx、临时网络/锁 | 指数退避、jitter、上限 |
 | `RepairRequired` | 原动作不该重试，但其他工作可修复证据 | 术语冲突、章节质量 FAIL、EPUB lint FAIL | replan 修复 Action |
 | `PermanentFailure` | 相同能力和输入不会成功 | 版权禁止、格式不支持、权限永久拒绝、invariant 冲突 | 替代能力或 `BLOCKED` |
-| `Indeterminate` | 副作用可能已发生 | 发布超时、commit 后崩溃 | probe/reconcile，禁止盲重试 |
+| `Indeterminate` | 带 durable error code/failure signature 的副作用可能已发生 | 发布超时、commit 后崩溃 | probe/reconcile，禁止盲重试 |
 | `Paused` | 等待预算或人类 | 预算上限、敏感动作确认 | interrupt 后恢复 |
 | `ProbeResolution` | 只读 probe 对原 operation 的专用裁决 | 外部幂等查询、发布状态核对 | 经 ledger 原子 resolve；不能作为普通成功 |
 
@@ -754,7 +862,9 @@ flowchart TD
 
 Probe 自身的 attempt 以 evidence-only 方式提交，不创建 artifact bundle/promotion intent。Registry 与
 ProbeResolver 同时校验它是原 ActionSpec 唯一绑定的 probe capability，且 `operation_key` 与原
-`Indeterminate` 完全一致。相同 resolution 重放幂等；`succeeded/absent/unknown` 之间的冲突重放、错误
+`Indeterminate` 完全一致。`absent` 只读取原 attempt outcome receipt 的 durable `error_code` 和 executor
+启动前快照的完整 retry policy/max attempts；当前 catalog 漂移不能改变结果。相同 resolution 重放幂等；
+`succeeded/absent/unknown` 之间的冲突重放、错误
 probe capability、原状态已经改变或 operation key 不同一律 fail closed 并留下 incident。`unknown` 不是
 pause 成功：原 attempt 保持 `INDETERMINATE`，run 明确进入 `BLOCKED` 等待人工或新的外部证据。
 
@@ -826,6 +936,9 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - 参数展开的 expected effect manifest 与实际 bundle 对额外/缺失项均 fail closed；
 - agent handler 与 deterministic builder 都只能通过 attempt-scoped writer 写 staging；
 - staging-aware validator 覆盖当前输出、只读其余 committed canonical，并绑定 bundle digest/checksums；
+- authorization/attempt 在 executor 前 durable expected manifest 和完整 retry policy/fingerprint；
+- outcome receipt 在 controller hook 前 durable，gate receipt 与完整 intent 集同事务；
+- receipt exact replay 幂等、conflicting replay/partial intent set fail closed；
 - ledger transition 和事务回滚；
 - 全部 intents durable 之前零 canonical copy、完整 bundle 前零 ledger success；
 - artifact promotion 与 checksum 冲突；
@@ -846,9 +959,11 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 
 - 已提交 Action 不重复；
 - 未提交 staging bundle 可验证并保留；本协议不自动清理 staging；
-- 多文件 bundle 在每个 intent/copy/postcheck/success transaction 边界崩溃后按 attempt 恢复且不重跑 Action；
-- 任一 `CONFLICT` 阻止整个 bundle 成功，但不阻断其他 intent 对账；
-- ledger commit 后 graph crash 能跳过；
+- `before_outcome_receipt` 从安全 staging+durable manifest 精确重建或阻断，绝不重跑 Action；
+- `after_outcome_receipt`、gate receipt/all-intents transaction、每个 copy/postcheck、统一 bundle 后验和
+  success transaction 边界崩溃后均 receipt-driven 恢复；
+- 部分 intents、任一 `CONFLICT` 或完整性失败进入 immutable conflict lifecycle，不自动 retry/replan；
+- success 后 graph crash 复核全部 intent/canonical；drift 补偿为 `REPAIR_REQUIRED` + run `BLOCKED`；
 - `Indeterminate` 的 `succeeded/absent/unknown` probe matrix 不会盲重试，重复相同 resolution 幂等且冲突
   resolution fail closed；
 - budget/HITL/blocked 可恢复；
@@ -874,9 +989,11 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 
 ```text
 src/abi/
+├── types/artifact_paths.py         # 纯 lexical portable-lowercase key validator
 ├── types/orchestration.py          # frozen 领域模型
 ├── project/run_ledger.py           # SQLite 业务真相
-├── project/artifacts.py            # attempt writer、bundle intents 与 create-only promotion
+├── project/artifact_paths.py       # 可选 re-export；不得成为 types 的依赖
+├── project/artifacts.py            # attempt writer、receipts、bundle intents 与 promotion/postcheck
 ├── actions/
 │   ├── registry.py                 # ActionSpec 注册与启动校验
 │   ├── effects.py                  # 参数 → ExpectedArtifactManifest
@@ -923,15 +1040,19 @@ dict/Any。
 4. RunLedger 是唯一业务真相，投影可从它重建。
 5. 所有写操作都经 attempt-scoped writer；非空 typed bundle 与 expected manifest 精确匹配，validator
    只读 staging-aware evidence view 并绑定 digest/checksum。
-6. 完整 bundle 的所有 intents 先 durable、后逐项 promote；只有全部 `COMMITTED` 才在一个 SQLite
-   事务中提交 artifacts/gates/success，且文档和实现均不声称文件系统多文件或跨介质原子。
-7. 崩溃恢复按 run/action/attempt 对账完整 bundle、不重跑 Action；任一 conflict 阻止成功并记录 incident。
-8. `PermanentFailure`、`RepairRequired`、`Indeterminate`、三种 `ProbeResolution`、预算暂停和 HITL 都有
+6. Outcome receipt 在 executor return 后、controller hook 前 durable；Gate receipt 与完整 intent 集在同一
+   SQLite 事务中 durable，之后才允许 promote。
+7. 完整 bundle 的所有 intents `COMMITTED` 后通过统一 canonical 后验，才在一个 SQLite 事务中提交
+   artifacts/gates/success；文档和实现均不声称文件系统多文件或跨介质原子。
+8. 崩溃恢复按 run/action/attempt 和 receipts 对账、不重跑 Action；任一 conflict/integrity failure 触发
+   immutable `REPAIR_REQUIRED + BLOCKED` lifecycle，人工只能用新 plan/action/staging 继续。
+9. `PermanentFailure`、`RepairRequired`、带 durable error code 的 `Indeterminate`、三种
+   `ProbeResolution`、预算暂停和 HITL 都有
    端到端测试；probe 重放相同裁决幂等、冲突裁决 fail closed。
-9. 恢复不会重复已提交业务事实；不确定副作用不会盲重试。
-10. 动态并行不会产生未声明的写冲突。
-11. 所有 LLM 与子 agent 调用仍受预算、Langfuse 和本地事件管道覆盖。
-12. 现有 L2/L3 质量门禁和全量自动化测试通过。
+10. 恢复不会重复已提交业务事实；不确定副作用不会盲重试。
+11. 动态并行不会产生未声明的写冲突。
+12. 所有 LLM 与子 agent 调用仍受预算、Langfuse 和本地事件管道覆盖。
+13. 现有 L2/L3 质量门禁和全量自动化测试通过。
 
 ## 21. 明确放弃的替代方案
 

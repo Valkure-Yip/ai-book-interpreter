@@ -12,6 +12,12 @@
 > staging-aware validation, multi-intent commit, and typed probe-resolution protocol below replaces
 > the earlier Tasks 1/4/7/8/9 contract. Do not preserve the old single-file `Succeeded` shape or
 > compatibility with artifacts, tasks, attempts, or state created from the superseded draft.
+>
+> **Recovery closure fix round 1 (2026-08-05):** Before executing Tasks 7/8/9, implement the durable
+> expected-manifest/retry snapshot, attempt outcome receipt, gate receipt + all-intents transaction,
+> receipt-driven Reconciler, unified bundle postcheck, and immutable conflict lifecycle specified
+> below. These requirements replace any earlier step that assumed an in-memory outcome or PASS could
+> survive a crash.
 
 ## Global Constraints
 
@@ -23,7 +29,7 @@
 - Planner may propose only; PolicyEngine, validators, Committer, and Reconciler exclusively control authorization, gates, run status, and business commits.
 - Unknown capability, validator, predicate, outcome, or exception classification fails closed with an error message that includes a repair instruction.
 - `state/run.db` is the business source of truth; `events.jsonl`, `metrics.json`, and `state/status.json` are rebuildable projections.
-- Action execution is at-least-once; business commits are exactly-once by stable `run_id`, `plan_version`, `action_id`, `attempt`, and `idempotency_key`.
+- A `RUNNING` attempt's executor is never automatically invoked again; missing handoff facts are reconstructed or blocked from durable staging/manifest evidence. Business commits are exactly-once by stable `run_id`, `plan_version`, `action_id`, `attempt`, and `idempotency_key`.
 - Filesystem promotion and SQLite commits use `promotion_intent` plus reconciliation; never claim cross-medium atomicity.
 - The platform remains single-process. Machine-managed canonical relpaths are exact portable lowercase keys; after an intent is `COMMITTED`, canonical plus ledger are authoritative and staged residue is non-authoritative.
 - Externally supplied, foreign-owned, dirty, or hot-journal SQLite files are invalid input; no mutation-free inspection guarantee is made for them.
@@ -32,6 +38,11 @@
 - Parameter expansion creates an exact expected artifact manifest. Extra and missing bundle entries are equally invalid; a write set is only a permission ceiling.
 - Validators read a staging-aware evidence view: this attempt's staged outputs shadow their logical canonical paths, while all other dependencies are read-only committed canonical artifacts. Gate evidence binds the canonical bundle digest and staged checksums.
 - Committer persists every bundle promotion intent before copying any canonical file, promotes/reconciles all entries, and records success only after every intent is `COMMITTED`. Multi-file filesystem promotion is not atomic.
+- Authorization and `start_attempt` persist the parameter-expanded expected manifest plus full retry policy JSON/fingerprint before executor dispatch.
+- Dispatcher persists an immutable `attempt_outcome_receipt` in one SQLite transaction before any controller outcome hook. A `RUNNING` attempt is never automatically re-executed when this receipt is absent.
+- Validator PASS becomes durable only when one SQLite transaction creates the `gate_receipt` and the complete promotion-intent set. No canonical copy precedes that transaction.
+- Before success, Committer performs a unified postcheck of every committed canonical entry against receipts/intents; post-success reconciliation continues the same checks and blocks the run on drift.
+- Any intent conflict, partial intent set, receipt mismatch, or integrity failure atomically moves attempt/Action to `REPAIR_REQUIRED`, blocks the run, preserves all evidence/files, and requires a new plan version/new action ID/new staging namespace after manual resolution.
 - `ProbeResolution` is a separate evidence-only outcome. It atomically resolves the original `INDETERMINATE` attempt through the ledger; ordinary `Succeeded` never implicitly resolves an external operation.
 - Unclassified failures are `PermanentFailure`, except possible external side effects, which are `Indeterminate` and must be probed before retry.
 - Translation Actions receive only source text, five to eight style rules, and matched terminology; QA, EPUB, and release rules are excluded.
@@ -43,10 +54,10 @@
 
 | Area | Files | Responsibility |
 | --- | --- | --- |
-| Pure contracts | `src/abi/types/orchestration.py`, `src/abi/types/tools.py` | Frozen run, plan, artifact bundle/manifest, evidence, probe resolution, outcome, authorization, and tool-binding shapes |
+| Pure contracts | `src/abi/types/artifact_paths.py`, `src/abi/types/orchestration.py`, `src/abi/types/tools.py` | Pure lexical canonical-key validator; frozen run, plan, bundle/manifest, receipts, probe resolution, outcome, authorization, and tool-binding shapes |
 | Configuration | `src/abi/types/run.py`, `src/abi/config/loader.py` | Planner horizon, loop, retry, timeout, and concurrency limits |
-| Business persistence | `src/abi/project/ledger_schema.py`, `src/abi/project/run_ledger.py` | SQLite schema, legal transitions, plans, attempts, bundle/gate facts, probe resolutions, incidents, outbox |
-| Artifact transactions | `src/abi/project/artifacts.py` | Attempt-scoped writer, canonical bundle JSON/digest, atomic all-intent creation, per-item promotion/reconciliation |
+| Business persistence | `src/abi/project/ledger_schema.py`, `src/abi/project/run_ledger.py` | SQLite schema, durable authorization/attempt snapshots, outcome/gate receipts, legal transitions, probe resolutions, incidents, outbox |
+| Artifact transactions | `src/abi/project/artifacts.py`, optional `src/abi/project/artifact_paths.py` re-export | Attempt-scoped writer, safe receipt reconstruction, per-item promotion, unified bundle postcheck/reconciliation |
 | Action control | `src/abi/actions/contracts.py`, `registry.py`, `effects.py`, `evidence.py`, `validators.py`, `builtins/catalog.py` | Capability definitions, parameter-expanded expected manifests, staging-aware evidence, eligibility, execution, deterministic gates |
 | Planning | `src/abi/planning/context.py`, `planner.py`, `policy.py`, `scheduler.py` | Snapshot compression, structured proposal, deterministic authorization and conflict-free batches |
 | Provider runtimes | `src/abi/providers/agent_runtime/runner.py`, `tooling.py`, `src/abi/providers/orchestration_runtime/runtime.py` | LangChain Action harness, ABI tool adaptation, LangGraph durable cycle cursor |
@@ -58,15 +69,19 @@
 
 ```mermaid
 flowchart TD
-    ACTION["Built-in / agent / deterministic Action"] --> WRITER["AttemptStagingWriter<br/>state/staging/action/attempt"]
-    WRITER --> BUNDLE["Frozen ArtifactBundle<br/>exact expected effects"]
-    BUNDLE --> VIEW["StagingEvidenceView<br/>current outputs shadow canonical"]
+    AUTH["Authorization + RUNNING attempt<br/>durable manifest + retry facts"] --> ACTION["Built-in / agent / deterministic Action"]
+    ACTION --> WRITER["AttemptStagingWriter<br/>state/staging/action/attempt"]
+    WRITER --> BUNDLE["Frozen ArtifactBundle<br/>caller-canonical order"]
+    BUNDLE --> OUTREC["AttemptOutcomeReceipt<br/>durable before controller hook"]
+    OUTREC --> VIEW["StagingEvidenceView<br/>current outputs shadow canonical"]
     VIEW --> GATE["GateDecision<br/>bundle digest + staged checksums"]
-    GATE --> INTENTS["Atomic SQLite creation<br/>of all promotion intents"]
+    GATE --> INTENTS["One SQLite transaction<br/>GateReceipt + complete intent set"]
     INTENTS --> PROMOTE["Per-entry promote / reconcile<br/>filesystem is not atomic"]
     PROMOTE --> ALL{"All intents COMMITTED?"}
-    ALL -- "yes" --> SUCCESS["One SQLite transaction<br/>artifacts + gate + attempt/action success"]
-    ALL -- "no / conflict" --> INCIDENT["Keep RUNNING or record incident<br/>never rerun Action during reconcile"]
+    ALL -- "yes" --> POSTCHECK["Unified canonical bundle postcheck"]
+    POSTCHECK -- "pass" --> SUCCESS["One SQLite transaction<br/>artifacts + gate + attempt/action success"]
+    ALL -- "no / conflict" --> INCIDENT["Attempt/Action REPAIR_REQUIRED<br/>Run BLOCKED · immutable evidence"]
+    POSTCHECK -- "drift" --> INCIDENT
 
     INDET["Original attempt INDETERMINATE"] --> PROBE["Bound read-only probe Action"]
     PROBE --> RESOLUTION{"ProbeResolution"}
@@ -79,14 +94,16 @@ flowchart TD
 ## Task 1: Frozen Orchestration and Tool Contracts
 
 **Files:**
+- Create: `src/abi/types/artifact_paths.py`
 - Create: `src/abi/types/orchestration.py`
 - Create: `src/abi/types/tools.py`
 - Modify: `src/abi/types/__init__.py`
 - Modify: `src/abi/types/run.py`
 - Test: `tests/test_orchestration_types.py`
+- Test: `tests/test_artifact_paths.py`
 
 **Interfaces:**
-- Produces: `RunStatus`, `ActionStatus`, `ActionKind`, `RetryPolicySpec`, `ActionSpec`, `ArtifactMetadata`, `ArtifactBundleEntry`, `ArtifactBundle`, `ExpectedArtifact`, `ExpectedArtifactManifest`, `ActionArgument`, `ProposedAction`, `PlanPatch`, `RunSnapshot`, `AuthorizedAction`, `AuthorizationDecision`, bundle-bound `GateDecision`, `ProbeResolution`, `ActionOutcomeEnvelope`, `ToolCallRecord`, `AgentRunResult`, `RunResult`, and `ToolBinding`.
+- Produces: pure `canonical_artifact_key()`, `RunStatus`, `ActionStatus`, `ActionKind`, `RetryPolicySpec`, `ActionSpec`, `ArtifactMetadata`, `ArtifactBundleEntry`, `ArtifactBundle`, `ExpectedArtifact`, `ExpectedArtifactManifest`, canonical `AttemptOutcomeReceiptPayload`, `GateReceiptPayload`, `ActionArgument`, `ProposedAction`, `PlanPatch`, `RunSnapshot`, `AuthorizedAction`, `AuthorizationDecision`, bundle-bound `GateDecision`, `ProbeResolution`, `ActionOutcomeEnvelope`, `ToolCallRecord`, `AgentRunResult`, `RunResult`, and `ToolBinding`.
 - Consumes: existing `abi.types._base.FrozenModel`.
 
 - [ ] **Step 1: Write the failing contract tests**
@@ -123,6 +140,8 @@ def test_plan_patch_is_frozen_and_rejects_unknown_fields() -> None:
 
 def test_action_outcome_is_discriminated() -> None:
     envelope = ActionOutcomeEnvelope.model_validate({
+        "action_id": "a1",
+        "attempt": 1,
         "outcome": {"kind": "permanent_failure", "error_code": "unsupported_format",
                     "message": "convert the source to txt or epub"}
     })
@@ -134,14 +153,16 @@ Add parameterized tests that reject an empty bundle; directory/glob paths; upper
 absolute, dot, backslash, or `state/staging` canonical paths; a staged path outside the exact
 action/attempt namespace; duplicate staged or canonical paths; unordered entries/metadata; and
 conflicting `ActionOutcomeEnvelope` identity. Add a golden canonical-JSON/digest test and parse all
-three `ProbeResolution.disposition` values. Assert the superseded single-file payload is rejected as
-an extra/missing-field error.
+three `ProbeResolution.disposition` values. Assert `Indeterminate` rejects missing error code or a
+non-canonical failure signature. Add receipt-payload tests for JSON/digest mismatch, success without
+bundle, failure without failure fields, and caller disorder; never auto-sort. Assert the superseded
+single-file payload is rejected as an extra/missing-field error.
 
 - [ ] **Step 2: Run the tests and confirm the missing-module failure**
 
-Run: `.venv/bin/pytest tests/test_orchestration_types.py -v`
+Run: `.venv/bin/pytest tests/test_artifact_paths.py tests/test_orchestration_types.py -v`
 
-Expected: collection fails with `ModuleNotFoundError: No module named 'abi.types.orchestration'`.
+Expected: collection fails with missing `abi.types.artifact_paths` / orchestration contracts.
 
 - [ ] **Step 3: Implement the complete pure contract surface**
 
@@ -180,11 +201,12 @@ class ExpectedArtifact(FrozenModel):
     canonical_relpath: str
     media_type: str
     evidence_role: str
-    required_metadata: tuple[str, ...] = ()
+    metadata: tuple[ArtifactMetadata, ...] = ()
 
 
 class ExpectedArtifactManifest(FrozenModel):
-    entries: tuple[ExpectedArtifact, ...] = Field(min_length=1)
+    action_id: str
+    entries: tuple[ExpectedArtifact, ...] = ()
 
 
 class Succeeded(FrozenModel):
@@ -215,6 +237,8 @@ class PermanentFailure(FrozenModel):
 class Indeterminate(FrozenModel):
     kind: Literal["indeterminate"] = "indeterminate"
     operation_key: str
+    error_code: str
+    failure_signature: str
     message: str
 
 
@@ -243,6 +267,36 @@ class ActionOutcomeEnvelope(FrozenModel):
     outcome: ActionOutcome
     action_id: str
     attempt: int = Field(ge=1)
+
+
+class AttemptOutcomeReceiptPayload(FrozenModel):
+    action_id: str
+    attempt: int = Field(ge=1)
+    canonical_outcome_json: str
+    outcome_digest: str
+    canonical_bundle_json: str | None = None
+    bundle_digest: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+    error_code: str | None = None
+    failure_signature: str | None = None
+
+
+class GateArtifactIdentity(FrozenModel):
+    staged_relpath: str
+    canonical_relpath: str
+    checksum: str
+
+
+class GateReceiptPayload(FrozenModel):
+    action_id: str
+    attempt: int = Field(ge=1)
+    validator_id: str
+    validator_version: str
+    canonical_gate_decision_json: str
+    gate_decision_digest: str
+    bundle_digest: str
+    artifacts: tuple[GateArtifactIdentity, ...] = Field(min_length=1)
+    evidence_refs: tuple[str, ...] = ()
 
 
 class ToolCallRecord(FrozenModel):
@@ -402,6 +456,10 @@ class AuthorizedAction(FrozenModel):
     read_set: tuple[str, ...] = ()
     write_set: tuple[str, ...] = ()
     idempotency_key: str
+    expected_artifact_manifest: ExpectedArtifactManifest
+    expected_artifact_manifest_digest: str
+    expected_evidence_refs: tuple[str, ...] = ()
+    retry_policy: RetryPolicySpec
     retry_policy_fingerprint: str
 
 
@@ -415,6 +473,7 @@ class GateDecision(FrozenModel):
     passed: bool
     reason_code: str
     message: str
+    validator_id: str
     validator_version: str
     bundle_digest: str
     artifact_checksums: tuple[str, ...]
@@ -428,15 +487,25 @@ class RunResult(FrozenModel):
     blocked_reason: str | None = None
 ```
 
-Implement one canonicalization function for artifact bundles. Validate staged paths as relative
+Create the pure lexical `canonical_artifact_key()` in `abi.types.artifact_paths`; it imports no
+project/business module. Project code may import or re-export it, but `types` never imports
+`project`. Implement one canonical JSON encoder for artifact bundles/receipts. Validate staged paths as relative
 regular-file candidates scoped exactly beneath `state/staging/{action_id}/{attempt}/`; validate
 canonical paths through `canonical_artifact_key()`; reject directories, globs, empty bundles,
 duplicate staged paths, duplicate canonical paths, empty media/evidence roles, duplicate metadata
-names, and metadata values that are not canonical JSON. Sort entries by
-`(canonical_relpath, staged_relpath)` and metadata by `name`. Serialize with UTF-8, sorted keys, and
+names, and metadata values that are not canonical JSON. Require callers to provide entries already
+strictly ordered by `(canonical_relpath, staged_relpath)` and metadata already strictly ordered by
+`name`; reject disorder or duplicates at the boundary and never auto-sort. Serialize with UTF-8, sorted keys, and
 compact separators, then SHA-256 the bytes as `bundle_digest`. Do not casefold, Unicode-normalize,
 or dot-normalize paths. `ExpectedArtifactManifest` uses the same canonical ordering and rejects
-duplicate canonical paths.
+disorder or duplicate canonical paths; the deterministic expander must emit it correctly.
+
+Canonical failure signature is exactly
+`sha256(capability + "\n" + canonical_parameters_json + "\n" + error_code)`. Validate every
+`Indeterminate.failure_signature` against it. Receipt payloads validate canonical JSON/digest
+pairs, require bundle fields only for ordinary success, and preserve caller order rather than
+repairing it. Apply discriminant-specific rules: copy
+`error_code` where the outcome defines it, and require `failure_signature` for `Indeterminate`.
 
 No legacy single-file `Succeeded` field or compatibility parser is permitted. An ordinary success
 must contain at least one entry; evidence-only probe Actions return `ProbeResolution`, never an
@@ -447,14 +516,14 @@ Add `PlannerConfig(horizon=5, max_rejections=3)`, `OrchestrationConfig(max_cycle
 
 - [ ] **Step 4: Run focused type and configuration tests**
 
-Run: `.venv/bin/pytest tests/test_orchestration_types.py tests/test_project_model.py -v`
+Run: `.venv/bin/pytest tests/test_artifact_paths.py tests/test_orchestration_types.py tests/test_project_model.py -v`
 
 Expected: all tests pass.
 
 - [ ] **Step 5: Commit the contracts**
 
 ```bash
-git add src/abi/types tests/test_orchestration_types.py
+git add src/abi/types tests/test_artifact_paths.py tests/test_orchestration_types.py
 git commit -m "feat: define dynamic orchestration contracts"
 ```
 
@@ -508,6 +577,10 @@ def test_policy_emits_only_canonical_validated_parameters() -> None:
     assert decision.authorized is True
     action = decision.actions[0]
     assert action.parameters_json == '{"source_relpath":"source/raw.txt"}'
+    assert action.expected_artifact_manifest.entries[0].canonical_relpath == "source/raw.txt"
+    assert action.expected_evidence_refs == ("source_manifest",)
+    assert action.retry_policy.retryable_codes == ("provider_timeout",)
+    assert action.retry_policy_fingerprint == retry_policy_digest(action.retry_policy)
 ```
 
 - [ ] **Step 3: Run both test files and observe missing implementations**
@@ -583,7 +656,7 @@ class ActionRegistry:
 
 - [ ] **Step 5: Implement deterministic policy checks**
 
-`PolicyEngine.authorize()` runs in this order: horizon 1–5, unique proposal IDs, known/eligible capability, argument parsing, dependencies exist, acyclic graph, hard prerequisites, budget estimate, read/write conflicts, repeated-failure signature, terminal release policy. It returns all rejection codes in stable sorted order and never partially authorizes a rejected patch.
+`PolicyEngine.authorize()` runs in this order: horizon 1–5, unique proposal IDs, known/eligible capability, argument parsing, deterministic effect expansion, dependencies exist, acyclic graph, hard prerequisites, budget estimate, read/write conflicts, repeated-failure signature, terminal release policy. For each authorized Action it embeds the canonical parameter-expanded expected manifest JSON/digest, stable expected evidence refs, and the complete canonical `RetryPolicySpec` JSON/fingerprint; these are authorization facts, not later Registry lookups. It returns all rejection codes in stable sorted order and never partially authorizes a rejected patch.
 
 ```python
 class PolicyEngine:
@@ -627,7 +700,7 @@ git commit -m "feat: authorize registered actions with deterministic policy"
 
 **Interfaces:**
 - Consumes: Task 1 models.
-- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `start_attempt()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
+- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `start_attempt()`, `record_attempt_outcome()`, `create_gate_receipt_and_bundle_intents()`, `mark_bundle_conflict()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
 
 - [ ] **Step 1: Write transaction, transition, and exactly-once tests**
 
@@ -635,7 +708,7 @@ git commit -m "feat: authorize registered actions with deterministic policy"
 @pytest.mark.asyncio
 async def test_commit_success_is_exactly_once(tmp_path: Path) -> None:
     async with RunLedger.open(tmp_path / "run.db") as ledger:
-        await seed_authorized_action(ledger, action_id="a1")
+        await seed_validated_committed_bundle(ledger, action_id="a1", checksum="abc")
         first = await ledger.commit_success(success_commit("a1", checksum="abc"))
         second = await ledger.commit_success(success_commit("a1", checksum="abc"))
         assert first == second
@@ -650,6 +723,26 @@ async def test_illegal_transition_rolls_back(tmp_path: Path) -> None:
         with pytest.raises(LedgerTransitionError, match="resume or unblock"):
             await ledger.set_run_status(run_id, RunStatus.COMPLETED)
         assert (await ledger.get_run(run_id)).status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_attempt_snapshots_manifest_and_retry_policy_before_dispatch(tmp_path: Path) -> None:
+    async with seeded_ledger(tmp_path) as ledger:
+        attempt = await ledger.start_attempt("a1")
+        assert attempt.expected_manifest_digest == authorized_manifest_digest("a1")
+        assert attempt.retry_policy.retryable_codes == ("provider_timeout",)
+        assert attempt.retry_policy_fingerprint == retry_policy_digest(attempt.retry_policy)
+
+
+@pytest.mark.asyncio
+async def test_outcome_receipt_is_idempotent_but_conflicts_on_changed_bundle(tmp_path: Path) -> None:
+    async with running_attempt_ledger(tmp_path) as ledger:
+        receipt = outcome_receipt("a1", 1, bundle_digest="bundle-a")
+        assert await ledger.record_attempt_outcome(receipt) == await ledger.record_attempt_outcome(receipt)
+        with pytest.raises(LedgerConflictError):
+            await ledger.record_attempt_outcome(
+                outcome_receipt("a1", 1, bundle_digest="bundle-b")
+            )
 ```
 
 - [ ] **Step 2: Run the ledger tests and confirm failure**
@@ -660,7 +753,18 @@ Expected: collection fails because `abi.project.run_ledger` does not exist.
 
 - [ ] **Step 3: Add the async SQLite dependency and schema**
 
-Add `"aiosqlite>=0.20,<1"` to runtime dependencies and run `uv lock`. `SCHEMA_SQL` must create WAL-backed tables `runs`, `plan_versions`, `actions`, `action_attempts`, `artifact_bundles`, `artifacts`, `promotion_intents`, `gate_evidence`, `probe_resolutions`, `incidents`, `interrupts`, `budget_entries`, and `event_outbox`. Persist the authorized retry-policy fingerprint on `actions`. Add unique constraints on `(run_id, version)`, `(run_id, action_id)`, `(action_id, attempt)`, one bundle per action attempt, artifact canonical path, one probe resolution per original action attempt/operation key, and event idempotency key.
+Add `"aiosqlite>=0.20,<1"` to runtime dependencies and run `uv lock`. `SCHEMA_SQL` must create WAL-backed tables `runs`, `plan_versions`, `actions`, `action_attempts`, `attempt_outcome_receipts`, `artifact_bundles`, `artifacts`, `gate_receipts`, `promotion_intents`, `gate_evidence`, `probe_resolutions`, `incidents`, `interrupts`, `budget_entries`, and `event_outbox`.
+
+`actions` stores canonical expected-manifest JSON/digest, stable expected evidence refs, plus complete retry-policy JSON/fingerprint.
+`start_attempt()` copies those immutable facts into `action_attempts` in the same transaction that
+sets `RUNNING`, before executor dispatch. `attempt_outcome_receipts` stores action/attempt, canonical
+outcome JSON/digest, optional bundle JSON/digest, evidence refs, error code, failure signature, and
+`recorded_at`. `gate_receipts` stores validator ID/version, canonical GateDecision JSON/digest,
+bundle digest, ordered staged path/canonical path/checksum identities, evidence refs, and
+`recorded_at`. Add unique constraints on `(run_id, version)`, `(run_id, action_id)`,
+`(action_id, attempt)`, exactly one outcome receipt and gate receipt per attempt, one bundle per
+attempt, artifact canonical path, one probe resolution per original attempt/operation key, and
+event idempotency key.
 
 ```sql
 CREATE TABLE IF NOT EXISTS actions (
@@ -669,6 +773,11 @@ CREATE TABLE IF NOT EXISTS actions (
   plan_version INTEGER NOT NULL,
   capability TEXT NOT NULL,
   parameters_json TEXT NOT NULL,
+  expected_manifest_json TEXT NOT NULL,
+  expected_manifest_digest TEXT NOT NULL,
+  expected_evidence_refs_json TEXT NOT NULL,
+  retry_policy_json TEXT NOT NULL,
+  retry_policy_fingerprint TEXT NOT NULL,
   status TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
   committed_at TEXT
@@ -677,7 +786,13 @@ CREATE TABLE IF NOT EXISTS actions (
 
 - [ ] **Step 4: Implement `RunLedger` with explicit transactions**
 
-Use `aiosqlite.Connection`, `BEGIN IMMEDIATE`, injected UTC clock, and repository-owned row-to-model parsing. `commit_success()` writes Action status, artifacts, gate evidence, budget entry, and outbox event in one SQLite transaction. An identical repeated commit returns the prior record; a different checksum for the same Action creates a conflict incident and raises `LedgerConflictError`.
+Use `aiosqlite.Connection`, `BEGIN IMMEDIATE`, injected UTC clock, and repository-owned row-to-model parsing. `record_attempt_outcome()` verifies the receipt against the immutable attempt identity/manifest/policy snapshot; exact replay is idempotent and any differing fact conflicts. `create_gate_receipt_and_bundle_intents()` verifies outcome/bundle identity and inserts the gate receipt plus the **complete** intent set in one transaction; partial replay is corruption, never piecemeal repair. `commit_success()` requires matching outcome/gate receipts and every expected intent `COMMITTED`, then writes Action status, artifacts, gate evidence, budget entry, and outbox event in one SQLite transaction. An identical repeated commit returns the prior record; a different checksum for the same Action enters the conflict lifecycle.
+
+Add legal compensating transitions `RUNNING → REPAIR_REQUIRED` and
+`SUCCEEDED → REPAIR_REQUIRED` for receipt/intent/canonical integrity failure. `mark_bundle_conflict()`
+atomically applies the attempt and Action transition, sets run `BLOCKED`, and inserts one idempotent
+subject-scoped incident while preserving all prior receipts/intents/artifact/gate rows. It cannot
+authorize retry or create a replacement Action.
 
 ```python
 @asynccontextmanager
@@ -709,7 +824,7 @@ git commit -m "feat: add transactional run ledger"
 
 **Files:**
 - Create: `src/abi/project/artifacts.py`
-- Create: `src/abi/project/artifact_paths.py`
+- Modify or create only as a re-export: `src/abi/project/artifact_paths.py`
 - Extend: `src/abi/project/run_ledger.py`
 - Extend: `src/abi/project/ledger_schema.py`
 - Modify: `src/abi/project/layout.py`
@@ -721,8 +836,8 @@ git commit -m "feat: add transactional run ledger"
 - Produces: attempt-bound `ArtifactStore.writer(action_id, attempt) -> AttemptStagingWriter`,
   create-only `AttemptStagingWriter.write_bytes(canonical_relpath, data, media_type,
   evidence_role, metadata) -> ArtifactBundleEntry`, display-only `staging_dir()`, canonical
-  bundle JSON/digest, `create_bundle_intents()` (one SQLite transaction), per-item `promote()`,
-  `reconcile_attempt(run_id, action_id, attempt)`, safe `sha256_file()`, and durable
+  bundle JSON/digest, safe `rebuild_outcome_receipt()`, per-item `promote()`,
+  `verify_committed_bundle()`, `reconcile_attempt(run_id, action_id, attempt)`, safe `sha256_file()`, and durable
   `PENDING | COMMITTED | CONFLICT` promotion transitions. `canonical_artifact_key()` is the one
   lexical boundary for portable canonical reservation keys.
 
@@ -756,8 +871,11 @@ async def test_bundle_persists_every_intent_before_any_canonical_copy(tmp_path: 
     bundle = two_file_bundle(tmp_path, action_id="a1", attempt=1)
     copied: list[str] = []
     store = instrumented_store(tmp_path, on_copy=lambda path: copied.append(path))
-    intents = await store.create_bundle_intents(bundle)
+    receipt, intents = await store.ledger.create_gate_receipt_and_bundle_intents(
+        gate_receipt_for(bundle), intents_for(bundle)
+    )
     assert copied == []
+    assert receipt.bundle_digest == bundle_digest(bundle)
     assert {item.status for item in intents} == {"PENDING"}
     assert await store.ledger.count_intents("a1", 1) == 2
 
@@ -807,8 +925,17 @@ commit-window and post-commit drift tests unchanged.
 Add bundle tests proving one failed intent insert rolls back all intent rows and performs zero
 canonical copies; a crash after intent creation or after any individual copy leaves the attempt
 `RUNNING`; reconciliation is scoped by `run_id/action_id/attempt`, completes every recoverable
-intent without executing the Action, and reports every conflict after processing the rest. Assert a
-bundle with one `CONFLICT` can never be reported successful even when all sibling intents commit.
+intent without executing the Action, and reports every conflict after read-only inspection of the
+rest. Add missing outcome-receipt tests that rebuild only when every expected regular file exists
+and there are no extra/unsafe leaves; incomplete/extra staging must atomically set attempt/Action
+`REPAIR_REQUIRED` and run `BLOCKED` without executor calls. Assert a bundle with one `CONFLICT` can
+never be reported successful even when all sibling intents had already committed.
+
+Add unified-postcheck tests that mutate entry 1 or entry 2 after its per-item postcheck but before
+success; `verify_committed_bundle()` must detect name/inode/checksum/dirchain drift against
+outcome/gate receipts and intents, enter the conflict lifecycle, and withhold success. Repeat after
+success and assert the compensating `SUCCEEDED → REPAIR_REQUIRED` transition, idempotent incident,
+and run `BLOCKED` while prior success/artifact/gate history remains auditable.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -827,12 +954,12 @@ compensation is idempotent. Repeating a matching `COMMITTED` transition is idemp
 `CONFLICT → COMMITTED` is an illegal transition with a repair-oriented error. Unknown persisted
 states fail closed during repository-owned parsing.
 
-Add `create_bundle_intents(bundle, checksums, media_types)` as the only intent-creation API. It
-validates bundle identity against a currently `RUNNING` attempt, stores the canonical bundle JSON
-and digest, inserts all intents in the same SQLite transaction, and returns existing rows only for
-an exact idempotent replay. A partial prior set, different ordering/digest/checksum, duplicate
-destination, or action/attempt mismatch is a durable conflict; it must not repair by adding missing
-rows piecemeal.
+Use Task 3's `create_gate_receipt_and_bundle_intents(gate_receipt, intents)` as the only
+intent-creation API. It validates the gate receipt against the current attempt outcome receipt and
+durable expected manifest, stores gate receipt plus all intents in the same SQLite transaction, and
+returns existing rows only for an exact idempotent replay. A partial prior set, different
+ordering/digest/checksum, duplicate destination, or action/attempt mismatch enters the bundle
+conflict lifecycle; it must not repair by adding missing rows piecemeal.
 
 | Current status | Requested transition | Result |
 | --- | --- | --- |
@@ -844,7 +971,9 @@ rows piecemeal.
 
 - [ ] **Step 4: Implement portable canonical keys, pinned staging, and checksum I/O**
 
-Machine-managed canonical relpaths use `/` separators and components matching only
+Import the Task 1 validator from `abi.types.artifact_paths`; `project.artifact_paths` may re-export
+it, but the implementation must not move the lexical rule back into project or create a
+`types → project` dependency. Machine-managed canonical relpaths use `/` separators and components matching only
 `[a-z0-9._-]+`. The shared lexical validator rejects uppercase, Unicode, empty, `.`, `..`, absolute
 paths, backslashes, and the `state/staging` prefix without normalization. ArtifactStore invokes it
 before canonical filesystem traversal; RunLedger invokes the same function before opening a
@@ -862,12 +991,24 @@ canonical output path or writer. `staging_dir()` is display-only. `sha256_file()
 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, requires a regular file through `fstat`, and closes the fd on
 every success and failure path; symlinks are rejected and FIFOs never block.
 
+`rebuild_outcome_receipt(action_id, attempt)` is the only recovery path when a `RUNNING` attempt has
+no receipt. Traverse the exact attempt namespace with pinned no-follow dirfds. Derive each staged
+leaf from the durable expected manifest's deterministic canonical→staged mapping; require every
+expected regular file, the exact expected ancestor directories, and no extra/unsafe entries.
+Media type, evidence role, metadata, and stable expected evidence refs come from the durable
+manifest/authorization facts; compute file checksums and canonical outcome/bundle JSON/digests,
+then call `record_attempt_outcome()`. Any ambiguity, missing/extra leaf, unexpected directory,
+symlink/FIFO/device, or identity mismatch invokes `mark_bundle_conflict()` and never calls the
+executor. An empty/evidence-only manifest or an attempt whose outcome cannot be uniquely proven by
+the exact file set is not reconstructable; block rather than guessing success/failure/probe.
+
 - [ ] **Step 5: Implement all-intents-first bundle promotion**
 
-Validate/canonicalize the complete bundle and persist every lexically valid `PENDING` intent in one
-SQLite transaction before any canonical mutation. Any insert/identity/effect error rolls back the
-whole set. Per-item promotion starts only after reloading and proving the durable intent count and
-identities exactly match the bundle. Hold the
+Reject non-canonical caller ordering; do not auto-sort. Persist the gate receipt and every lexically
+valid `PENDING` intent in one SQLite transaction before any canonical mutation. Any
+insert/identity/effect error rolls back the whole set. Per-item promotion starts only after
+reloading and proving outcome receipt, gate receipt, durable intent count, and identities exactly
+match the bundle. Hold the
 canonical-parent dirfd
 through the whole operation. If the canonical name already exists, open it read-only without
 following links and commit only when its checksum matches. If absent, open the final canonical name
@@ -893,8 +1034,9 @@ compensation if it finds drift.
 The same non-atomic window permits another connection to compensate a stale `PENDING` snapshot to
 `CONFLICT` while a worker is already copying. That worker may have created or written the canonical
 candidate before it learns the durable state, but its ledger commit must be rejected and converted
-to an aggregateable artifact conflict. Preserve the candidate and continue later intents. Calls
-that load `CONFLICT` perform no further write or delete; this rule does not claim to undo syscalls
+to an aggregateable artifact conflict. Preserve the candidate; after durable conflict, later
+sibling intents receive read-only inspection only and no new promotion. Calls that load `CONFLICT`
+perform no further write or delete; this rule does not claim to undo syscalls
 already issued by an in-flight worker.
 
 Filesystem promotion of multiple entries is not atomic and must never be described that way. Do not
@@ -904,20 +1046,34 @@ write, file-fsync, or parent-directory-fsync failure is retained. Record
 `canonical_write_incomplete` with instructions to inspect storage and preserve the partial
 canonical plus staged source; never misclassify that failure as `artifact_intent_invalid`.
 
+After every entry is `COMMITTED` and before the success transaction,
+`verify_committed_bundle()` reopens the complete canonical set through pinned no-follow dirfds and
+proves every name/inode/checksum/dirchain against outcome receipt, gate receipt, and intents. A
+single failure marks the entire bundle conflict. This pre-success check does not make filesystem
+and SQLite atomic. The next Reconciler cycle repeats it even after success; post-success drift uses
+the compensating `SUCCEEDED → REPAIR_REQUIRED`, run `BLOCKED`, and idempotent incident path while
+preserving prior business history.
+
 - [ ] **Step 6: Implement reconciliation from the durable state table**
 
 | Durable status | Filesystem evidence | Reconciliation |
 | --- | --- | --- |
 | `PENDING` | valid staged; canonical absent | perform the create-only copy and guarded commit |
 | `PENDING` | canonical checksum matches; staged absent or matches | guarded commit to `COMMITTED` |
-| `PENDING` | neither artifact exists | remain `PENDING`; idempotent `artifact_promotion_missing` incident |
+| `PENDING` | neither artifact exists | enter bundle conflict lifecycle; idempotent `artifact_promotion_missing` incident |
 | `PENDING` | canonical differs/is partial, staged differs, or intent path is unsafe | atomically enter `CONFLICT`; retain every artifact |
 | `COMMITTED` | canonical name/inode/checksum/dirchain match; staged has any contents or is absent | remain `COMMITTED`; staged is non-authoritative residue |
 | `COMMITTED` | canonical missing/drifted, or any canonical identity/dirchain check fails | atomically compensate to `CONFLICT`; never recreate canonical |
-| `CONFLICT` | any evidence | a caller that observes it never commits, rewrites, or deletes; an already in-flight stale `PENDING` worker preserves its candidate and fails commit; surface the incident and continue later intents |
+| `CONFLICT` | any evidence | never commit, rewrite, delete, retry, or replan; preserve evidence and inspect siblings read-only |
 
-`reconcile_attempt(run_id, action_id, attempt)` processes every intent in the durable bundle before
-raising an aggregate conflict. `reconcile_all()` may iterate attempts but cannot mix their success
+`reconcile_attempt(run_id, action_id, attempt)` first validates outcome receipt, gate receipt, and
+the complete intent set. It processes every safe intent, then calls `verify_committed_bundle()`
+before success. When some entries are already `COMMITTED` and staging was cleaned, it proves them
+with gate receipt + intent + canonical checksums and does not rerun the validator. It may rerun the
+validator only if all staging still exists safely and the canonical GateDecision JSON/digest is
+identical to the gate receipt. Any conflict or integrity failure calls `mark_bundle_conflict()`;
+manual continuation requires a new plan version/action ID/staging namespace after explicit
+canonical conflict selection/cleanup. `reconcile_all()` may iterate attempts but cannot mix their success
 conditions. Repeated
 reconciliation and compensation do not duplicate incidents. Automatic staged cleanup remains out of
 scope until a separate durable ownership protocol can prove safe unlinking.
@@ -1110,7 +1266,7 @@ Remove `set_state` and `record_gate` from content tools. Replace `get_state` wit
 
 - [ ] **Step 5: Implement `create_agent` with persistent `AsyncSqliteSaver`**
 
-Use `langchain.agents.create_agent`, `response_format=ActionOutcomeEnvelope`, and `AsyncSqliteSaver.from_conn_string`. Map graph recursion to `RetryableFailure(error_code="iteration_limit")`, budget to `Paused(reason="budget")`, declared transient provider errors to `RetryableFailure`, and possible side-effect timeouts to `Indeterminate`. Unknown exceptions become `PermanentFailure(error_code="unclassified_exception")`.
+Use `langchain.agents.create_agent`, `response_format=ActionOutcomeEnvelope`, and `AsyncSqliteSaver.from_conn_string`. Every structured result must echo required `action_id` and `attempt`. Map graph recursion to `RetryableFailure(error_code="iteration_limit")`, budget to `Paused(reason="budget")`, declared transient provider errors to `RetryableFailure`, and possible side-effect timeouts to `Indeterminate(operation_key=..., error_code="provider_timeout", failure_signature=canonical_failure_signature(...), message=...)`. Unknown exceptions become `PermanentFailure(error_code="unclassified_exception")`.
 
 Define the provider-owned request as a frozen dataclass so callable tools are not persisted as Pydantic data:
 
@@ -1180,7 +1336,7 @@ git commit -m "feat: add durable LangChain v1 action harness"
 
 **Interfaces:**
 - Consumes: Action registry/contracts, Action harness, existing deterministic EPUB/QA/release functions, and existing prompt contents.
-- Produces: `build_action_registry()`, `ActionPromptRegistry`, typed inputs for every built-in capability, deterministic `expand_expected_artifacts(capability, parameters)`, attempt-scoped tool handlers/builders, `StagingEvidenceView`, and `validate_evidence(capability, evidence_view, parameters, bundle)`.
+- Produces: `build_action_registry()`, `ActionPromptRegistry`, typed inputs for every built-in capability, deterministic `expand_expected_artifacts(capability, action_id, parameters)`, attempt-scoped tool handlers/builders, `StagingEvidenceView`, and `validate_evidence(capability, evidence_view, parameters, bundle)`.
 
 - [ ] **Step 1: Write catalog completeness and no-state-mutation tests**
 
@@ -1212,8 +1368,9 @@ def test_action_receives_only_allowlisted_tools_and_paths() -> None:
 
 def test_parameter_expansion_declares_exact_chapter_outputs() -> None:
     manifest = expand_expected_artifacts(
-        "chapter.translate", ChapterBatchInput(chapters=("002", "001"))
+        "chapter.translate", "a1", ChapterBatchInput(chapters=("002", "001"))
     )
+    assert manifest.action_id == "a1"
     assert tuple(item.canonical_relpath for item in manifest.entries) == (
         "chapters/translated/001.md", "chapters/translated/002.md"
     )
@@ -1250,7 +1407,9 @@ attempt staged outputs shadow the same logical canonical path; unrelated depende
 from the committed artifact manifest; another attempt's staging is invisible; and the returned
 `GateDecision` binds the exact bundle digest, ordered staged checksums, evidence refs, and validator
 version. Add fail-closed tests for extra and missing expected effects, media/evidence-role mismatch,
-and a deterministic builder or agent tool attempting a direct canonical write.
+metadata mismatch, caller-disordered bundle entries/metadata (no auto-sort), and a deterministic
+builder or agent tool attempting a direct canonical write. Assert even the unknown-validator FAIL
+decision contains required validator ID/version, bundle digest, ordered checksums, and evidence refs.
 
 - [ ] **Step 3: Run focused tests and confirm failure**
 
@@ -1260,7 +1419,7 @@ Expected: collection fails because the built-in catalog and validator router do 
 
 - [ ] **Step 4: Define typed inputs and registered capability effects**
 
-Use separate models: `SourceIngestInput`, `SourceSplitInput`, `ResearchInput`, `ChapterBatchInput`, `ReviewBatchInput`, `BuildEpubInput`, `ReleaseInput`, and `EmptyInput`. Every ActionSpec declares `prerequisites`, `effects`, `expected_evidence`, `tool_allowlist`, `skill_refs`, `read_set`, `write_set`, retry policy, validator, estimated cost, and Action kind. Every artifact-producing ActionDefinition also binds a deterministic effect expander. It converts parsed parameters into a glob-free, directory-free `ExpectedArtifactManifest` with exact canonical path, media type, evidence role, and required metadata keys; runtime output must match it exactly. Keep dependency rules as predicates, not list ordering.
+Use separate models: `SourceIngestInput`, `SourceSplitInput`, `ResearchInput`, `ChapterBatchInput`, `ReviewBatchInput`, `BuildEpubInput`, `ReleaseInput`, and `EmptyInput`. Every ActionSpec declares `prerequisites`, `effects`, `expected_evidence`, `tool_allowlist`, `skill_refs`, `read_set`, `write_set`, retry policy, validator, estimated cost, and Action kind. Every artifact-producing ActionDefinition also binds a deterministic effect expander. It converts action identity plus parsed parameters into a glob-free, directory-free `ExpectedArtifactManifest` with exact canonical path, media type, evidence role, and exact metadata. The expander emits canonical order; it never relies on a later auto-sort. PolicyEngine persists its canonical JSON/digest and the full retry policy/fingerprint at authorization, and `start_attempt()` snapshots both before executor dispatch. Runtime output must match it exactly. Keep dependency rules as predicates, not list ordering.
 
 - [ ] **Step 5: Port prompts and Action execution without `StageSpec`**
 
@@ -1271,8 +1430,10 @@ All built-in, agent, and deterministic writes go through the current
 canonical paths, but the ABI handler maps them to staged leaves, records one typed effect entry, and
 never opens canonical output. Deterministic parsers/builders receive a staged sink or
 `AttemptOutputView`; remove direct canonical-output calls rather than wrapping them after the write.
-At successful executor return, canonicalize recorded entries, compare them exactly with the
-parameter-expanded manifest, and build `Succeeded(artifact_bundle=...)`. Composite review Actions
+At successful executor return, reject recorded entries unless they are already in strict canonical
+order, compare them exactly with the durable parameter-expanded manifest, and build
+`ActionOutcomeEnvelope(action_id=context.action_id, attempt=context.attempt,
+outcome=Succeeded(artifact_bundle=...))`. Composite review Actions
 allocate independent thread IDs and reuse the shared BudgetGate.
 
 - [ ] **Step 6: Move validators and make the router exhaustive**
@@ -1296,6 +1457,11 @@ def validate_evidence(
             passed=False,
             reason_code="validator_not_registered",
             message=f"No validator for {capability}; register one before authorizing this Action.",
+            validator_id="unregistered",
+            validator_version="none",
+            bundle_digest=evidence_view.bundle_digest,
+            artifact_checksums=evidence_view.artifact_checksums,
+            evidence_refs=(),
         )
     return validator(evidence_view, parameters, bundle)
 ```
@@ -1325,8 +1491,9 @@ not continue implementing the Task 8 Committer against the superseded Task 7 sur
 
 > **Entry gate:** Do not continue the in-progress Task 8 implementation until the mandatory Task 7
 > backfill has landed and its focused tests prove attempt-scoped writing, exact bundle effects, and
-> staging-aware validation. Replace any in-progress single-file Committer code; do not adapt it with
-> a compatibility branch.
+> staging-aware validation. Tasks 1/3/4 receipt schemas/APIs and compensating conflict transitions
+> must also be landed first. Replace any in-progress single-file/in-memory-outcome Committer code;
+> do not adapt it with a compatibility branch.
 
 **Files:**
 - Create: `src/abi/planning/scheduler.py`
@@ -1364,15 +1531,19 @@ def test_scheduler_parallelizes_only_non_conflicting_actions() -> None:
 ```python
 @pytest.mark.asyncio
 async def test_controller_replans_after_repair_and_completes() -> None:
-    rig = controller_rig(outcomes=(RepairRequired(
-        defect_codes=("term_drift",), message="repair glossary"
-    ), Succeeded(
-        artifact_bundle=bundle(
-            action_id="a2", attempt=1,
-            entries=(("chapter.md", "chapters/translated/001.md", "text/markdown", "translation"),),
+    rig = controller_rig(outcomes=(
+        ActionOutcomeEnvelope(
+            action_id="a1", attempt=1,
+            outcome=RepairRequired(defect_codes=("term_drift",), message="repair glossary"),
         ),
-        evidence_refs=("gate",),
-    )))
+        ActionOutcomeEnvelope(
+            action_id="a2", attempt=1,
+            outcome=Succeeded(artifact_bundle=bundle(
+                action_id="a2", attempt=1,
+                entries=(("chapter.md", "chapters/translated/001.md", "text/markdown", "translation"),),
+            ), evidence_refs=("gate",)),
+        ),
+    ))
     await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
     assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.COMPLETED
     assert await rig.ledger.event_names() == expected_replan_event_sequence()
@@ -1380,8 +1551,11 @@ async def test_controller_replans_after_repair_and_completes() -> None:
 
 @pytest.mark.asyncio
 async def test_permanent_failure_blocks_without_retry() -> None:
-    rig = controller_rig(outcomes=(PermanentFailure(
-        error_code="copyright_denied", message="supply a license or use private mode"
+    rig = controller_rig(outcomes=(ActionOutcomeEnvelope(
+        action_id="rights", attempt=1,
+        outcome=PermanentFailure(
+            error_code="copyright_denied", message="supply a license or use private mode"
+        ),
     ),))
     await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
     assert await rig.ledger.count_attempts(capability="rights.check") == 1
@@ -1391,7 +1565,9 @@ async def test_permanent_failure_blocks_without_retry() -> None:
 @pytest.mark.asyncio
 async def test_committer_requires_complete_multi_file_bundle(tmp_path: Path) -> None:
     rig = committer_rig(tmp_path, expected=("reports/a.json", "reports/b.json"))
-    result = await rig.commit(two_file_success(rig, action_id="a1", attempt=1))
+    envelope = two_file_success(rig, action_id="a1", attempt=1)
+    await rig.ledger.record_attempt_outcome(receipt_for(envelope))
+    result = await rig.commit(envelope)
     assert {item.relpath for item in result.artifacts} == {"reports/a.json", "reports/b.json"}
     assert await rig.ledger.count_intents("a1", 1) == 2
     assert await rig.ledger.action_status("a1") is ActionStatus.SUCCEEDED
@@ -1399,9 +1575,11 @@ async def test_committer_requires_complete_multi_file_bundle(tmp_path: Path) -> 
 
 Add Committer tests for bundle/action/attempt mismatch; permission violation; non-regular staged
 leaf; extra/missing/duplicate manifest entry; gate digest/checksum mismatch; zero canonical copies
-until every intent is durable; crash after each intent/copy/postcheck; one conflict among committed
+until outcome receipt then gate receipt + every intent are durable; crash after each receipt/intent/
+copy/postcheck and unified postcheck; one conflict among committed
 siblings; and refusal to mark either attempt or Action successful before every intent is
-`COMMITTED`. Assert a crash leaves the attempt `RUNNING`.
+`COMMITTED`. Assert a crash leaves the attempt `RUNNING` unless integrity failure invokes the
+explicit `REPAIR_REQUIRED + BLOCKED` compensation.
 
 - [ ] **Step 3: Run Scheduler and controller tests and confirm failure**
 
@@ -1411,35 +1589,54 @@ Expected: collection fails because the Scheduler and dynamic controller do not e
 
 - [ ] **Step 4: Implement batch selection and typed dispatch**
 
-Scheduler sorts by priority then action ID, incrementally admits Actions whose dependencies are committed and whose read/write sets do not conflict with the batch. Dispatcher starts attempts in the ledger, resolves canonical parameters through Registry, creates the exact attempt-scoped writer/output view, runs deterministic/agent/composite executors, applies per-Action timeout, and always returns `ActionOutcomeEnvelope`. It rejects a `Succeeded` bundle whose identity differs from the durable action/attempt and rejects `ProbeResolution` from a non-probe capability before routing either outcome.
+Scheduler sorts by priority then action ID, incrementally admits Actions whose dependencies are committed and whose read/write sets do not conflict with the batch. Dispatcher starts attempts in the ledger (thereby snapshotting the authorized expected manifest and full retry policy before execution), resolves canonical parameters, creates the exact attempt-scoped writer/output view, runs deterministic/agent/composite executors, applies per-Action timeout, and requires `ActionOutcomeEnvelope.action_id/attempt` on every result. It rejects a `Succeeded` bundle whose identity/order/effects differ from the durable action/attempt manifest and rejects `ProbeResolution` from a non-probe capability.
+
+Immediately after typed executor return, the `before_outcome_receipt` test hook may crash. Otherwise
+Dispatcher canonical-encodes the envelope and calls `record_attempt_outcome()` in one SQLite
+transaction. Only after that transaction commits may it invoke the `after_action_output` hook or
+return control to the controller. This applies to success and all failure outcomes; receipts are not
+PASS or terminal status. `Indeterminate` requires error code and canonical failure signature.
 
 - [ ] **Step 5: Implement commit and reconciliation routing**
 
 Implement ordinary-success commit in this exact order:
 
-1. Parse and canonicalize the frozen bundle; validate current run/action/attempt identity, regular
+1. Load the durable outcome receipt; reject non-canonical caller ordering (never auto-sort), then
+   validate the frozen bundle's current run/action/attempt identity, regular
    staged leaves, portable lowercase canonical paths, media/evidence metadata, write permission,
-   unique staged/canonical names, and exact equality with the parameter-expanded expected manifest.
+   unique staged/canonical names, and exact equality with the durable parameter-expanded manifest.
 2. Construct `StagingEvidenceView` so current attempt outputs shadow their logical canonical paths
    and all other inputs are read-only committed canonical artifacts. Run the deterministic validator
    and require a PASS bound to this bundle digest, ordered staged checksums, evidence refs, and
    validator version.
-3. Call the ledger's atomic `create_bundle_intents()`; every intent must be durable before
-   `ArtifactStore` copies any canonical byte.
+3. Call `create_gate_receipt_and_bundle_intents()` so canonical GateDecision/validator identity,
+   ordered staged checksums/evidence, and **every** intent become durable in one SQLite transaction.
+   No canonical copy may precede its commit; a partial intent set is corruption.
 4. Promote/reconcile each intent using the create-only protocol and re-read all intents for this
-   run/action/attempt. Continue sibling reconciliation after a conflict so evidence is complete.
-5. Require every intent to be `COMMITTED`; then, and only then, use one SQLite transaction to write
+   run/action/attempt. After a conflict inspect siblings read-only; do not promote, retry, or replan.
+5. Require every intent to be `COMMITTED`, then run `verify_committed_bundle()` across the complete
+   canonical name/inode/checksum/dirchain set against outcome/gate receipts and intents.
+6. Only after the unified postcheck passes, use one SQLite transaction to write
    the bundle/artifact rows and gate evidence and transition the attempt/Action to `SUCCEEDED` with
    the cost/outbox facts.
 
-Filesystem promotion across bundle entries is explicitly non-atomic. Any crash before step 5 leaves
+Filesystem promotion across bundle entries is explicitly non-atomic. Any crash before step 6 leaves
 the attempt `RUNNING`; it does not become retryable, repair-required, or successful merely because
 some files exist. Outcome routing is exact: retryable → bounded retry; repair → incident + replan;
 permanent → alternative capability or BLOCKED; indeterminate → registered probe Action only; paused
-→ run pause; ordinary success → the five-step bundle protocol. Reconciler runs before every planning
-cycle, groups facts by run/action/attempt, resumes all pending intents without rerunning the Action,
-records an incident and withholds success on any `CONFLICT`, finalizes the same success transaction
-only for a complete committed bundle, and skips execution when ledger already committed it.
+→ run pause; ordinary success → the six-step receipt protocol. Reconciler runs before every planning
+cycle and groups facts by run/action/attempt. A `RUNNING` attempt with no outcome receipt is never
+redispatched: rebuild an exact receipt only from safe staging plus its durable expected manifest;
+missing/extra/unsafe evidence invokes `mark_bundle_conflict()`. With a gate receipt and partial
+`COMMITTED` set, recover from gate receipt + intents + canonical checksums without requiring cleaned
+staging or rerunning validator. A durable non-success receipt is routed idempotently from its
+discriminant and attempt-snapshotted policy/failure facts, never from in-memory output. Revalidate only when all staging remains and require byte-identical
+GateDecision JSON/digest. Finalize only after unified postcheck. Any conflict/integrity failure
+atomically sets attempt/Action `REPAIR_REQUIRED`, run `BLOCKED`, preserves receipts/intents/files,
+and creates an idempotent subject incident; no automatic rerun/replan. Manual continuation creates a
+new plan version/action ID/staging namespace after explicit canonical conflict selection/cleanup.
+Even after ledger success, the next Reconciler cycle repeats committed-intent/canonical postchecks
+and compensates drift to `REPAIR_REQUIRED + BLOCKED`; this does not claim FS/SQLite atomicity.
 
 `OutboxProjector.flush()` reads undelivered ledger events in sequence order, appends them to `events.jsonl` through `EventLogger.append_record(event_id, record)`, updates metrics/status projections, then marks each outbox row delivered. `EventLogger` builds a seen-event-ID set from the existing JSONL file at startup and refuses a second append of the same ID, closing the crash window between file append and the delivered flag. Provider events also receive stable call/attempt IDs, so one file remains a deduplicated projection.
 
@@ -1497,10 +1694,12 @@ git commit -m "feat: execute durable policy-gated action loop"
 ```python
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", [
-    "before_dispatch", "after_action_output", "before_bundle_intents",
-    "after_bundle_intents", "after_first_canonical_create", "after_first_canonical_write",
+    "before_dispatch", "before_outcome_receipt", "after_outcome_receipt",
+    "after_action_output", "before_gate_receipt_and_intents", "after_gate_receipt_and_intents",
+    "after_first_canonical_create", "after_first_canonical_write",
     "after_first_intent_commit_before_postcheck", "between_bundle_entries",
-    "after_all_intents_committed", "after_success_ledger_commit", "before_graph_checkpoint",
+    "after_all_intents_committed", "after_unified_bundle_postcheck",
+    "after_success_ledger_commit", "before_graph_checkpoint",
 ])
 async def test_crash_boundaries_do_not_duplicate_business_facts(
     tmp_path: Path, boundary: str
@@ -1516,11 +1715,20 @@ async def test_crash_boundaries_do_not_duplicate_business_facts(
 ```
 
 For every boundary, use a two-entry bundle and assert: all intent rows existed before the first
-canonical copy; the attempt stayed `RUNNING` until the complete success transaction; resume grouped
+canonical copy; outcome receipt existed before `after_action_output`; gate receipt and all intents
+appeared in one transaction; the attempt stayed `RUNNING` until the complete success transaction; resume grouped
 by run/action/attempt and did not rerun the Action; exactly one bundle/gate/success fact was
 committed; and staged residue became non-authoritative only after each corresponding intent reached
-`COMMITTED`. Add cases for a conflict on entry 1 and entry 2, proving sibling reconciliation
-continues but bundle success is withheld and one stable incident is recorded.
+`COMMITTED`. At `before_outcome_receipt`, resume must rebuild the exact receipt from safe staging +
+durable expected manifest without executor calls. Add incomplete, extra, symlink, and unsafe staging
+variants that instead produce `REPAIR_REQUIRED + BLOCKED`.
+
+Inject a deliberately partial durable intent set separately (the normal transaction cannot create
+one) and assert corruption is blocked without adding missing rows or copying canonical. Add conflict
+on entry 1/entry 2 and drift after unified postcheck and after success. Each case sets attempt/Action
+`REPAIR_REQUIRED`, run `BLOCKED`, preserves all receipts/intents/files/history, creates one stable
+subject incident, and only inspects siblings read-only. Assert unblock cannot reuse the old Action;
+a new plan version/action ID/staging namespace is required after explicit canonical cleanup.
 
 - [ ] **Step 2: Write failure classification and probe tests**
 
@@ -1528,12 +1736,26 @@ continues but bundle success is withheld and one stable incident is recorded.
 @pytest.mark.asyncio
 async def test_indeterminate_release_is_probed_not_reissued(tmp_path: Path) -> None:
     operation_log = tmp_path / "external-operations.jsonl"
-    rig = release_rig(first=Indeterminate(
-        operation_key="release:abc", message="timeout after request"
-    ), probe=ProbeResolution(
-        operation_key="release:abc", disposition="succeeded",
-        evidence_refs=("external:release:abc",), message="remote release exists",
-    ), operation_log=operation_log)
+    rig = release_rig(
+        first=ActionOutcomeEnvelope(
+            action_id="release", attempt=1,
+            outcome=Indeterminate(
+                operation_key="release:abc", error_code="provider_timeout",
+                failure_signature=canonical_failure_signature(
+                    "release.prepare", canonical_release_parameters(), "provider_timeout"
+                ),
+                message="timeout after request",
+            ),
+        ),
+        probe=ActionOutcomeEnvelope(
+            action_id="release-probe", attempt=1,
+            outcome=ProbeResolution(
+                operation_key="release:abc", disposition="succeeded",
+                evidence_refs=("external:release:abc",), message="remote release exists",
+            ),
+        ),
+        operation_log=operation_log,
+    )
     await rig.run()
     records = [json.loads(line) for line in operation_log.read_text().splitlines()]
     assert [record["operation"] for record in records] == ["release", "probe"]
@@ -1567,7 +1789,9 @@ def test_unknown_exception_classifies_fail_closed() -> None:
 ```
 
 Add `absent` cases for retry exhausted, unregistered error code, and mismatched retry-policy
-fingerprint; all must block rather than retry. Add wrong probe capability, writable/side-effecting
+fingerprint; all must block rather than retry. Mutate the in-memory/current catalog policy after the
+original attempt and prove `absent` still uses only the outcome receipt error code plus the attempt's
+durable full policy/max attempts. Add wrong probe capability, writable/side-effecting
 probe registration, wrong original status, wrong operation key, and probe returning ordinary
 `Succeeded` tests. Replay the exact same resolution and assert idempotency; replay a different
 disposition, evidence set, operation key, original attempt, or retry fingerprint and assert a
@@ -1583,7 +1807,14 @@ Expected: tests fail at the unimplemented crash hooks, signature accounting, and
 
 - [ ] **Step 4: Implement retry signatures and external-operation probes**
 
-Hash `(capability, canonical_parameters_json, error_code)` as the failure signature. Retry only errors named by `RetryPolicySpec.retryable_codes`, enforce max attempts and jittered backoff, and convert exhaustion to `RepairRequired` or `PermanentFailure` according to the ActionSpec. Persist the canonical retry-policy fingerprint with authorization so probe resolution can verify the original policy durably. External Actions declare `may_have_side_effects=True` plus a separate `probe_capability`; Dispatcher refuses to retry them while the prior attempt is indeterminate.
+Define the failure signature exactly as
+`sha256(capability + "\n" + canonical_parameters_json + "\n" + error_code)` and require
+`Indeterminate.error_code` plus that signature. Authorization and attempt rows already persist full
+retry-policy JSON (`retryable_codes`, `max_attempts`, delays) and fingerprint; the outcome receipt
+persists the original error code/signature. Retry only errors allowed by those durable attempt facts,
+enforce their max attempts/backoff, and never consult a later catalog version. External Actions
+declare `may_have_side_effects=True` plus a separate `probe_capability`; Dispatcher refuses to retry
+them while the prior attempt is indeterminate.
 
 Registry startup requires every probe capability to be read-only, evidence-only, side-effect-free,
 effect/write-set empty, and bound to exactly the probed ActionSpec/operation-key input schema. A
@@ -1593,12 +1824,13 @@ ordinary `Succeeded` and never creates promotion intents.
 
 Implement `probe_resolutions` and `RunLedger.resolve_indeterminate(request)` as one serialized
 SQLite transaction. Validate probe/original action and attempt identity, registered probe binding,
-operation key, original `INDETERMINATE` status, evidence-only probe status, idempotency key, and
-retry-policy fingerprint. In the same transaction, commit the probe attempt/action and evidence,
+operation key, original `INDETERMINATE` status, evidence-only probe status, idempotency key, the
+outcome receipt's error code/failure signature, and the attempt's complete durable retry policy/
+fingerprint. In the same transaction, commit the probe attempt/action and evidence,
 insert the immutable resolution/outbox facts, then apply exactly one original route:
 
 - `succeeded`: original attempt/Action → `SUCCEEDED`; never redispatch the external operation.
-- `absent`: original Action → `RETRY_WAIT` only when its stored retry policy, error code, and attempt
+- `absent`: original Action → `RETRY_WAIT` only when its attempt-snapshotted retry policy, outcome-receipt error code, and attempt
   count allow; otherwise run → `BLOCKED` with an incident.
 - `unknown`: leave original attempt/Action `INDETERMINATE`; run → `BLOCKED` with an incident that
   requests human/external evidence.
@@ -1608,12 +1840,15 @@ fails closed and preserves the first durable fact.
 
 - [ ] **Step 5: Implement all recovery boundaries**
 
-At startup reconcile ledger/checkpoint/artifacts in this order: incomplete artifact bundles grouped
-by run/action/attempt; all intents in each bundle; complete bundles whose success transaction is
-missing; committed Actions missing graph progress; indeterminate operations through their bound
-probe Actions; outbox delivery. A bundle crash never causes Action redispatch. An intent conflict
-withholds success and records an incident but does not stop sibling intent reconciliation. Emit
-`action.reconciled` for every correction and preserve the original incident.
+At startup reconcile ledger/checkpoint/artifacts in this order: `RUNNING` attempts grouped by
+run/action/attempt and their durable manifest/policy snapshot; missing/conflicting outcome receipts;
+missing/conflicting gate receipt + complete intent sets; pending/committed intents; unified
+canonical bundle postcheck; success rows missing graph progress; post-success canonical drift;
+indeterminate operations through bound probe Actions; outbox delivery. A missing outcome receipt
+never causes Action redispatch: exact safe reconstruction or `REPAIR_REQUIRED + BLOCKED` only. A
+partial intent set is corruption, not a repair invitation. An intent conflict stops further sibling
+promotion but permits read-only evidence collection. Emit `action.reconciled` for every correction,
+preserve original receipts/intents/files/history, and never auto-create the replacement plan/action.
 
 - [ ] **Step 6: Run recovery and full unit tests**
 
@@ -1665,6 +1900,10 @@ def test_inspect_prints_plan_actions_and_incidents(cli_runner, seeded_project) -
     assert "Open incidents" in result.stdout
 ```
 
+Add a conflict-unblock test that starts with immutable old receipts/intents and a
+`REPAIR_REQUIRED` Action, supplies explicit canonical resolution evidence, and asserts a new plan
+version, new action ID, and new staging namespace are created while every old row remains unchanged.
+
 - [ ] **Step 2: Run lifecycle tests and confirm they fail against old behavior**
 
 Run: `.venv/bin/pytest tests/test_project_model.py tests/test_dynamic_cli.py tests/test_orchestrator_offline.py -v`
@@ -1677,7 +1916,7 @@ Scaffold creates the directory contract, `state/run.db`, `state/staging`, and ch
 
 - [ ] **Step 4: Replace status-based CLI commands**
 
-Remove `--until` and the happy-path table. `inspect` prints run status, current plan version, authorized/running/recent Actions, gates, incidents, budget, and next recovery instruction. `approve` resumes one `PAUSED_HITL` interrupt by ID and records the human decision; `unblock` requires a reason, closes only externally resolved incidents, and transitions BLOCKED or `PAUSED_BUDGET` to RUNNING. `cancel` is idempotent and cannot reopen COMPLETED.
+Remove `--until` and the happy-path table. `inspect` prints run status, current plan version, authorized/running/recent Actions, gates, receipts, incidents, budget, and next recovery instruction. `approve` resumes one `PAUSED_HITL` interrupt by ID and records the human decision. `unblock` requires a reason and evidence that canonical conflicts were explicitly selected/cleaned. For a bundle-conflict incident it must append a new plan version and authorize a new action ID/new staging namespace before returning the run to `RUNNING`; it never resets or reuses the old `REPAIR_REQUIRED` Action or changes old receipts/intents/conflicts. A budget-only unblock may transition without replacement work. `cancel` is idempotent and cannot reopen COMPLETED.
 
 - [ ] **Step 5: Rewrite the offline end-to-end test around a deterministic Planner**
 
@@ -1749,7 +1988,16 @@ Remove the fixed state/stage code and numbered sequence registry. `ToolContext` 
 
 - [ ] **Step 4: Rewrite L1 process eval against the ledger**
 
-Gate integrity replays `gate_evidence` against the canonical bundle digest, ordered artifact checksums, and validator version. Path conformance becomes policy conformance: every committed Action was authorized, every ordinary success had a non-empty exact expected bundle, every bundle intent existed before promotion and was `COMMITTED` before ledger success, every release prerequisite was committed, no failed/paused/indeterminate Action was treated as success except through a valid immutable probe resolution, and every plan rejection has reasons. Keep L2 translation and L3 EPUB scoring behavior unchanged.
+Gate integrity replays `gate_evidence` against authorization/attempt expected-manifest facts,
+attempt outcome receipt, gate receipt, canonical bundle digest, ordered artifact checksums, validator
+identity/version, and the complete intent set. Path conformance becomes policy conformance: every
+ordinary success had a non-empty caller-canonical exact bundle; outcome receipt preceded controller
+handling; gate receipt and every intent were created together before promotion; every intent and
+the unified canonical postcheck passed before ledger success; post-success drift created
+`REPAIR_REQUIRED + BLOCKED`; conflict history was never reset/reused; every release prerequisite
+was committed; no failed/paused/indeterminate Action was treated as success except through a valid
+immutable probe resolution using durable attempt policy/error facts; and every plan rejection has
+reasons. Keep L2 translation and L3 EPUB scoring behavior unchanged.
 
 - [ ] **Step 5: Synchronize all authoritative documentation**
 
@@ -1802,8 +2050,10 @@ Expected: Ruff passes. Mypy must contain no new errors; the pre-existing 20-erro
 
 Run: `.venv/bin/pytest tests/test_orchestration_recovery.py tests/test_failure_semantics.py tests/test_dynamic_controller.py tests/test_orchestrator_offline.py -v`
 
-Expected: all two-entry bundle recovery boundaries, conflict positions, permanent failures, all three
-probe dispositions and replay conflicts, replanning, concurrency, and completion scenarios pass.
+Expected: all two-entry boundaries before/after outcome receipt, before/after atomic gate receipt +
+intents, each promotion, unified postcheck, success/checkpoint, partial-intent corruption,
+pre/post-success drift, immutable conflict/unblock replacement, permanent failures, all three probe
+dispositions using durable policy/error facts, replay conflicts, concurrency, and completion pass.
 
 - [ ] **Step 4: Verify forbidden symbols and SDK boundaries**
 
@@ -1813,7 +2063,9 @@ Run: `rg -n '^(from|import) (langchain|langgraph|langfuse)' src/abi --glob '!pro
 
 Run: `rg -n 'Succeeded\x28staging_relpath|ProbeR[e]sult' src tests docs/superpowers/plans/2026-08-04-constrained-dynamic-orchestration.md`
 
-Expected: all three searches return no matches. References to per-entry `staged_relpath` inside
+Run: `rg -n 'from abi\.project\.artifact_paths|import abi\.project\.artifact_paths' src/abi/types`
+
+Expected: all four searches return no matches. References to per-entry `staged_relpath` inside
 `ArtifactBundleEntry` remain valid; only the superseded single-file outcome is forbidden.
 
 - [ ] **Step 5: Record implementation evidence in the design document**
