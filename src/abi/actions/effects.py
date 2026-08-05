@@ -103,9 +103,18 @@ def expand_expected_artifacts(
         if not isinstance(parameters, ReviewBatchInput):
             raise TypeError("chapter.review requires ReviewBatchInput")
         paths = tuple(
-            (f"chapters/final/{chapter}.md", "translation")
+            item
             for chapter in sorted(parameters.chapters)
+            for item in (
+                (f"chapters/final/{chapter}.md", "translation"),
+                (f"qa/fidelity/{chapter}.md", "fidelity_review"),
+                (f"qa/gates/{chapter}.gate.md", "chapter_gate"),
+                (f"qa/imagery/{chapter}.imagery.md", "imagery_review"),
+                (f"qa/readability/{chapter}.md", "readability_review"),
+                (f"qa/terminology/{chapter}.md", "terminology_review"),
+            )
         )
+        paths = tuple(sorted(paths))
         entries = tuple(_artifact(path, "text/markdown", role) for path, role in paths)
     elif capability == "release.prepare":
         if not isinstance(parameters, ReleaseInput):
@@ -171,7 +180,8 @@ def expand_expected_artifacts(
         if not isinstance(parameters, ReviewBatchInput):
             raise TypeError("review.independent requires ReviewBatchInput")
         entries = (
-            _artifact("reviews/revision_route.md", "text/markdown", "review"),
+            _artifact("reviews/agent_a/review.md", "text/markdown", "independent_review"),
+            _artifact("reviews/agent_b/review.md", "text/markdown", "independent_review"),
         )
     else:
         try:

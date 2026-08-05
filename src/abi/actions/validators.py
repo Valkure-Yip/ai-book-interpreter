@@ -112,6 +112,237 @@ def _generic(
     )
 
 
+def _semantic_failure(
+    capability: str,
+    view: StagingEvidenceView,
+    reason_code: str,
+    message: str,
+) -> GateDecision:
+    return _decision(
+        view,
+        passed=False,
+        reason_code=reason_code,
+        message=message,
+        validator_id=capability,
+    )
+
+
+def _semantic_success(
+    capability: str, view: StagingEvidenceView, bundle: ArtifactBundle
+) -> GateDecision:
+    return _decision(
+        view,
+        passed=True,
+        reason_code="evidence_valid",
+        message="Current attempt evidence satisfies the capability's semantic gate.",
+        validator_id=capability,
+        evidence_refs=tuple(entry.canonical_relpath for entry in bundle.entries),
+    )
+
+
+def _typed_expected(
+    capability: str,
+    expected_type: type[FrozenModel],
+    view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
+) -> GateDecision | None:
+    if not isinstance(parameters, expected_type):
+        return _semantic_failure(
+            capability,
+            view,
+            "invalid_validator_parameters",
+            f"{capability} requires {expected_type.__name__}.",
+        )
+    return _validate_expected(capability, view, parameters, bundle)
+
+
+def _nonempty_bundle(
+    capability: str,
+    expected_type: type[FrozenModel],
+    reason_code: str,
+    view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
+) -> GateDecision:
+    if invalid := _typed_expected(
+        capability, expected_type, view, parameters, bundle
+    ):
+        return invalid
+    try:
+        if any(
+            not view.read_bytes(entry.canonical_relpath).strip()
+            for entry in bundle.entries
+        ):
+            raise ValueError("all required evidence must be non-empty")
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(capability, view, reason_code, str(exc))
+    return _semantic_success(capability, view, bundle)
+
+
+def _contains_field_pass(text: str, field: str = "result") -> bool:
+    pattern = re.compile(rf"(?im)^\s*(?:[#>*`-]+\s*)?{re.escape(field)}\s*:\s*PASS\s*$")
+    return pattern.search(text) is not None
+
+
+def _source_split(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "source.split"
+    if invalid := _typed_expected(
+        capability, SourceSplitInput, view, parameters, bundle
+    ):
+        return invalid
+    assert isinstance(parameters, SourceSplitInput)
+    try:
+        toc = json.loads(view.read_text("source/toc.json"))
+        if not isinstance(toc, list):
+            raise ValueError("source/toc.json must contain an ordered list")
+        slugs = tuple(
+            item.get("slug") if isinstance(item, dict) else None for item in toc
+        )
+        sources = tuple(
+            item.get("src") if isinstance(item, dict) else None for item in toc
+        )
+        expected_sources = tuple(
+            f"chapters/src/{chapter}.md" for chapter in parameters.expected_chapters
+        )
+        if slugs != parameters.expected_chapters or sources != expected_sources:
+            raise ValueError("TOC chapter identities must exactly equal expected_chapters")
+        if any(not view.read_text(path).strip() for path in expected_sources):
+            raise ValueError("every expected source chapter must be non-empty")
+    except (
+        json.JSONDecodeError,
+        OSError,
+        PermissionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        return _semantic_failure(capability, view, "source_split_invalid", str(exc))
+    return _semantic_success(capability, view, bundle)
+
+
+def _translation_trial(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "translation.trial"
+    result = _nonempty_bundle(
+        capability,
+        EmptyInput,
+        "pretranslation_report_missing",
+        view,
+        parameters,
+        bundle,
+    )
+    if not result.passed:
+        return result
+    if not _contains_field_pass(view.read_text("qa/pretranslation/report.md")):
+        return _semantic_failure(
+            capability,
+            view,
+            "pretranslation_not_passed",
+            "Pretranslation report must conclude result: PASS.",
+        )
+    return result
+
+
+def _glossary_prepare(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "glossary.prepare"
+    if invalid := _typed_expected(capability, EmptyInput, view, parameters, bundle):
+        return invalid
+    try:
+        rows = tuple(
+            row
+            for row in view.read_text("glossary/terms.csv").splitlines()
+            if row.strip()
+        )
+        if len(rows) < 2 or not view.read_text("glossary/style_guide.md").strip():
+            raise ValueError("Glossary requires a header, a term row, and a style guide.")
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(capability, view, "glossary_terms_empty", str(exc))
+    return _semantic_success(capability, view, bundle)
+
+
+def _chapter_review(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "chapter.review"
+    if invalid := _typed_expected(
+        capability, ReviewBatchInput, view, parameters, bundle
+    ):
+        return invalid
+    assert isinstance(parameters, ReviewBatchInput)
+    if not parameters.chapters:
+        return _semantic_failure(
+            capability, view, "chapter_review_scope_empty", "Explicit chapters are required."
+        )
+    try:
+        if any(
+            not view.read_bytes(entry.canonical_relpath).strip()
+            for entry in bundle.entries
+        ):
+            raise ValueError("Every review and final chapter must be non-empty.")
+        for chapter in parameters.chapters:
+            if not _contains_field_pass(view.read_text(f"qa/gates/{chapter}.gate.md")):
+                return _semantic_failure(
+                    capability,
+                    view,
+                    "chapter_gate_not_passed",
+                    f"qa/gates/{chapter}.gate.md must conclude result: PASS.",
+                )
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(capability, view, "chapter_final_missing", str(exc))
+    return _semantic_success(capability, view, bundle)
+
+
+def _preproduction_sample(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "preproduction.sample"
+    if invalid := _typed_expected(
+        capability, BuildEpubInput, view, parameters, bundle
+    ):
+        return invalid
+    try:
+        if not view.read_bytes("preproduction/stage2_sample/sample_book.epub"):
+            raise ValueError("Sample EPUB is empty.")
+        if not _contains_field_pass(
+            view.read_text("preproduction/stage2_sample/sample_review.md"),
+            "sample_review_status",
+        ):
+            raise ValueError("sample_review_status must be PASS.")
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(capability, view, "sample_review_not_passed", str(exc))
+    return _semantic_success(capability, view, bundle)
+
+
+def _review_independent(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "review.independent"
+    if invalid := _typed_expected(
+        capability, ReviewBatchInput, view, parameters, bundle
+    ):
+        return invalid
+    for reviewer in ("agent_a", "agent_b"):
+        path = f"reviews/{reviewer}/review.md"
+        try:
+            passed = _contains_field_pass(view.read_text(path))
+        except (OSError, PermissionError, UnicodeError, ValueError):
+            passed = False
+        if not passed:
+            return _semantic_failure(
+                capability,
+                view,
+                "independent_review_not_passed",
+                f"{path} must conclude result: PASS.",
+            )
+    return _semantic_success(capability, view, bundle)
+
+
 def _source_ingest(
     view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
 ) -> GateDecision:
@@ -423,11 +654,32 @@ _VALIDATORS: dict[str, Validator] = {
 _VALIDATORS.update(
     {
         "source.ingest": _source_ingest,
+        "source.split": _source_split,
+        "research.global": lambda view, parameters, bundle: _nonempty_bundle(
+            "research.global", ResearchInput, "global_research_missing", view, parameters, bundle
+        ),
+        "research.book": lambda view, parameters, bundle: _nonempty_bundle(
+            "research.book", ResearchInput, "book_research_missing", view, parameters, bundle
+        ),
+        "translation.trial": _translation_trial,
+        "glossary.prepare": _glossary_prepare,
         "chapter.translate": _chapter_translate,
         "chapter.control": _chapter_control,
+        "chapter.review": _chapter_review,
+        "preproduction.spec": lambda view, parameters, bundle: _nonempty_bundle(
+            "preproduction.spec", EmptyInput, "production_spec_missing", view, parameters, bundle
+        ),
+        "preproduction.sample": _preproduction_sample,
         "epub.build": _epub_build,
         "review.spotcheck": _review_spotcheck,
+        "review.independent": _review_independent,
         "release.prepare": _release_prepare,
+        "output.finalize": lambda view, parameters, bundle: _nonempty_bundle(
+            "output.finalize", EmptyInput, "final_manifest_missing", view, parameters, bundle
+        ),
+        "retrospective.capture": lambda view, parameters, bundle: _nonempty_bundle(
+            "retrospective.capture", EmptyInput, "retrospective_missing", view, parameters, bundle
+        ),
     }
 )
 

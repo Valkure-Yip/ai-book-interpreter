@@ -8,6 +8,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from abi.actions.builtins.inputs import SpotcheckInput
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     ArtifactBundle,
@@ -17,6 +18,7 @@ from abi.types.orchestration import (
     ExpectedArtifact,
     ExpectedArtifactManifest,
     GateArtifactIdentity,
+    GateDecision,
     GateReceiptPayload,
     Indeterminate,
     ProbeResolution,
@@ -196,8 +198,9 @@ def test_repair_required_needs_explicit_class_source_and_reason() -> None:
 def test_outcome_and_gate_receipts_bind_canonical_json_and_digests() -> None:
     """Catch caller-supplied receipt digests or artifact identities drifting from facts."""
     outcome = Succeeded(artifact_bundle=_bundle(), evidence_refs=("translation",))
+    envelope = ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
     outcome_json = json.dumps(
-        outcome.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        envelope.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     )
     bundle_json = canonical_bundle_json(_bundle())
     receipt = AttemptOutcomeReceiptPayload(
@@ -247,3 +250,103 @@ def test_outcome_and_gate_receipts_bind_canonical_json_and_digests() -> None:
         evidence_refs=("translation",),
     )
     assert gate.artifacts[0].canonical_relpath == "chapters/translated/001.md"
+
+
+def test_outcome_receipt_rejects_skeletal_or_outer_fact_drift() -> None:
+    bundle = _bundle()
+    unrelated = ArtifactBundle(
+        action_id="a1",
+        attempt=1,
+        entries=(
+            _entry(
+                canonical="chapters/translated/002.md",
+                staged="state/staging/a1/1/chapters/translated/002.md",
+            ),
+        ),
+    )
+    unrelated_json = canonical_bundle_json(unrelated)
+    skeletal = '{"kind":"succeeded"}'
+    with pytest.raises(ValidationError):
+        AttemptOutcomeReceiptPayload(
+            action_id="a1",
+            attempt=1,
+            canonical_outcome_json=skeletal,
+            outcome_digest=sha256_canonical_json(skeletal),
+            canonical_bundle_json=unrelated_json,
+            bundle_digest=sha256_canonical_json(unrelated_json),
+        )
+
+    envelope = ActionOutcomeEnvelope(
+        action_id="a1",
+        attempt=1,
+        outcome=Succeeded(artifact_bundle=bundle, evidence_refs=("translation",)),
+    )
+    encoded = json.dumps(
+        envelope.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    )
+    with pytest.raises(ValidationError):
+        AttemptOutcomeReceiptPayload(
+            action_id="a1",
+            attempt=1,
+            canonical_outcome_json=encoded,
+            outcome_digest=sha256_canonical_json(encoded),
+            canonical_bundle_json=unrelated_json,
+            bundle_digest=sha256_canonical_json(unrelated_json),
+            evidence_refs=("different",),
+        )
+
+
+def test_gate_receipt_rejects_checksum_evidence_and_staged_namespace_drift() -> None:
+    bundle = _bundle()
+    digest = sha256_canonical_json(canonical_bundle_json(bundle))
+    decision = GateDecision(
+        passed=True,
+        reason_code="evidence_valid",
+        message="valid",
+        validator_id="chapter.translate",
+        validator_version="1",
+        bundle_digest=digest,
+        artifact_checksums=("a" * 64,),
+        evidence_refs=("translation",),
+    )
+    encoded = json.dumps(
+        decision.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    )
+    for checksum, evidence_refs, staged in (
+        ("b" * 64, ("translation",), _entry().staged_relpath),
+        ("a" * 64, ("different",), _entry().staged_relpath),
+        ("a" * 64, ("translation",), "state/staging/a1/2/chapters/translated/001.md"),
+    ):
+        with pytest.raises(ValidationError):
+            GateReceiptPayload(
+                action_id="a1",
+                attempt=1,
+                validator_id="chapter.translate",
+                validator_version="1",
+                canonical_gate_decision_json=encoded,
+                gate_decision_digest=sha256_canonical_json(encoded),
+                bundle_digest=digest,
+                artifacts=(
+                    GateArtifactIdentity(
+                        staged_relpath=staged,
+                        canonical_relpath=_entry().canonical_relpath,
+                        checksum=checksum,
+                    ),
+                ),
+                evidence_refs=evidence_refs,
+            )
+
+
+@pytest.mark.parametrize(
+    "reviewers",
+    (("agent_a",), ("agent_a", "agent_b", "agent_c"), ("reviewer_a", "reviewer_b")),
+)
+def test_spotcheck_requires_exact_two_reviewer_protocol(reviewers: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError):
+        SpotcheckInput(
+            round_id="round_001",
+            reviewers=reviewers,
+            chapters=("001",),
+            samples_per_agent=1,
+            seed=1,
+        )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from abi.types.orchestration import (
     ArtifactBundle,
     ArtifactBundleEntry,
     ArtifactMetadata,
+    ArtifactRef,
     RunSnapshot,
     RunStatus,
     Succeeded,
@@ -251,6 +253,68 @@ def test_staging_evidence_shadows_canonical_and_hides_other_attempts(tmp_path: P
         assert decision.passed is True
         assert decision.bundle_digest == view.bundle_digest
         assert decision.artifact_checksums == view.artifact_checksums
+    finally:
+        store.close()
+
+
+def test_staging_evidence_rejects_symlinked_committed_parent(tmp_path: Path) -> None:
+    project = BookProject(tmp_path)
+    outside = project.root / "outside"
+    outside.mkdir()
+    (outside / "fact.txt").write_text("outside", encoding="utf-8")
+    (project.root / "deps").symlink_to(outside, target_is_directory=True)
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer("a1", 1)
+        writer.write_text("reports/current.txt", "current", evidence_role="report")
+        committed = (
+            ArtifactRef(
+                artifact_id="dep",
+                relpath="deps/fact.txt",
+                sha256=hashlib.sha256(b"outside").hexdigest(),
+                producer_action_id="dep-action",
+            ),
+        )
+        view = StagingEvidenceView.for_bundle(project, committed, writer.artifact_bundle())
+        with pytest.raises(ValueError, match=r"regular|symlink|unsafe"):
+            view.read_bytes("deps/fact.txt")
+    finally:
+        store.close()
+
+
+def test_committed_evidence_hash_and_bytes_come_from_same_open_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = BookProject(tmp_path)
+    committed_path = project.root / "deps/fact.txt"
+    committed_path.parent.mkdir(parents=True)
+    committed_path.write_bytes(b"original")
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer("a1", 1)
+        writer.write_text("reports/current.txt", "current", evidence_role="report")
+        view = StagingEvidenceView.for_bundle(
+            project,
+            (
+                ArtifactRef(
+                    artifact_id="dep",
+                    relpath="deps/fact.txt",
+                    sha256=hashlib.sha256(b"original").hexdigest(),
+                    producer_action_id="dep-action",
+                ),
+            ),
+            writer.artifact_bundle(),
+        )
+
+        def replace_after_hash(path: Path) -> str:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            path.write_bytes(b"replacement")
+            return digest
+
+        monkeypatch.setattr(
+            "abi.actions.evidence.sha256_file", replace_after_hash, raising=False
+        )
+        assert view.read_bytes("deps/fact.txt") == b"original"
     finally:
         store.close()
 

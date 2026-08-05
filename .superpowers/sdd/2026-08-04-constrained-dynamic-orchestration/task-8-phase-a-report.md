@@ -88,3 +88,61 @@ reconciler, scheduler, orchestration-runtime, observability, and the two untrack
 files. `providers/agent_runtime/runner.py` is included because the breaker types require its old
 outcome constructors to be migrated; its existing stable Action identity/checkpoint hunks remain
 in the same file and are documented here as approved by the parent task.
+
+## Review fix round 1/5 — receipt, bundle, and semantic-gate hardening
+
+### RED evidence
+
+- Full receipt parsing/binding and exact spot-check reviewer protocol:
+  `tests/test_orchestration_types.py` produced 5 failures because skeletal outcome/gate facts and
+  non-exact reviewer sets were accepted.
+- Ledger protocol:
+  the five focused tests for receipt-only persistence, separate retry routing, commit bypass,
+  exact replay identity, and receipt-bound finish all failed before implementation. The direct
+  commit path succeeded without receipts/intents; intent replay compared only count; retry denial
+  rolled its receipt back.
+- Pinned evidence reads:
+  the symlinked committed-parent and hash/read TOCTOU tests both failed (`2 failed`).
+- Semantic validators:
+  `.venv/bin/python -m pytest -q tests/test_action_validators.py -k
+  'source_split_validator_exactly or semantic_validators_reject'` produced `11 failed`; generic
+  existence checks accepted empty or incomplete exact bundles.
+- Removed single-file protocol:
+  `.venv/bin/python -m pytest -q tests/test_artifact_promotion.py -k
+  single_file_promotion_apis` produced `1 failed` while the legacy ledger/store APIs remained.
+
+### GREEN implementation and evidence
+
+- `AttemptOutcomeReceiptPayload` now parses canonical `ActionOutcomeEnvelope`; `GateReceiptPayload`
+  parses canonical `GateDecision`. Both bind outer identity and every embedded bundle, evidence,
+  checksum, error, and failure-signature fact.
+- `record_attempt_outcome` is an immutable insert-only handoff. `route_retry_from_receipt` applies
+  the frozen retry policy in a separate transaction, so denied routing cannot erase the receipt.
+- Gate replay compares the complete ordered intent identity. `verify_committed_bundle` binds the
+  receipt, PASS gate, durable manifest, exact outcome bundle, and all `COMMITTED` intents;
+  `commit_success` rejects any missing or divergent prerequisite. The legacy
+  `create_promotion_intent` / `prepare_promotion` single-file APIs were removed.
+- `finish_attempt` requires a typed receipt whose outcome maps exactly to the requested state;
+  indeterminate signatures must match and repair completion requires a repair fact.
+  `record_repair_required` accepts typed `RepairClass` / `RepairSource`, binds all fields to the
+  receipt, and normalizes unknown or divergent sources to
+  `integrity/integrity_guard/repair_class_unknown`, blocking the run.
+- `StagingEvidenceView` pins the project root inode, opens every path component no-follow through
+  directory file descriptors, requires a regular leaf, and derives bytes and checksum from the
+  same open descriptor.
+- Dedicated semantic gates were restored for source splitting, research, trials, glossary,
+  chapter review, preproduction, independent review, finalization, and retrospective evidence.
+  Source TOC slug/src order must exactly equal frozen `expected_chapters`; chapter and independent
+  review manifests now include their gate/reviewer evidence. Spot-check reviewers are exactly
+  `agent_a` and `agent_b`.
+- Focused receipt/evidence tests: `7 passed`; focused ledger suite: `9 passed`; semantic suite:
+  `11 passed`; actual ledger bypass, removed APIs, and repair normalization: `9 passed`.
+- Tasks 1/3/4 plus amended Task 7: `233 passed, 5 warnings`.
+- All tracked/Phase-A tests excluding the two untracked Phase B files:
+  `419 passed, 20 warnings`.
+- Architecture linter: PASS. Full Ruff: PASS. Python 3.12 strict mypy over 26 Phase A source files:
+  PASS. `git diff --check`: PASS.
+
+The deferred Phase B committer and controller tests still call the removed single-file promotion
+surface. Those dirty/untracked files are intentionally excluded from this fix commit and must be
+rewritten to use the gate-receipt plus complete-bundle-intent protocol in Phase B.

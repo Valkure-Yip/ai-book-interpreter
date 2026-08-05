@@ -473,14 +473,17 @@ class AttemptOutcomeReceiptPayload(FrozenModel):
 
     @model_validator(mode="after")
     def _validate_receipt(self) -> Self:
-        raw = _require_canonical_json(self.canonical_outcome_json, label="outcome receipt JSON")
+        _require_canonical_json(self.canonical_outcome_json, label="outcome receipt JSON")
         if sha256_canonical_json(self.canonical_outcome_json) != self.outcome_digest:
             raise ValueError("outcome receipt digest mismatch")
-        if not isinstance(raw, dict):
-            raise ValueError("outcome receipt JSON must be an object")
-        kind = raw.get("kind")
+        envelope = ActionOutcomeEnvelope.model_validate_json(self.canonical_outcome_json)
+        if canonical_model_json(envelope) != self.canonical_outcome_json:
+            raise ValueError("outcome receipt JSON is not canonical")
+        if envelope.action_id != self.action_id or envelope.attempt != self.attempt:
+            raise ValueError("outcome receipt envelope identity mismatch")
+        outcome = envelope.outcome
         has_bundle = self.canonical_bundle_json is not None or self.bundle_digest is not None
-        if kind == "succeeded":
+        if isinstance(outcome, Succeeded):
             if not has_bundle or self.canonical_bundle_json is None or self.bundle_digest is None:
                 raise ValueError("ordinary success receipt requires canonical bundle facts")
             parsed = ArtifactBundle.model_validate_json(self.canonical_bundle_json)
@@ -490,12 +493,19 @@ class AttemptOutcomeReceiptPayload(FrozenModel):
                 raise ValueError("bundle receipt digest mismatch")
             if parsed.action_id != self.action_id or parsed.attempt != self.attempt:
                 raise ValueError("bundle receipt identity mismatch")
+            if parsed != outcome.artifact_bundle:
+                raise ValueError("bundle receipt differs from embedded outcome bundle")
         elif has_bundle:
             raise ValueError("only ordinary success may carry bundle receipt facts")
-        if kind in {"retryable_failure", "permanent_failure", "indeterminate"} and not self.error_code:
-            raise ValueError("failure receipt requires error_code")
-        if kind == "indeterminate" and not self.failure_signature:
-            raise ValueError("indeterminate receipt requires failure_signature")
+        embedded_evidence = tuple(getattr(outcome, "evidence_refs", ()))
+        if self.evidence_refs != embedded_evidence:
+            raise ValueError("outcome receipt evidence refs differ from embedded outcome")
+        embedded_error = getattr(outcome, "error_code", None)
+        if self.error_code != embedded_error:
+            raise ValueError("outcome receipt error code differs from embedded outcome")
+        embedded_signature = getattr(outcome, "failure_signature", None)
+        if self.failure_signature != embedded_signature:
+            raise ValueError("outcome receipt failure signature differs from embedded outcome")
         return self
 
 
@@ -523,20 +533,34 @@ class GateReceiptPayload(FrozenModel):
 
     @model_validator(mode="after")
     def _validate_gate(self) -> Self:
-        raw = _require_canonical_json(
+        _require_canonical_json(
             self.canonical_gate_decision_json, label="gate receipt JSON"
         )
         if sha256_canonical_json(self.canonical_gate_decision_json) != self.gate_decision_digest:
             raise ValueError("gate receipt digest mismatch")
-        if not isinstance(raw, dict) or raw.get("passed") is not True:
+        decision = GateDecision.model_validate_json(self.canonical_gate_decision_json)
+        if canonical_model_json(decision) != self.canonical_gate_decision_json:
+            raise ValueError("gate receipt JSON is not canonical")
+        if decision.passed is not True:
             raise ValueError("gate receipt requires a PASS decision")
-        if raw.get("validator_id") != self.validator_id or raw.get("validator_version") != self.validator_version:
+        if decision.validator_id != self.validator_id or decision.validator_version != self.validator_version:
             raise ValueError("gate validator identity mismatch")
-        if raw.get("bundle_digest") != self.bundle_digest:
+        if decision.bundle_digest != self.bundle_digest:
             raise ValueError("gate bundle digest mismatch")
+        if decision.artifact_checksums != tuple(item.checksum for item in self.artifacts):
+            raise ValueError("gate artifact checksums differ from ordered artifact identities")
+        if decision.evidence_refs != self.evidence_refs:
+            raise ValueError("gate evidence refs differ from the canonical decision")
         ordered = tuple((item.canonical_relpath, item.staged_relpath) for item in self.artifacts)
         if ordered != tuple(sorted(ordered)) or len(ordered) != len(set(ordered)):
             raise ValueError("gate artifact identities must be unique and canonically ordered")
+        prefix = f"state/staging/{self.action_id}/{self.attempt}/"
+        if any(
+            not item.staged_relpath.startswith(prefix)
+            or item.staged_relpath.removeprefix(prefix) != item.canonical_relpath
+            for item in self.artifacts
+        ):
+            raise ValueError("gate staged paths must use the exact attempt namespace")
         return self
 
 

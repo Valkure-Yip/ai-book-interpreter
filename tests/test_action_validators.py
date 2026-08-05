@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from abi.actions.builtins.catalog import build_action_registry
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
     ChapterBatchInput,
     EmptyInput,
     ReleaseInput,
+    ResearchInput,
+    ReviewBatchInput,
+    SourceSplitInput,
     SpotcheckInput,
 )
 from abi.actions.effects import expand_expected_artifacts
@@ -179,6 +184,63 @@ def test_validator_rejects_the_wrong_typed_parameters(tmp_path: Path) -> None:
 
     assert result.passed is False
     assert result.reason_code == "invalid_validator_parameters"
+
+
+def test_source_split_validator_exactly_matches_frozen_toc_and_nonempty_chapters(
+    tmp_path: Path,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    parameters = SourceSplitInput(expected_chapters=("001",), refine_toc=False)
+    (project.chapters_src / "001.md").write_text("", encoding="utf-8")
+    project.toc_json.parent.mkdir(parents=True, exist_ok=True)
+    project.toc_json.write_text("[]", encoding="utf-8")
+    view, bundle = _validator_input(project, "source.split", parameters, action_id="split")
+
+    result = validate_evidence("source.split", view, parameters, bundle)
+
+    assert result.passed is False
+    assert result.reason_code == "source_split_invalid"
+
+
+@pytest.mark.parametrize(
+    ("capability", "parameters"),
+    (
+        ("research.global", ResearchInput()),
+        ("research.book", ResearchInput()),
+        ("translation.trial", EmptyInput()),
+        ("glossary.prepare", EmptyInput()),
+        ("chapter.review", ReviewBatchInput(chapters=("001",))),
+        ("preproduction.spec", EmptyInput()),
+        ("preproduction.sample", BuildEpubInput()),
+        ("review.independent", ReviewBatchInput()),
+        ("output.finalize", EmptyInput()),
+        ("retrospective.capture", EmptyInput()),
+    ),
+)
+def test_semantic_validators_reject_empty_or_incomplete_exact_bundles(
+    tmp_path: Path, capability: str, parameters: object
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    manifest = expand_expected_artifacts(capability, "semantic-empty", parameters)  # type: ignore[arg-type]
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer("semantic-empty", 1)
+        for expected in manifest.entries:
+            writer.write_bytes(
+                expected.canonical_relpath,
+                b"",
+                media_type=expected.media_type,
+                evidence_role=expected.evidence_role,
+                metadata=expected.metadata,
+            )
+        bundle = writer.artifact_bundle()
+        view = StagingEvidenceView.for_bundle(project, (), bundle)
+        result = validate_evidence(capability, view, parameters, bundle)  # type: ignore[arg-type]
+    finally:
+        store.close()
+
+    assert result.passed is False
+    assert result.reason_code != "evidence_valid"
 
 
 def test_epub_validator_accepts_existing_gate_report_shape(tmp_path: Path) -> None:

@@ -14,8 +14,14 @@ from weakref import finalize
 
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.layout import BookProject
-from abi.project.run_ledger import LedgerTransitionError, PromotionIntent, RunLedger
+from abi.project.run_ledger import (
+    LedgerError,
+    LedgerTransitionError,
+    PromotionIntent,
+    RunLedger,
+)
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ArtifactBundle,
     ArtifactBundleEntry,
     ArtifactMetadata,
@@ -326,32 +332,6 @@ class ArtifactStore:
             os.close(parent_fd)
         return self.staging_dir(action_id, attempt) / Path(*parts)
 
-    async def prepare_promotion(
-        self,
-        *,
-        action_id: str,
-        attempt: int,
-        staged_relpath: str,
-        canonical_relpath: str,
-        media_type: str,
-    ) -> PromotionIntent:
-        """Persist a normalized, checksum-bearing intent before canonical mutation."""
-        _require_secure_dirfd_support()
-        canonical_parts = self._canonical_parts(canonical_relpath)
-        self._assert_root_anchor()
-        staged_parts = self._staged_file_parts(action_id, attempt, staged_relpath)
-        checksum = self._staged_checksum(action_id, attempt, staged_parts)
-        if checksum is None:
-            raise FileNotFoundError(f"staged artifact {staged_relpath} does not exist")
-        return await self._require_ledger().create_promotion_intent(
-            action_id=action_id,
-            attempt=attempt,
-            staged_relpath=self._normalized_staged_relpath(action_id, attempt, staged_parts),
-            canonical_relpath="/".join(canonical_parts),
-            checksum=checksum,
-            media_type=media_type,
-        )
-
     async def promote(
         self, intent: PromotionIntent, *, crash_after: str | None = None
     ) -> PromotionIntent:
@@ -387,19 +367,16 @@ class ArtifactStore:
         self, action_id: str, attempt: int
     ) -> tuple[PromotionIntent, ...]:
         """Reopen and verify every canonical intent as one success prerequisite."""
-        intents = tuple(
-            item
-            for item in await self._require_ledger().promotion_intents()
-            if item.action_id == action_id and item.attempt == attempt
-        )
-        if not intents or any(item.status != "COMMITTED" for item in intents):
+        try:
+            intents = await self._require_ledger().verify_committed_bundle(action_id, attempt)
+        except LedgerError as exc:
             await self._require_ledger().mark_bundle_conflict(
                 action_id,
                 attempt,
                 reason_code="partial_intent_set",
                 message="Every bundle intent must be COMMITTED before unified postcheck.",
             )
-            raise ArtifactConflictError("bundle has pending or conflicting intents")
+            raise ArtifactConflictError("bundle has pending or conflicting intents") from exc
         for intent in intents:
             try:
                 canonical = self._durable_root / canonical_artifact_key(intent.canonical_relpath)
@@ -466,7 +443,11 @@ class ArtifactStore:
             artifact_bundle=bundle,
             evidence_refs=attempt_record.expected_evidence_refs,
         )
-        outcome_json = canonical_model_json(outcome)
+        outcome_json = canonical_model_json(
+            ActionOutcomeEnvelope(
+                action_id=action_id, attempt=attempt, outcome=outcome
+            )
+        )
         bundle_json = canonical_bundle_json(bundle)
         payload = AttemptOutcomeReceiptPayload(
             action_id=action_id,

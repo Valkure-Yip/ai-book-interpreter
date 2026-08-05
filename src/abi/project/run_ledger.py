@@ -18,6 +18,7 @@ from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.ledger_schema import SCHEMA_SQL
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ActionStatus,
     ActionView,
     ArtifactMetadata,
@@ -29,11 +30,19 @@ from abi.types.orchestration import (
     GateEvidence,
     GateReceiptPayload,
     IncidentView,
+    Indeterminate,
+    Paused,
+    PermanentFailure,
     PlanPatch,
     PlanRejectionView,
+    RepairClass,
+    RepairRequired,
+    RepairSource,
+    RetryableFailure,
     RetryPolicySpec,
     RunSnapshot,
     RunStatus,
+    Succeeded,
     canonical_manifest_json,
     canonical_model_json,
 )
@@ -530,7 +539,7 @@ class RunLedger:
         """Persist the immutable executor handoff before any controller hook."""
         now = self._now()
         async with self.transaction() as db:
-            action = await self._require_action(db, payload.action_id)
+            await self._require_action(db, payload.action_id)
             attempt = await self._attempt_row(db, payload.action_id, payload.attempt)
             if _action_status(attempt["status"], "action_attempts.status") is not ActionStatus.RUNNING:
                 cursor = await db.execute(
@@ -599,38 +608,64 @@ class RunLedger:
                     now,
                 ),
             )
-            outcome = json.loads(payload.canonical_outcome_json)
-            if outcome.get("kind") == "retryable_failure":
-                policy = RetryPolicySpec.model_validate_json(attempt["retry_policy_json"])
-                error_code = payload.error_code or ""
-                if error_code not in policy.retryable_codes or payload.attempt >= policy.max_attempts:
-                    raise LedgerTransitionError(
-                        f"{error_code} is not eligible for another attempt under the frozen retry policy"
-                    )
-                await db.execute(
-                    "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
-                    (ActionStatus.RETRY_WAIT.value, now, payload.action_id, payload.attempt),
+        return await self.get_attempt_outcome(payload.action_id, payload.attempt)
+
+    async def route_retry_from_receipt(
+        self, action_id: str, *, attempt: int
+    ) -> ActionAttemptRecord:
+        """Apply frozen retry policy only after its immutable outcome receipt exists."""
+        now = self._now()
+        async with self.transaction() as db:
+            action = await self._require_action(db, action_id)
+            attempt_row = await self._attempt_row(db, action_id, attempt)
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (action_id, attempt),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerTransitionError("retry routing requires a durable outcome receipt")
+            envelope = ActionOutcomeEnvelope.model_validate_json(row["canonical_outcome_json"])
+            if not isinstance(envelope.outcome, RetryableFailure):
+                raise LedgerTransitionError("only a retryable-failure receipt can enter RETRY_WAIT")
+            policy = RetryPolicySpec.model_validate_json(attempt_row["retry_policy_json"])
+            if (
+                envelope.outcome.error_code not in policy.retryable_codes
+                or attempt >= policy.max_attempts
+            ):
+                raise LedgerTransitionError(
+                    f"{envelope.outcome.error_code} is not eligible for another attempt under the frozen retry policy"
                 )
-                await db.execute(
-                    "UPDATE actions SET status = ? WHERE action_id = ?",
-                    (ActionStatus.RETRY_WAIT.value, payload.action_id),
-                )
+            current = _action_status(attempt_row["status"], "action_attempts.status")
+            if current is ActionStatus.RETRY_WAIT:
+                return self._attempt_from_row(attempt_row)
+            if current is not ActionStatus.RUNNING:
+                raise LedgerTransitionError("retry routing requires a RUNNING attempt")
+            await db.execute(
+                "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
+                (ActionStatus.RETRY_WAIT.value, now, action_id, attempt),
+            )
+            await db.execute(
+                "UPDATE actions SET status = ? WHERE action_id = ?",
+                (ActionStatus.RETRY_WAIT.value, action_id),
+            )
             await self._insert_outbox(
                 db,
                 run_id=action["run_id"],
                 event_name="action.outcome",
-                aggregate_id=payload.action_id,
+                aggregate_id=action_id,
                 payload_json=json.dumps(
                     {
-                        "action_id": payload.action_id,
-                        "attempt": payload.attempt,
-                        "classification": outcome.get("kind"),
-                    }
+                        "action_id": action_id,
+                        "attempt": attempt,
+                        "classification": envelope.outcome.kind,
+                    },
+                    sort_keys=True,
                 ),
-                idempotency_key=f"action.outcome:{payload.action_id}:{payload.attempt}",
+                idempotency_key=f"action.outcome:{action_id}:{attempt}",
                 now=now,
             )
-        return await self.get_attempt_outcome(payload.action_id, payload.attempt)
+        return await self.get_attempt(action_id, attempt)
 
     async def get_attempt_outcome(
         self, action_id: str, attempt: int
@@ -713,7 +748,10 @@ class RunLedger:
                 if prior is not None:
                     record = self._gate_receipt_from_row(prior)
                     intents = await self._intent_rows_for_attempt(db, payload.action_id, payload.attempt)
-                    if record.model_dump(exclude={"recorded_at"}) != payload.model_dump() or len(intents) != len(payload.artifacts):
+                    if (
+                        record.model_dump(exclude={"recorded_at"}) != payload.model_dump()
+                        or not _intent_rows_match_payload(intents, payload, attempt)
+                    ):
                         await self._mark_bundle_conflict_tx(
                             db, action, attempt, "partial_intent_set", "gate/intents replay conflicts"
                         )
@@ -722,9 +760,25 @@ class RunLedger:
                 expected = ExpectedArtifactManifest.model_validate_json(attempt["expected_manifest_json"])
                 if len(expected.entries) != len(payload.artifacts):
                     raise LedgerConflictError("gate artifact count does not equal durable manifest")
-                for identity, artifact in zip(payload.artifacts, expected.entries, strict=True):
-                    if identity.canonical_relpath != artifact.canonical_relpath:
-                        raise LedgerConflictError("gate artifact order/identity differs from manifest")
+                receipt = self._outcome_receipt_from_row(outcome)
+                envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
+                if not hasattr(envelope.outcome, "artifact_bundle"):
+                    raise LedgerConflictError("gate receipt requires a successful outcome bundle")
+                bundle = envelope.outcome.artifact_bundle
+                if len(bundle.entries) != len(expected.entries):
+                    raise LedgerConflictError("outcome bundle does not equal the durable manifest")
+                for identity, bundle_entry, artifact in zip(
+                    payload.artifacts, bundle.entries, expected.entries, strict=True
+                ):
+                    if (
+                        identity.staged_relpath != bundle_entry.staged_relpath
+                        or identity.canonical_relpath != bundle_entry.canonical_relpath
+                        or bundle_entry.canonical_relpath != artifact.canonical_relpath
+                        or bundle_entry.media_type != artifact.media_type
+                        or bundle_entry.evidence_role != artifact.evidence_role
+                        or bundle_entry.metadata != artifact.metadata
+                    ):
+                        raise LedgerConflictError("gate artifact order/identity differs from outcome and manifest")
                 await db.execute(
                 "INSERT INTO gate_receipts (action_id, attempt, validator_id, validator_version, "
                 "canonical_gate_decision_json, gate_decision_digest, bundle_digest, artifacts_json, "
@@ -798,8 +852,8 @@ class RunLedger:
         *,
         action_id: str,
         attempt: int,
-        repair_class: str,
-        repair_source: str,
+        repair_class: RepairClass,
+        repair_source: RepairSource,
         reason_code: str,
         defect_codes: tuple[str, ...],
         evidence_refs: tuple[str, ...],
@@ -808,13 +862,6 @@ class RunLedger:
     ) -> RepairFactRecord:
         """Record one receipt-bound semantic repair or integrity block transaction."""
         now = self._now()
-        effective_class = (
-            "semantic"
-            if repair_class == "semantic" and semantic_reason_mapped and repair_source in {"action_outcome", "validator"}
-            else "integrity"
-        )
-        effective_source = repair_source if effective_class == repair_class else "integrity_guard"
-        effective_reason = reason_code if effective_class == repair_class else "repair_class_unknown"
         async with self.transaction() as db:
             action = await self._require_action(db, action_id)
             await self._attempt_row(db, action_id, attempt)
@@ -825,6 +872,37 @@ class RunLedger:
             receipt = await cursor.fetchone()
             if receipt is None:
                 raise LedgerTransitionError("repair fact requires the durable outcome receipt")
+            envelope = ActionOutcomeEnvelope.model_validate_json(
+                receipt["canonical_outcome_json"]
+            )
+            outcome = envelope.outcome
+            exact_receipt_fact = (
+                isinstance(outcome, RepairRequired)
+                and repair_class == outcome.repair_class
+                and repair_source == outcome.repair_source
+                and reason_code == outcome.reason_code
+                and defect_codes == outcome.defect_codes
+                and message == outcome.message
+            )
+            valid_semantic = (
+                exact_receipt_fact
+                and repair_class == "semantic"
+                and semantic_reason_mapped
+                and repair_source in {"action_outcome", "validator"}
+            )
+            valid_integrity = (
+                exact_receipt_fact
+                and repair_class == "integrity"
+                and repair_source == "integrity_guard"
+            )
+            if valid_semantic or valid_integrity:
+                effective_class: RepairClass = repair_class
+                effective_source: RepairSource = repair_source
+                effective_reason = reason_code
+            else:
+                effective_class = "integrity"
+                effective_source = "integrity_guard"
+                effective_reason = "repair_class_unknown"
             cursor = await db.execute(
                 "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
             )
@@ -926,6 +1004,33 @@ class RunLedger:
                 raise LedgerTransitionError(
                     f"attempt {attempt} for {action_id} is already finished; record a new retry attempt instead"
                 )
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (action_id, attempt),
+            )
+            receipt = await cursor.fetchone()
+            if receipt is None:
+                raise LedgerTransitionError("finish attempt requires its durable outcome receipt")
+            envelope = ActionOutcomeEnvelope.model_validate_json(receipt["canonical_outcome_json"])
+            expected_status = _finish_status_for_outcome(envelope.outcome)
+            if status is not expected_status:
+                raise LedgerTransitionError(
+                    f"{envelope.outcome.kind} receipt cannot finish as {status.value}"
+                )
+            if status is ActionStatus.REPAIR_REQUIRED:
+                cursor = await db.execute(
+                    "SELECT 1 FROM repair_facts WHERE action_id = ? AND attempt = ?",
+                    (action_id, attempt),
+                )
+                if await cursor.fetchone() is None:
+                    raise LedgerTransitionError("repair-required finish requires its durable repair fact")
+            if (
+                isinstance(envelope.outcome, Indeterminate)
+                and failure_signature != envelope.outcome.failure_signature
+            ):
+                raise LedgerTransitionError(
+                    "indeterminate finish must preserve the receipt failure signature"
+                )
             await db.execute(
                 "UPDATE action_attempts SET status = ?, failure_signature = ?, finished_at = ? "
                 "WHERE action_id = ? AND attempt = ?",
@@ -989,6 +1094,7 @@ class RunLedger:
                         raise LedgerTransitionError(
                             f"attempt {commit.attempt} for {commit.action_id} is already finished; do not commit it again"
                         )
+                    await self._verify_committed_bundle_tx(db, commit)
                     await db.execute(
                         "UPDATE actions SET status = ?, committed_at = ?, commit_signature = ? WHERE action_id = ?",
                         (ActionStatus.SUCCEEDED.value, now, signature, commit.action_id),
@@ -1100,6 +1206,102 @@ class RunLedger:
             )
         return await self._committed_action(self._db, commit.action_id)
 
+    async def verify_committed_bundle(
+        self, action_id: str, attempt: int
+    ) -> tuple[PromotionIntent, ...]:
+        """Verify the full receipt/gate/manifest/intent identity set is committed."""
+        async with self.transaction() as db:
+            rows = await self._verified_intent_rows_tx(db, action_id, attempt)
+        return tuple(self._promotion_intent_from_row(row) for row in rows)
+
+    async def _verify_committed_bundle_tx(
+        self, db: aiosqlite.Connection, commit: SuccessCommit
+    ) -> None:
+        rows = await self._verified_intent_rows_tx(db, commit.action_id, commit.attempt)
+        intents = tuple(self._promotion_intent_from_row(row) for row in rows)
+        expected_artifacts = tuple(
+            (
+                intent.canonical_relpath,
+                intent.checksum,
+                intent.media_type,
+            )
+            for intent in intents
+        )
+        actual_artifacts = tuple(
+            (artifact.relpath, artifact.sha256, artifact.media_type)
+            for artifact in commit.artifacts
+        )
+        if actual_artifacts != expected_artifacts or any(
+            artifact.producer_action_id != commit.action_id for artifact in commit.artifacts
+        ):
+            raise LedgerTransitionError(
+                "success commit artifacts do not equal the complete committed intent set"
+            )
+        cursor = await db.execute(
+            "SELECT * FROM gate_receipts WHERE action_id = ? AND attempt = ?",
+            (commit.action_id, commit.attempt),
+        )
+        gate_row = await cursor.fetchone()
+        assert gate_row is not None
+        gate = self._gate_receipt_from_row(gate_row)
+        if len(commit.gate_evidence) != 1:
+            raise LedgerTransitionError("success commit requires exactly its durable gate receipt")
+        evidence = commit.gate_evidence[0]
+        if (
+            not evidence.passed
+            or evidence.gate != gate.validator_id
+            or evidence.validator_version != gate.validator_version
+            or evidence.artifact_checksums != tuple(item.checksum for item in gate.artifacts)
+        ):
+            raise LedgerTransitionError(
+                "success commit gate evidence does not equal the durable PASS receipt"
+            )
+
+    async def _verified_intent_rows_tx(
+        self, db: aiosqlite.Connection, action_id: str, attempt: int
+    ) -> list[aiosqlite.Row]:
+        attempt_row = await self._attempt_row(db, action_id, attempt)
+        cursor = await db.execute(
+            "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        outcome_row = await cursor.fetchone()
+        if outcome_row is None:
+            raise LedgerTransitionError("success requires its durable outcome receipt")
+        outcome_receipt = self._outcome_receipt_from_row(outcome_row)
+        envelope = ActionOutcomeEnvelope.model_validate_json(
+            outcome_receipt.canonical_outcome_json
+        )
+        if not isinstance(envelope.outcome, Succeeded):
+            raise LedgerTransitionError("success requires a succeeded outcome receipt")
+        cursor = await db.execute(
+            "SELECT * FROM gate_receipts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        gate_row = await cursor.fetchone()
+        if gate_row is None:
+            raise LedgerTransitionError("success requires its durable gate receipt")
+        gate = self._gate_receipt_from_row(gate_row)
+        rows = await self._intent_rows_for_attempt(db, action_id, attempt)
+        if not _intent_rows_match_payload(rows, gate, attempt_row):
+            raise LedgerConflictError(
+                "promotion intent set conflicts with receipt, outcome bundle, or durable manifest"
+            )
+        if any(_promotion_status(row["status"], row["intent_id"]) != "COMMITTED" for row in rows):
+            raise LedgerTransitionError(
+                "all exact bundle intents must be COMMITTED before success"
+            )
+        bundle = envelope.outcome.artifact_bundle
+        if gate.bundle_digest != outcome_receipt.bundle_digest or tuple(
+            (entry.staged_relpath, entry.canonical_relpath)
+            for entry in bundle.entries
+        ) != tuple(
+            (identity.staged_relpath, identity.canonical_relpath)
+            for identity in gate.artifacts
+        ):
+            raise LedgerConflictError("gate intent set is not bound to the outcome bundle")
+        return rows
+
     async def record_incident(
         self, run_id: str, *, error_code: str, message: str, action_id: str | None = None
     ) -> IncidentRecord:
@@ -1115,93 +1317,6 @@ class RunLedger:
             return await self._insert_incident(
                 db, run_id=run_id, error_code=error_code, message=message, action_id=action_id, now=now
             )
-
-    async def create_promotion_intent(
-        self,
-        *,
-        action_id: str,
-        attempt: int,
-        staged_relpath: str,
-        canonical_relpath: str,
-        checksum: str,
-        media_type: str,
-    ) -> PromotionIntent:
-        """Record an immutable pending promotion before changing the filesystem."""
-        canonical_key = canonical_artifact_key(canonical_relpath)
-        now = self._now()
-        canonical_conflict = False
-        async with self.transaction() as db:
-            action = await self._require_action(db, action_id)
-            await self._attempt_row(db, action_id, attempt)
-            cursor = await db.execute(
-                "SELECT * FROM promotion_intents WHERE action_id = ? AND attempt = ? "
-                "AND staged_relpath = ? AND canonical_relpath = ?",
-                (action_id, attempt, staged_relpath, canonical_key),
-            )
-            existing = await cursor.fetchone()
-            if existing is not None:
-                if existing["checksum"] != checksum or existing["media_type"] != media_type:
-                    raise LedgerConflictError(
-                        f"promotion for {canonical_key} disagrees with its recorded checksum; "
-                        "inspect and choose the canonical artifact before retrying"
-                    )
-                return self._promotion_intent_from_row(existing)
-            cursor = await db.execute(
-                "SELECT intent_id FROM promotion_intents WHERE canonical_relpath = ?",
-                (canonical_key,),
-            )
-            canonical_intent = await cursor.fetchone()
-            if canonical_intent is not None:
-                await self._insert_incident(
-                    db,
-                    run_id=action["run_id"],
-                    error_code="artifact_checksum_conflict",
-                    message=(
-                        f"canonical artifact {canonical_key} already has promotion intent "
-                        f"{canonical_intent['intent_id']}; inspect and choose the canonical artifact"
-                    ),
-                    action_id=action_id,
-                    now=now,
-                )
-                canonical_conflict = True
-            else:
-                intent_id = str(uuid4())
-                await db.execute(
-                    "INSERT INTO promotion_intents (intent_id, action_id, attempt, staged_relpath, "
-                    "canonical_relpath, checksum, media_type, status, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        intent_id,
-                        action_id,
-                        attempt,
-                        staged_relpath,
-                        canonical_key,
-                        checksum,
-                        media_type,
-                        "PENDING",
-                        now,
-                    ),
-                )
-        if canonical_conflict:
-            raise LedgerConflictError(
-                f"canonical artifact {canonical_key} already has a promotion intent; "
-                "inspect and choose the canonical artifact"
-            )
-        return PromotionIntent(
-            intent_id=intent_id,
-            action_id=action_id,
-            attempt=attempt,
-            staged_relpath=staged_relpath,
-            canonical_relpath=canonical_key,
-            checksum=checksum,
-            media_type=media_type,
-            evidence_role="legacy_promotion",
-            metadata_json="[]",
-            ordinal=0,
-            bundle_digest=checksum,
-            status="PENDING",
-            created_at=_parse_time(now),
-        )
 
     async def get_promotion_intent(self, intent_id: str) -> PromotionIntent:
         """Load one typed promotion intent."""
@@ -2179,6 +2294,49 @@ def _promotion_status(value: str, intent_id: str) -> PromotionStatus:
             "repair the ledger before reconciling artifacts"
         )
     return cast(PromotionStatus, value)
+
+
+def _intent_rows_match_payload(
+    rows: Sequence[aiosqlite.Row],
+    payload: GateReceiptPayload,
+    attempt_row: aiosqlite.Row,
+) -> bool:
+    expected = ExpectedArtifactManifest.model_validate_json(attempt_row["expected_manifest_json"])
+    if len(rows) != len(payload.artifacts) or len(rows) != len(expected.entries):
+        return False
+    for ordinal, (row, identity, artifact) in enumerate(
+        zip(rows, payload.artifacts, expected.entries, strict=True)
+    ):
+        if (
+            row["action_id"] != payload.action_id
+            or int(row["attempt"]) != payload.attempt
+            or row["staged_relpath"] != identity.staged_relpath
+            or row["canonical_relpath"] != identity.canonical_relpath
+            or row["checksum"] != identity.checksum
+            or row["media_type"] != artifact.media_type
+            or row["evidence_role"] != artifact.evidence_role
+            or row["metadata_json"] != canonical_model_json(
+                _MetadataList(items=artifact.metadata)
+            )
+            or int(row["ordinal"]) != ordinal
+            or row["bundle_digest"] != payload.bundle_digest
+        ):
+            return False
+    return True
+
+
+def _finish_status_for_outcome(outcome: object) -> ActionStatus:
+    if isinstance(outcome, RetryableFailure):
+        return ActionStatus.RETRY_WAIT
+    if isinstance(outcome, RepairRequired):
+        return ActionStatus.REPAIR_REQUIRED
+    if isinstance(outcome, PermanentFailure):
+        return ActionStatus.PERMANENT_FAILED
+    if isinstance(outcome, Indeterminate):
+        return ActionStatus.INDETERMINATE
+    if isinstance(outcome, Paused):
+        return ActionStatus.PAUSED
+    raise LedgerTransitionError("outcome receipt must use its dedicated success or probe route")
 
 
 def _parse_time(value: str) -> datetime:

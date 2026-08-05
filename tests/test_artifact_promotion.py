@@ -25,6 +25,7 @@ from abi.project.artifacts import (
 from abi.project.layout import BookProject
 from abi.project.run_ledger import LedgerConflictError, LedgerError, RunLedger, RunSeed
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ArtifactBundle,
     ArtifactBundleEntry,
     AttemptOutcomeReceiptPayload,
@@ -114,7 +115,11 @@ async def _persist_bundle_protocol(
     bundle: ArtifactBundle,
 ) -> PromotionIntent:
     outcome = Succeeded(artifact_bundle=bundle, evidence_refs=("translation",))
-    outcome_json = canonical_model_json(outcome)
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(
+            action_id=bundle.action_id, attempt=bundle.attempt, outcome=outcome
+        )
+    )
     bundle_json = canonical_bundle_json(bundle)
     await ledger.record_attempt_outcome(
         AttemptOutcomeReceiptPayload(
@@ -770,24 +775,28 @@ async def test_direct_ledger_intent_bypass_never_promotes_source_file(tmp_path: 
         source = tmp_path / "source.md"
         source.write_text("source", encoding="utf-8")
         before = await ledger.promotion_intents()
+        receipt, _ = await ledger.get_gate_receipt_and_intents("translate-001", 1)
+        unsafe_identity = GateArtifactIdentity.model_construct(
+            staged_relpath="source.md",
+            canonical_relpath=receipt.artifacts[0].canonical_relpath,
+            checksum=receipt.artifacts[0].checksum,
+        )
+        unsafe_receipt = GateReceiptPayload.model_construct(
+            **receipt.model_dump(exclude={"recorded_at", "artifacts"}),
+            artifacts=(unsafe_identity,),
+        )
 
-        with pytest.raises(ValueError, match="exact action/attempt namespace"):
-            ArtifactBundle(
-                action_id="translate-001",
-                attempt=1,
-                entries=(
-                    ArtifactBundleEntry(
-                        staged_relpath="source.md",
-                        canonical_relpath="chapters/final/source.md",
-                        media_type="text/markdown",
-                        evidence_role="translation",
-                    ),
-                ),
-            )
+        with pytest.raises(LedgerConflictError, match=r"intent|conflict"):
+            await ledger.create_gate_receipt_and_bundle_intents(unsafe_receipt)
 
         assert source.read_text(encoding="utf-8") == "source"
         assert not (tmp_path / "chapters/final/source.md").exists()
         assert await ledger.promotion_intents() == before
+
+
+def test_single_file_promotion_apis_are_not_public_protocols() -> None:
+    assert not hasattr(RunLedger, "create_promotion_intent")
+    assert not hasattr(ArtifactStore, "prepare_promotion")
 
 
 @pytest.mark.asyncio

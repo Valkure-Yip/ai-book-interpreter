@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from abi.project.run_ledger import (
     SuccessCommit,
 )
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ActionStatus,
     ArtifactBundle,
     ArtifactBundleEntry,
@@ -29,6 +31,7 @@ from abi.types.orchestration import (
     GateDecision,
     GateEvidence,
     GateReceiptPayload,
+    Indeterminate,
     PlanPatch,
     ProposedAction,
     RetryPolicySpec,
@@ -128,7 +131,9 @@ async def _record_gate_intent(
         ),
     )
     outcome = Succeeded(artifact_bundle=bundle, evidence_refs=("source_manifest",))
-    outcome_json = canonical_model_json(outcome)
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=outcome)
+    )
     bundle_json = canonical_bundle_json(bundle)
     bundle_digest = sha256_canonical_json(bundle_json)
     await ledger.record_attempt_outcome(
@@ -182,6 +187,11 @@ def _success_commit(
     cost_usd: float = 0.25,
     evidence: GateEvidence | None = None,
 ) -> SuccessCommit:
+    checksum = (
+        checksum
+        if len(checksum) == 64 and all(character in "0123456789abcdef" for character in checksum)
+        else hashlib.sha256(checksum.encode()).hexdigest()
+    )
     return SuccessCommit(
         action_id=action_id,
         attempt=1,
@@ -198,7 +208,7 @@ def _success_commit(
             evidence
             or GateEvidence(
                 evidence_id=f"gate-{action_id}",
-                gate="source_manifest",
+                gate="source.ingest",
                 passed=True,
                 validator_version="1",
                 artifact_checksums=(checksum,),
@@ -208,14 +218,31 @@ def _success_commit(
     )
 
 
+async def _prepare_success_facts(
+    ledger: RunLedger, commit: SuccessCommit
+) -> None:
+    if len(commit.artifacts) != 1:
+        raise AssertionError("test helper requires one exact artifact")
+    artifact = commit.artifacts[0]
+    intent = await _record_gate_intent(
+        ledger,
+        action_id=commit.action_id,
+        canonical_relpath=artifact.relpath,
+        checksum=artifact.sha256,
+    )
+    await ledger.commit_promotion_intent(intent.intent_id)
+
+
 @pytest.mark.asyncio
 async def test_commit_success_is_exactly_once(tmp_path: Path) -> None:
     """Catch duplicate durable commits that create duplicate facts or events."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
+        commit = _success_commit("a1", checksum="abc")
+        await _prepare_success_facts(ledger, commit)
 
-        first = await ledger.commit_success(_success_commit("a1", checksum="abc"))
-        second = await ledger.commit_success(_success_commit("a1", checksum="abc"))
+        first = await ledger.commit_success(commit)
+        second = await ledger.commit_success(commit)
 
         assert first == second
         assert first.artifacts[0].media_type == "application/json"
@@ -497,7 +524,9 @@ async def test_different_success_checksum_creates_conflict_incident(tmp_path: Pa
     """Catch an action replay that overwrites a previously committed artifact."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
-        await ledger.commit_success(_success_commit("a1", checksum="abc"))
+        commit = _success_commit("a1", checksum="abc")
+        await _prepare_success_facts(ledger, commit)
+        await ledger.commit_success(commit)
 
         with pytest.raises(LedgerConflictError, match="inspect the canonical artifact"):
             await ledger.commit_success(_success_commit("a1", checksum="different"))
@@ -579,7 +608,9 @@ async def test_replay_with_different_cost_creates_conflict_incident(tmp_path: Pa
     """Catch replays that alter a committed fact while retaining artifact checksums."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
-        await ledger.commit_success(_success_commit("a1", "abc", cost_usd=0.25))
+        commit = _success_commit("a1", "abc", cost_usd=0.25)
+        await _prepare_success_facts(ledger, commit)
+        await ledger.commit_success(commit)
 
         with pytest.raises(LedgerConflictError, match="inspect the canonical artifact"):
             await ledger.commit_success(_success_commit("a1", "abc", cost_usd=0.5))
@@ -646,6 +677,7 @@ async def test_replay_difference_creates_conflict_incident(
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
         commit = _success_commit("a1", "abc")
+        await _prepare_success_facts(ledger, commit)
         await ledger.commit_success(commit)
 
         with pytest.raises(LedgerConflictError, match="inspect the canonical artifact"):
@@ -665,7 +697,9 @@ async def test_canonical_artifact_collision_rolls_back_mid_transaction(tmp_path:
         await _seed_authorized_action(ledger)
         await ledger.authorize_actions("run-1", (_action("a2"),))
         await ledger.start_attempt("a2")
-        await ledger.commit_success(_success_commit("a1", "abc"))
+        first = _success_commit("a1", "abc")
+        await _prepare_success_facts(ledger, first)
+        await ledger.commit_success(first)
         second = _success_commit("a2", "different").model_copy(
             update={
                 "artifacts": (
@@ -689,7 +723,7 @@ async def test_canonical_artifact_collision_rolls_back_mid_transaction(tmp_path:
             }
         )
 
-        with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
+        with pytest.raises(LedgerTransitionError, match="outcome receipt"):
             await ledger.commit_success(second)
 
         snapshot = await ledger.load_snapshot("run-1")
@@ -711,6 +745,7 @@ async def test_concurrent_identical_commits_serialize_without_duplicate_facts(tm
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
         commit = _success_commit("a1", "abc")
+        await _prepare_success_facts(ledger, commit)
 
         first, second = await asyncio.gather(
             ledger.commit_success(commit), ledger.commit_success(commit)
@@ -956,15 +991,38 @@ async def test_attempt_outcomes_follow_legal_action_transitions(tmp_path: Path) 
     """Catch finishing an unauthorized action or skipping the running attempt state."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_authorized_action(ledger)
-
-        finished = await ledger.finish_attempt(
-            "a1", attempt=1, status=ActionStatus.PERMANENT_FAILED, failure_signature="terms"
+        signature = "a" * 64
+        outcome = Indeterminate(
+            operation_key="action:a1:attempt:1",
+            error_code="provider_unknown",
+            failure_signature=signature,
+            message="probe before retry",
+        )
+        encoded = canonical_model_json(
+            ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id="a1",
+                attempt=1,
+                canonical_outcome_json=encoded,
+                outcome_digest=sha256_canonical_json(encoded),
+                error_code="provider_unknown",
+                failure_signature=signature,
+            )
         )
 
-        assert finished.status is ActionStatus.PERMANENT_FAILED
+        finished = await ledger.finish_attempt(
+            "a1",
+            attempt=1,
+            status=ActionStatus.INDETERMINATE,
+            failure_signature=signature,
+        )
+
+        assert finished.status is ActionStatus.INDETERMINATE
         snapshot = await ledger.load_snapshot("run-1")
-        assert snapshot.actions[0].status is ActionStatus.PERMANENT_FAILED
-        assert snapshot.failure_signatures == ("terms",)
+        assert snapshot.actions[0].status is ActionStatus.INDETERMINATE
+        assert snapshot.failure_signatures == (signature,)
 
 
 @pytest.mark.asyncio

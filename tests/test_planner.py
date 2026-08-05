@@ -20,11 +20,16 @@ from abi.types.orchestration import (
     ActionKind,
     ActionOutcomeEnvelope,
     ActionSpec,
+    ArtifactBundle,
+    ArtifactBundleEntry,
     ArtifactRef,
+    AttemptOutcomeReceiptPayload,
     ExpectedArtifact,
     ExpectedArtifactManifest,
+    GateArtifactIdentity,
     GateDecision,
     GateEvidence,
+    GateReceiptPayload,
     PlanningContext,
     PlanPatch,
     PlanRejectionView,
@@ -32,6 +37,8 @@ from abi.types.orchestration import (
     RetryPolicySpec,
     RunSnapshot,
     RunStatus,
+    Succeeded,
+    canonical_bundle_json,
     canonical_manifest_json,
     canonical_model_json,
     sha256_canonical_json,
@@ -128,7 +135,21 @@ async def _seed_committed_artifacts(ledger: RunLedger, body: str) -> None:
     )
     from abi.types.orchestration import AuthorizedAction
 
-    manifest = _expand_unused("source.ingest", "ingest-1", EmptyInput())
+    manifest = ExpectedArtifactManifest(
+        action_id="ingest-1",
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath="source/manifest.json",
+                media_type="application/json",
+                evidence_role="source_manifest",
+            ),
+            ExpectedArtifact(
+                canonical_relpath="source/raw.txt",
+                media_type="text/plain",
+                evidence_role="source_body",
+            ),
+        ),
+    )
     retry = RetryPolicySpec(max_attempts=1)
 
     await ledger.authorize_actions(
@@ -154,24 +175,86 @@ async def _seed_committed_artifacts(ledger: RunLedger, body: str) -> None:
     )
     await ledger.start_attempt("ingest-1")
     primary_checksum = sha256(body.encode("utf-8")).hexdigest()
+    manifest_checksum = sha256(b"manifest").hexdigest()
+    bundle = ArtifactBundle(
+        action_id="ingest-1",
+        attempt=1,
+        entries=tuple(
+            ArtifactBundleEntry(
+                staged_relpath=f"state/staging/ingest-1/1/{entry.canonical_relpath}",
+                canonical_relpath=entry.canonical_relpath,
+                media_type=entry.media_type,
+                evidence_role=entry.evidence_role,
+            )
+            for entry in manifest.entries
+        ),
+    )
+    outcome = Succeeded(artifact_bundle=bundle)
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id="ingest-1", attempt=1, outcome=outcome)
+    )
+    bundle_json = canonical_bundle_json(bundle)
+    bundle_digest = sha256_canonical_json(bundle_json)
+    await ledger.record_attempt_outcome(
+        AttemptOutcomeReceiptPayload(
+            action_id="ingest-1",
+            attempt=1,
+            canonical_outcome_json=outcome_json,
+            outcome_digest=sha256_canonical_json(outcome_json),
+            canonical_bundle_json=bundle_json,
+            bundle_digest=bundle_digest,
+        )
+    )
+    checksums = (manifest_checksum, primary_checksum)
+    decision = GateDecision(
+        passed=True,
+        reason_code="evidence_valid",
+        message="valid",
+        validator_id="source_manifest",
+        validator_version="1",
+        bundle_digest=bundle_digest,
+        artifact_checksums=checksums,
+    )
+    decision_json = canonical_model_json(decision)
+    _, intents = await ledger.create_gate_receipt_and_bundle_intents(
+        GateReceiptPayload(
+            action_id="ingest-1",
+            attempt=1,
+            validator_id="source_manifest",
+            validator_version="1",
+            canonical_gate_decision_json=decision_json,
+            gate_decision_digest=sha256_canonical_json(decision_json),
+            bundle_digest=bundle_digest,
+            artifacts=tuple(
+                GateArtifactIdentity(
+                    staged_relpath=entry.staged_relpath,
+                    canonical_relpath=entry.canonical_relpath,
+                    checksum=checksum,
+                )
+                for entry, checksum in zip(bundle.entries, checksums, strict=True)
+            ),
+        )
+    )
+    for intent in intents:
+        await ledger.commit_promotion_intent(intent.intent_id)
     await ledger.commit_success(
         SuccessCommit(
             action_id="ingest-1",
             attempt=1,
             artifacts=(
                 ArtifactCommit(
+                    artifact_id="source-manifest",
+                    relpath="source/manifest.json",
+                    sha256=manifest_checksum,
+                    producer_action_id="ingest-1",
+                    media_type="application/json",
+                ),
+                ArtifactCommit(
                     artifact_id="source-body",
                     relpath="source/raw.txt",
                     sha256=primary_checksum,
                     producer_action_id="ingest-1",
                     media_type="text/plain",
-                ),
-                ArtifactCommit(
-                    artifact_id="source-manifest",
-                    relpath="source/manifest.json",
-                    sha256="manifest-checksum",
-                    producer_action_id="ingest-1",
-                    media_type="application/json",
                 ),
             ),
             gate_evidence=(
@@ -180,7 +263,7 @@ async def _seed_committed_artifacts(ledger: RunLedger, body: str) -> None:
                     gate="source_manifest",
                     passed=True,
                     validator_version="1",
-                    artifact_checksums=(primary_checksum, "manifest-checksum"),
+                    artifact_checksums=checksums,
                 ),
             ),
             cost_usd=1.25,

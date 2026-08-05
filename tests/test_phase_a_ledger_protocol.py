@@ -7,8 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from abi.project.run_ledger import RunLedger, RunSeed
+from abi.project.run_ledger import (
+    ArtifactCommit,
+    LedgerConflictError,
+    LedgerTransitionError,
+    RunLedger,
+    RunSeed,
+    SuccessCommit,
+)
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ActionStatus,
     ArtifactBundle,
     ArtifactBundleEntry,
@@ -18,6 +26,7 @@ from abi.types.orchestration import (
     ExpectedArtifactManifest,
     GateArtifactIdentity,
     GateDecision,
+    GateEvidence,
     GateReceiptPayload,
     PlanPatch,
     ProposedAction,
@@ -85,15 +94,17 @@ async def _seed(ledger: RunLedger) -> None:
     await ledger.authorize_actions("run-1", (_authorized(),))
 
 
-def _retry_receipt() -> AttemptOutcomeReceiptPayload:
-    outcome = RetryableFailure(error_code="provider_timeout", message="retry later")
-    encoded = canonical_model_json(outcome)
+def _retry_receipt(error_code: str = "provider_timeout") -> AttemptOutcomeReceiptPayload:
+    outcome = RetryableFailure(error_code=error_code, message="retry later")
+    encoded = canonical_model_json(
+        ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+    )
     return AttemptOutcomeReceiptPayload(
         action_id="a1",
         attempt=1,
         canonical_outcome_json=encoded,
         outcome_digest=sha256_canonical_json(encoded),
-        error_code="provider_timeout",
+        error_code=error_code,
     )
 
 
@@ -115,7 +126,9 @@ def _bundle() -> ArtifactBundle:
 
 def _success_receipt(bundle: ArtifactBundle) -> AttemptOutcomeReceiptPayload:
     outcome = Succeeded(artifact_bundle=bundle, evidence_refs=("report",))
-    encoded = canonical_model_json(outcome)
+    encoded = canonical_model_json(
+        ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+    )
     bundle_json = canonical_bundle_json(bundle)
     return AttemptOutcomeReceiptPayload(
         action_id="a1",
@@ -175,7 +188,7 @@ async def test_attempt_snapshots_manifest_and_retry_policy_before_dispatch(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_outcome_receipt_routes_retry_and_concurrent_ticks_create_one_successor(
+async def test_outcome_receipt_is_immutable_before_separate_retry_route(
     tmp_path: Path,
 ) -> None:
     """Catch automatic retry re-entering attempt one or allocating duplicate successors."""
@@ -184,6 +197,8 @@ async def test_outcome_receipt_routes_retry_and_concurrent_ticks_create_one_succ
         await ledger.start_attempt("a1", attempt=1)
         receipt = _retry_receipt()
         assert await ledger.record_attempt_outcome(receipt) == await ledger.record_attempt_outcome(receipt)
+        assert await ledger.attempt_status("a1", 1) is ActionStatus.RUNNING
+        await ledger.route_retry_from_receipt("a1", attempt=1)
         assert await ledger.attempt_status("a1", 1) is ActionStatus.RETRY_WAIT
         first, second = await asyncio.gather(
             ledger.create_next_attempt("a1", previous_attempt=1),
@@ -195,6 +210,21 @@ async def test_outcome_receipt_routes_retry_and_concurrent_ticks_create_one_succ
         assert first.retry_of_attempt == 1
         assert first.staging_relpath == "state/staging/a1/2"
         assert await ledger.attempt_numbers("a1") == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_denied_retry_never_rolls_back_durable_outcome_receipt(tmp_path: Path) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        payload = _retry_receipt("unregistered_error")
+        await ledger.record_attempt_outcome(payload)
+
+        with pytest.raises(LedgerTransitionError, match="frozen retry policy"):
+            await ledger.route_retry_from_receipt("a1", attempt=1)
+
+        assert (await ledger.get_attempt_outcome("a1", 1)).outcome_digest == payload.outcome_digest
+        assert await ledger.attempt_status("a1", 1) is ActionStatus.RUNNING
 
 
 @pytest.mark.asyncio
@@ -240,7 +270,9 @@ async def test_repair_fact_is_receipt_bound_and_never_creates_retry_attempt(
             defect_codes=("term_drift",) if repair_class == "semantic" else ("artifact_bundle_conflict",),
             message="preserve and repair",
         )
-        encoded = canonical_model_json(outcome)
+        encoded = canonical_model_json(
+            ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+        )
         await ledger.record_attempt_outcome(
             AttemptOutcomeReceiptPayload(
                 action_id="a1",
@@ -264,3 +296,114 @@ async def test_repair_fact_is_receipt_bound_and_never_creates_retry_attempt(
         assert (await ledger.get_run("run-1")).status is expected_status
         assert await ledger.attempt_status("a1", 1) is ActionStatus.REPAIR_REQUIRED
         assert await ledger.attempt_numbers("a1") == (1,)
+
+
+@pytest.mark.asyncio
+async def test_unknown_repair_source_fails_closed_as_integrity(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        outcome = RepairRequired(
+            repair_class="semantic",
+            repair_source="action_outcome",
+            reason_code="term_drift",
+            defect_codes=("term_drift",),
+            message="preserve and repair",
+        )
+        encoded = canonical_model_json(
+            ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id="a1",
+                attempt=1,
+                canonical_outcome_json=encoded,
+                outcome_digest=sha256_canonical_json(encoded),
+            )
+        )
+
+        fact = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="invented_source",  # type: ignore[arg-type]
+            reason_code="term_drift",
+            defect_codes=("term_drift",),
+            evidence_refs=(),
+            message="preserve and repair",
+            semantic_reason_mapped=True,
+        )
+
+        assert fact.repair_class == "integrity"
+        assert fact.repair_source == "integrity_guard"
+        assert fact.reason_code == "repair_class_unknown"
+        assert (await ledger.get_run("run-1")).status is RunStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_commit_success_rejects_direct_ledger_bypass_without_receipts_or_intents(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        commit = SuccessCommit(
+            action_id="a1",
+            attempt=1,
+            artifacts=tuple(
+                ArtifactCommit(
+                    artifact_id=f"artifact-{name}",
+                    relpath=f"reports/{name}.json",
+                    sha256=checksum,
+                    producer_action_id="a1",
+                    media_type="application/json",
+                )
+                for name, checksum in (("a", "a" * 64), ("b", "b" * 64))
+            ),
+            gate_evidence=(
+                GateEvidence(
+                    evidence_id="gate-a1",
+                    gate="report.build",
+                    passed=True,
+                    validator_version="1",
+                    artifact_checksums=("a" * 64, "b" * 64),
+                ),
+            ),
+        )
+
+        with pytest.raises(LedgerTransitionError, match=r"receipt|intent|bundle"):
+            await ledger.commit_success(commit)
+
+        assert await ledger.attempt_status("a1", 1) is ActionStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_gate_replay_compares_full_ordered_intent_identity(tmp_path: Path) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        bundle = _bundle()
+        await ledger.record_attempt_outcome(_success_receipt(bundle))
+        gate = _gate_receipt(bundle)
+        _, intents = await ledger.create_gate_receipt_and_bundle_intents(gate)
+        await ledger._db.execute(
+            "UPDATE promotion_intents SET checksum = ? WHERE intent_id = ?",
+            ("f" * 64, intents[0].intent_id),
+        )
+        await ledger._db.commit()
+
+        with pytest.raises(LedgerConflictError, match=r"intent|conflict"):
+            await ledger.create_gate_receipt_and_bundle_intents(gate)
+
+
+@pytest.mark.asyncio
+async def test_finish_attempt_requires_receipt_and_repair_facts(tmp_path: Path) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        with pytest.raises(LedgerTransitionError, match=r"receipt|repair"):
+            await ledger.finish_attempt(
+                "a1", attempt=1, status=ActionStatus.REPAIR_REQUIRED
+            )

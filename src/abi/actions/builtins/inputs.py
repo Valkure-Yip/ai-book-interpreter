@@ -108,6 +108,13 @@ class SpotcheckInput(FrozenModel):
             raise ValueError("spot-check names must be unique and in canonical order")
         return value
 
+    @field_validator("reviewers")
+    @classmethod
+    def _exact_reviewers(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != ("agent_a", "agent_b"):
+            raise ValueError("spot-check reviewers must be exactly agent_a and agent_b")
+        return value
+
 
 class BuildEpubInput(FrozenModel):
     """Fixed ABI EPUB build; paths and chapter selection are controller-owned."""
