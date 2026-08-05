@@ -7,12 +7,13 @@ budget, events). The filesystem tools are sandboxed to ``project.root``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from abi.project.layout import BookProject
-from abi.project.state import PipelineState
 from abi.providers.services import RunServices
+from abi.types.orchestration import RunSnapshot
 from abi.types.run import RunConfig
 
 
@@ -21,12 +22,8 @@ class ToolContext:
     project: BookProject
     services: RunServices
     config: RunConfig | None = None
-
-    def state(self) -> PipelineState:
-        return self.project.load_state()
-
-    def save_state(self, state: PipelineState) -> None:
-        self.project.save_state(state)
+    run_id: str | None = None
+    get_run_snapshot: Callable[[], RunSnapshot] | None = None
 
     def resolve(self, relpath: str) -> Path:
         """Resolve a project-relative path, enforcing the sandbox."""

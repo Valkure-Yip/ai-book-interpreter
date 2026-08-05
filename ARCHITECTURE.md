@@ -1,107 +1,129 @@
 # ARCHITECTURE.md
 
-> 本文件描述 **AI Book Interpreter (ABI)** 的整体架构、分层与依赖规则。
-> 详细强制规则见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
+> 本文件描述 AI Book Interpreter（ABI）的当前实现。强制规则见
+> [`docs/DESIGN.md`](./docs/DESIGN.md)，完整协议见
+> [`docs/design-docs/dynamic-agent-orchestration.md`](./docs/design-docs/dynamic-agent-orchestration.md)。
 
 ## 1. 高层视角
 
-ABI 是一个**自包含的自主 agent**：它在进程内完成 `public-domain-books-translation`
-原本交给外部 agent 客户端（Claude/Codex）做的事——按编号阶段提示 `00→19` 驱动一个
-**28 态状态机**，调用工具，遇到硬质量门禁就自循环修复，直到产出版本化 EPUB。
+ABI 是一个自包含的自主翻译 agent。它不执行编号阶段或固定宏观路径，而是持续观察书籍工程的
+durable facts，由 Planner 提出短期 `PlanPatch`，再由确定性的 Policy、Scheduler、Reconciler 与
+Committer 限制、执行和提交。确定性门禁仍决定译文、EPUB 与 release 是否可提交；agent 不能宣布
+PASS，也不能直接写业务状态。
 
-```
-abi make-book ──▶ Orchestrator（按 28 态状态机逐阶段推进）
-                     │  载入当前阶段提示 + 工具子集
-                     ▼
-              Stage 运行：LLM tool-calling agent loop（有界）
-                     │  agent 认为完成 ──▶ 确定性 validator 校验
-                     │                         │ FAIL：带原因重试
-                     ▼                         ▼ PASS：推进状态 + 记录门禁
-              providers.llm / providers.agent_runtime
-                     （Langfuse trace + events.jsonl + BudgetGate 成本上限）
-```
+```mermaid
+flowchart TB
+    ENTRY["CLI / API<br/>make-book · resume · inspect<br/>approve · unblock · cancel"] --> ORCH
 
-宏观流程是**显式状态机 + 确定性门禁**（不是开放式 planner）；自主性体现在阶段内的
-翻译、QA、修复、路由决策。状态持久化在 `state/pipeline_state.json`，崩溃后
-`abi resume` 从断点继续。
+    subgraph CONTROL["控制平面：受约束的 Durable Orchestrator"]
+        ORCH["Dynamic Orchestrator"]
+        RECON["Reconciler<br/>对账 checkpoint、ledger 与工件"]
+        OBS["Observer<br/>生成 RunSnapshot"]
+        ELIG["Eligibility Engine<br/>计算合法候选 Action"]
+        PLAN["Planner<br/>输出结构化 PlanPatch"]
+        POLICY["Policy Engine<br/>验证依赖、门禁、预算与权限"]
+        SCHED["Scheduler / Dispatcher<br/>选择无冲突 Action batch"]
+        COMMIT["Committer<br/>multi-intent promotion<br/>完整 bundle 后 ledger success"]
+        INCIDENT["Incident Manager<br/>记录失败与修复证据"]
 
-## 2. 分层架构
+        ORCH --> RECON --> OBS --> ELIG --> PLAN --> POLICY --> SCHED
+        COMMIT --> OBS
+        INCIDENT --> OBS
+    end
 
-```
-types → config → ir → project → epub → qa → release → tools → stages → orchestrator → cli
-providers (llm, agent_runtime, observability) ← 任何业务层（providers 不依赖业务）
-```
+    REGISTRY["Action Registry<br/>schema · prerequisites · effects<br/>tools · validator · retry · read/write sets"]
+    REGISTRY --> ELIG
+    REGISTRY --> POLICY
+    REGISTRY --> SCHED
 
-| 层 | 职责 | 不得做 |
-| --- | --- | --- |
-| `types` | pydantic 模型、领域类型 | 任何 I/O |
-| `config` | 配置解析、默认值 | 业务逻辑 |
-| `ir` | 解析 epub/txt → `Book` IR + 章节切分 | 调用 LLM |
-| `project` | 书籍工程目录合约 + 28 态 `PipelineState` 持久化 | 调用 LLM |
-| `epub` | EPUB 构建、publication lint、资源检查、EPUBCheck | 调用 LLM |
-| `qa` | 分层随机抽检采样器 + 卓越线 validator | 调用 LLM |
-| `release` | 版本化发布 / 私人自用产物 | 调用 LLM |
-| `tools` | 暴露给 agent 的工具带（沙箱文件、ingest、门禁、子 agent） | 业务决策 |
-| `stages` | 各阶段 agent 调用 + 确定性 validator | 直接拼底层 SDK |
-| `orchestrator` | 驱动 28 态状态机到 DONE | — |
-| `cli` | typer 命令 → orchestrator | 业务逻辑 |
-| `providers` | LLM router、agent 运行时（LangGraph）、可观测性 | 业务决策 |
+    subgraph EXEC["执行平面"]
+        DET["Deterministic Action<br/>解析、构建、lint、采样"]
+        HARNESS["Action Harness<br/>LangChain create_agent"]
+        TOOLS["Scoped Tool Belt<br/>默认拒绝、最小权限"]
+        SUB["Specialized Subagents<br/>研究 · 翻译 · 修订 · 评审"]
+        SCHED --> DET
+        SCHED --> HARNESS
+        TOOLS --> HARNESS
+        HARNESS --> SUB
+    end
 
-**单向依赖**由 `docs/DESIGN.md` 规则 D1 定义。`langchain*` / `langgraph*` / `langfuse*`
-等只能在 `providers/**` 出现（规则 D2）。所有 LLM 调用（含子 agent）都经
-`providers.llm` 的 `LLMRouter` 或 `providers.agent_runtime` 的 `AgentRuntime`，因此自动
-接入 Langfuse + `events.jsonl` + `BudgetGate`。
+    subgraph EVIDENCE["工件与确定性证据"]
+        STAGING["Attempt-scoped Staging Bundle<br/>state/staging/action/attempt"]
+        OUTREC["Attempt Outcome Receipt<br/>typed outcome + bundle digest"]
+        ART["Committed Canonical Workspace<br/>source · chapters · glossary · EPUB"]
+        VALID["Staging-aware Validators"]
+        GATEREC["Gate Receipt + all intents<br/>同一 SQLite 事务"]
+        DET --> STAGING
+        HARNESS --> STAGING
+        SUB --> STAGING
+        STAGING --> OUTREC --> VALID --> GATEREC
+    end
 
-## 3. 书籍工程目录合约（运行时）
+    GATEREC --> COMMIT
+    VALID -- "FAIL" --> INCIDENT
+    COMMIT -- "promote all + unified postcheck" --> ART
 
-替代旧的 `runs/<book-id>/<run-id>/`。每本书一个工程根：
-
-```
-books/{target}/{NNNN}_{目标语言书名}/
-├── source/            # 原文 raw + 清洗文本 + manifest + toc.json
-├── metadata/          # book.yaml, rights_checklist, 研究, style_profile
-├── references/        # 复制进来的质量门禁/标准/政策参考（agent 读取）
-├── skills/            # expert-translation-quality / defect-families
-├── chapters/{src,translated,final}/
-├── glossary/          # terms.csv（locked/preferred/avoid + 禁用正文写法）+ style_guide
-├── qa/                # pretranslation / chapter_controls / fidelity / ... / gates
-├── preproduction/     # stage1 spec + stage2 样章 EPUB
-├── reviews/           # 随机抽检轮次 + 独立双 agent 评审
-├── output/            # book.epub + release/ + 各门禁 JSON 报告
-├── retrospective/
-└── state/             # pipeline_state.json + run.log
+    LEDGER["RunLedger / state/run.db<br/>唯一业务真相"]
+    CHECKPOINT["LangGraph Checkpointer<br/>运行游标与消息状态"]
+    COMMIT --> LEDGER
+    INCIDENT --> LEDGER
+    LEDGER --> RECON
+    CHECKPOINT -. "恢复控制循环" .-> RECON
 ```
 
-所有工件都是**人类与 agent 都可读**的，无不可解释二进制状态。
+## 2. 分层与依赖
 
-## 4. 翻译方法（核心）
+```text
+types → config → ir → project → epub → qa → release → tools → actions
+      → planning → orchestrator → cli
+providers 是横切边界；业务层不得直接 import LangChain/LangGraph/Langfuse SDK。
+```
 
-抛弃滑动窗口，采用持久工件模型：
+| 层 | 职责 |
+| --- | --- |
+| `types` / `config` / `ir` | frozen 边界模型、配置、输入解析与章节 IR |
+| `project` | `BookProject`、RunLedger、artifact promotion 与 durable schema |
+| `epub` / `qa` / `release` | 确定性构建、门禁、抽检与版本发布 |
+| `tools` | scoped、attempt-aware 的最小权限工具 |
+| `actions` | capability registry、typed executor 与 validator 合约 |
+| `planning` | snapshot、eligibility、Planner、Policy、Scheduler |
+| `orchestrator` | controller、dispatcher、reconciler、committer、lifecycle |
+| `providers` | LLM、agent/checkpointer、宏观 durable runtime、observability |
+| `cli` | 六个 lifecycle 命令与 eval 命令；不拥有业务 transition |
 
-- 全局 + 本书研究 → `metadata/*research*.md` + `metadata/style_profile.md`。
-- A/B/C/D 试译门禁（`PRETRANSLATION_PASS` 才能批量）。
-- 持久 `glossary/terms.csv` + `glossary/style_guide.md`。
-- **精简的每章翻译调用**：原文 + 最关键 5-8 条文体规则 + 仅命中的术语；只输出译文。
-- 每章 `08a` 全量译后控制（零问题 PASS 硬门禁）后才进下一章。
-- 忠实度 / 可读性+意象 / 术语三审 + 章节门禁 → `chapters/final/`。
-- 任一可复现问题 → 问题族全书审计 + 技能回填。
+## 3. 持久化边界
 
-## 5. 后 EPUB QA 与发布
+每本书一个工程目录。canonical 工件仍位于 `source/`、`metadata/`、`chapters/`、`glossary/`、
+`qa/`、`preproduction/`、`reviews/` 与 `output/`。控制与恢复数据位于：
 
-- 预制作规格 + 样章 EPUB PASS 后才全书构建。
-- Python `publication_lint` + `asset_manifest_check` + `epubcheck`（Java jar）门禁。
-- 分层随机抽检：确定性采样器 + 两个独立评审子 agent + validator（avg≥92/min≥88、
-  `release_confidence≥0.80`、≥2 连续 PASS 轮）。
-- 版本化发布到 `output/release/`（私人自用模式到被忽略的 `output/private_artifacts/`）。
+```text
+state/run.db                    # run/plan/action/attempt/receipt/gate/intent/incident
+state/staging/{action}/{attempt}/ # executor 的唯一写入目标
+state/graph-checkpoints.sqlite  # Action harness 游标、消息与 interrupt；不是业务真相
+state/status_projection.json    # 可重建的人类视图
+events.jsonl / metrics.json     # 可观测投影，可重建且不授权 transition
+```
 
-## 6. 可观测性与成本
+普通成功严格经过：冻结授权事实 → attempt → immutable outcome receipt → validator → gate receipt 与
+完整 intent 集 → create-only promotion → unified canonical postcheck → ledger success。文件系统和 SQLite
+不宣称跨介质原子性；Reconciler 按 receipt、checksum 和 intent 补完或 fail closed。
 
-每次 LLM 调用写入 `events.jsonl`，token/cost 聚合到 `metrics.json`，并经 Langfuse
-trace；`BudgetGate` 在 `config.cost.hard_cap_usd` 触发时优雅停止（保留断点）。
+## 4. 动态恢复语义
 
-## 7. 外部前置依赖
+- 自动 retry 保留旧 attempt=`RETRY_WAIT`，显式创建 attempt+1 与新 staging，沿用冻结 manifest/policy。
+- 显式映射的 semantic repair 保留旧 Action，run 保持 `RUNNING`，创建新 plan/action/staging。
+- integrity、未知分类、外部副作用不确定性一律 `BLOCKED`；人工 `unblock` 只创建新 identity。
+- HITL 初始 `Paused` receipt 不改写；decision `CLAIMED → STARTED → RESOLVED`，continuation 追加并由
+  effective-outcome 读取。`Succeeded` continuation 仍必须通过完整门禁与 promotion 协议。
+- LangGraph checkpoint 只恢复执行游标；所有生命周期操作重新读取 RunLedger。
 
-- OpenAI 兼容端点（`LLM_API_KEY` 等）。
-- 可选 Langfuse keys。
-- **EPUBCheck 需要 JRE**（`java` 在 PATH）。安装 `epub` extra 获取打包 jar，或设
-  `ABI_EPUBCHECK_JAR`，或让 `epubcheck` 在 PATH。
+## 5. 翻译与发布质量
+
+动态编排不改变翻译方法和成品门禁：每章翻译只接收原文、5–8 条文体规则和命中术语，只输出译文；
+QA/修订作为独立 Action。EPUB 必须通过 publication lint、asset manifest 与 EPUBCheck；分层随机抽检、
+独立评审和 release 前置工件都必须以 committed artifact/gate evidence 进入 ledger。
+
+## 6. 可观测性与外部依赖
+
+所有 LLM 调用走 providers，接入 Langfuse、`events.jsonl`、`metrics.json` 与预算门禁。EPUBCheck 需要
+JRE；可通过 `ABI_EPUBCHECK_JAR` 或 PATH 中的 `epubcheck` 提供。

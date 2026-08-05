@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from datetime import timedelta
 
 import pytest
 
@@ -19,9 +20,52 @@ from abi.eval.datasets import load_triples, parse_dataset_spec
 from abi.eval.judge import LikertOutput, PairwiseOutput, SlotScore, judge_triple
 from abi.eval.mechanical import length_ratio_ok, resolve_band, score_paragraph
 from abi.eval.report import aggregate_mechanical
+from abi.eval.run_facts import load_eval_run_facts
+from abi.eval.trace import trace_project
 from abi.eval.types import EvalTriple
 from abi.project.layout import BookProject
-from abi.project.run_ledger import RunLedger, RunSeed
+from abi.project.run_ledger import (
+    ArtifactCommit,
+    ProbeResolutionRequest,
+    RunLedger,
+    RunSeed,
+    SuccessCommit,
+)
+from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
+    ActionStatus,
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    AttemptOutcomeReceiptPayload,
+    AuthorizedAction,
+    CanonicalResolutionEvidence,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
+    GateArtifactIdentity,
+    GateDecision,
+    GateEvidence,
+    GateReceiptPayload,
+    Indeterminate,
+    Paused,
+    PendingHitlActionReview,
+    PendingHitlInterrupt,
+    PermanentFailure,
+    PlanPatch,
+    ProbeActionInput,
+    ProbeResolution,
+    ProposedAction,
+    RepairRequired,
+    RetryableFailure,
+    RetryPolicySpec,
+    RunStatus,
+    Succeeded,
+    UnblockRequest,
+    canonical_bundle_json,
+    canonical_failure_signature,
+    canonical_manifest_json,
+    canonical_model_json,
+    sha256_canonical_json,
+)
 
 
 # --- datasets / spec ---
@@ -293,6 +337,1117 @@ def _make_project(tmp_path, *, translated: bool = True, glossary: bool = True):
             encoding="utf-8",
         )
     return proj
+
+
+def _eval_authorized_action(
+    *,
+    action_id: str,
+    proposal_id: str,
+    capability: str,
+    artifact: ExpectedArtifact | None = None,
+    plan_version: int = 1,
+    policy: RetryPolicySpec | None = None,
+    parameters_json: str = "{}",
+    write_set: tuple[str, ...] = (),
+    evidence_refs: tuple[str, ...] = (),
+    idempotency_key: str | None = None,
+) -> AuthorizedAction:
+    """Build only shared legal authorization setup; negative facts stay literal in tests."""
+    manifest = ExpectedArtifactManifest(
+        action_id=action_id, entries=() if artifact is None else (artifact,)
+    )
+    frozen_policy = policy or RetryPolicySpec(max_attempts=1)
+    return AuthorizedAction(
+        action_id=action_id,
+        proposal_id=proposal_id,
+        plan_version=plan_version,
+        capability=capability,
+        parameters_json=parameters_json,
+        write_set=write_set,
+        idempotency_key=idempotency_key or action_id,
+        expected_artifact_manifest=manifest,
+        expected_artifact_manifest_digest=sha256_canonical_json(
+            canonical_manifest_json(manifest)
+        ),
+        expected_evidence_refs=evidence_refs,
+        retry_policy=frozen_policy,
+        retry_policy_fingerprint=sha256_canonical_json(
+            canonical_model_json(frozen_policy)
+        ),
+    )
+
+
+async def _create_authorized_attempt(
+    ledger: RunLedger,
+    *,
+    run_id: str,
+    authorized: AuthorizedAction,
+    objective: str,
+    rationale: str,
+) -> object:
+    """Create the shared legal run/plan/authorization/start baseline via public APIs."""
+    await ledger.create_run(RunSeed(run_id=run_id))
+    plan = await ledger.append_plan(
+        run_id,
+        PlanPatch(
+            objective=objective,
+            proposed_actions=(
+                ProposedAction(
+                    proposal_id=authorized.proposal_id,
+                    capability=authorized.capability,
+                ),
+            ),
+            rationale=rationale,
+        ),
+    )
+    await ledger.authorize_actions(run_id, (authorized,))
+    await ledger.start_attempt(authorized.action_id)
+    return plan
+
+
+async def _seed_committed_gate(proj: BookProject) -> None:
+    action_id = "eval-action"
+    checksum = "a" * 64
+    authorized = _eval_authorized_action(
+        action_id=action_id,
+        proposal_id="eval-proposal",
+        capability="report.build",
+        artifact=ExpectedArtifact(
+            canonical_relpath="reports/result.json",
+            media_type="application/json",
+            evidence_role="report",
+        ),
+        write_set=("reports",),
+        evidence_refs=("report",),
+    )
+    bundle = ArtifactBundle(
+        action_id=action_id,
+        attempt=1,
+        entries=(
+            ArtifactBundleEntry(
+                staged_relpath="state/staging/eval-action/1/reports/result.json",
+                canonical_relpath="reports/result.json",
+                media_type="application/json",
+                evidence_role="report",
+            ),
+        ),
+    )
+    succeeded = Succeeded(artifact_bundle=bundle, evidence_refs=("report",))
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=succeeded)
+    )
+    bundle_json = canonical_bundle_json(bundle)
+    bundle_digest = sha256_canonical_json(bundle_json)
+    decision = GateDecision(
+        passed=True,
+        reason_code="evidence_valid",
+        message="valid",
+        validator_id="report.build",
+        validator_version="1",
+        bundle_digest=bundle_digest,
+        artifact_checksums=(checksum,),
+        evidence_refs=("report",),
+    )
+    decision_json = canonical_model_json(decision)
+    async with RunLedger.open(proj.run_db) as ledger:
+        await _create_authorized_attempt(
+            ledger,
+            run_id="eval-run",
+            authorized=authorized,
+            objective="build report",
+            rationale="report is required",
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=action_id,
+                attempt=1,
+                canonical_outcome_json=outcome_json,
+                outcome_digest=sha256_canonical_json(outcome_json),
+                canonical_bundle_json=bundle_json,
+                bundle_digest=bundle_digest,
+                evidence_refs=("report",),
+            )
+        )
+        _, intents = await ledger.create_gate_receipt_and_bundle_intents(
+            GateReceiptPayload(
+                action_id=action_id,
+                attempt=1,
+                validator_id="report.build",
+                validator_version="1",
+                canonical_gate_decision_json=decision_json,
+                gate_decision_digest=sha256_canonical_json(decision_json),
+                bundle_digest=bundle_digest,
+                artifacts=(
+                    GateArtifactIdentity(
+                        staged_relpath=bundle.entries[0].staged_relpath,
+                        canonical_relpath=bundle.entries[0].canonical_relpath,
+                        checksum=checksum,
+                    ),
+                ),
+                evidence_refs=("report",),
+            )
+        )
+        await ledger.commit_promotion_intent(intents[0].intent_id)
+        await ledger.commit_success(
+            SuccessCommit(
+                action_id=action_id,
+                artifacts=(
+                    ArtifactCommit(
+                        artifact_id="artifact:result",
+                        relpath="reports/result.json",
+                        sha256=checksum,
+                        producer_action_id=action_id,
+                        media_type="application/json",
+                    ),
+                ),
+                gate_evidence=(
+                    GateEvidence(
+                        evidence_id="gate:report",
+                        gate="report.build",
+                        passed=True,
+                        validator_version="1",
+                        artifact_checksums=(checksum,),
+                    ),
+                ),
+            )
+        )
+
+
+def test_l1_replays_committed_gate_evidence_against_ledger_policy(tmp_path) -> None:
+    """Catch L1 falsely passing gate evidence whose ordered checksum binding drifted."""
+    root = tmp_path / "0001_book"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    bad_evidence = facts.snapshot.gate_evidence[0].model_copy(
+        update={"artifact_checksums": ("b" * 64,)}
+    )
+    facts = facts.model_copy(
+        update={
+            "snapshot": facts.snapshot.model_copy(
+                update={"gate_evidence": (bad_evidence,)}
+            )
+        }
+    )
+
+    report = trace_project(proj, facts=facts)
+
+    assert report.gate_integrity_ok is False
+    assert report.gate_integrity[0].consistent is False
+    assert "artifact checksums" in report.gate_integrity[0].replay_reason
+
+
+async def _seed_retry_lineage(proj: BookProject) -> None:
+    action_id = "retry-action"
+    policy = RetryPolicySpec(max_attempts=2, retryable_codes=("provider_timeout",))
+    authorized = _eval_authorized_action(
+        action_id=action_id,
+        proposal_id="retry-proposal",
+        capability="report.build",
+        artifact=ExpectedArtifact(
+            canonical_relpath="reports/retry.json",
+            media_type="application/json",
+            evidence_role="report",
+        ),
+        write_set=("reports",),
+        evidence_refs=("report",),
+        policy=policy,
+    )
+    failure = RetryableFailure(error_code="provider_timeout", message="retry")
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=failure)
+    )
+    async with RunLedger.open(proj.run_db) as ledger:
+        await _create_authorized_attempt(
+            ledger,
+            run_id="retry-run",
+            authorized=authorized,
+            objective="retry report",
+            rationale="report is required",
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=action_id,
+                attempt=1,
+                canonical_outcome_json=outcome_json,
+                outcome_digest=sha256_canonical_json(outcome_json),
+                error_code="provider_timeout",
+            )
+        )
+        await ledger.route_retry_from_receipt(action_id, attempt=1)
+        await ledger.create_next_attempt(action_id, previous_attempt=1)
+
+
+async def _seed_repair_lineage(
+    proj: BookProject, *, repair_class: str
+) -> tuple[object, object, object | None]:
+    run_id = f"{repair_class}-run"
+    action_id = f"{repair_class}-action"
+    authorized = _eval_authorized_action(
+        action_id=action_id,
+        proposal_id=f"{repair_class}-proposal",
+        capability="report.build",
+        artifact=ExpectedArtifact(
+            canonical_relpath=f"reports/{repair_class}.json",
+            media_type="application/json",
+            evidence_role="report",
+        ),
+        write_set=("reports",),
+        evidence_refs=("report",),
+    )
+    source = "action_outcome" if repair_class == "semantic" else "integrity_guard"
+    reason = "term_drift" if repair_class == "semantic" else "artifact_bundle_conflict"
+    outcome = RepairRequired(
+        repair_class=repair_class,
+        repair_source=source,
+        reason_code=reason,
+        defect_codes=(reason,),
+        message="preserve and repair",
+    )
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=outcome)
+    )
+    async with RunLedger.open(proj.run_db) as ledger:
+        first_plan = await _create_authorized_attempt(
+            ledger,
+            run_id=run_id,
+            authorized=authorized,
+            objective="build report",
+            rationale="report is required",
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=action_id,
+                attempt=1,
+                canonical_outcome_json=outcome_json,
+                outcome_digest=sha256_canonical_json(outcome_json),
+            )
+        )
+        repair_fact = await ledger.record_repair_required(
+            action_id=action_id,
+            attempt=1,
+            repair_class=repair_class,
+            repair_source=source,
+            reason_code=reason,
+            defect_codes=(reason,),
+            evidence_refs=(),
+            message="preserve and repair",
+            semantic_reason_mapped=repair_class == "semantic",
+        )
+        if repair_class == "semantic":
+            repair_id = "semantic-replacement"
+            second_plan = await ledger.append_plan(
+                run_id,
+                PlanPatch(
+                    objective="repair report",
+                    proposed_actions=(
+                        ProposedAction(
+                            proposal_id="semantic-replacement-proposal",
+                            capability="report.repair",
+                        ),
+                    ),
+                    superseded_action_ids=(action_id,),
+                    rationale="repair the durable semantic defect",
+                ),
+            )
+            await ledger.authorize_actions(
+                run_id,
+                (
+                    _eval_authorized_action(
+                        action_id=repair_id,
+                        proposal_id="semantic-replacement-proposal",
+                        plan_version=2,
+                        capability="report.repair",
+                        artifact=ExpectedArtifact(
+                            canonical_relpath=f"reports/{repair_class}.json",
+                            media_type="application/json",
+                            evidence_role="report",
+                        ),
+                        write_set=("reports",),
+                        evidence_refs=("report",),
+                    ),
+                ),
+            )
+            await ledger.start_attempt(repair_id)
+            return (first_plan, second_plan), repair_fact, None
+        unblock = await ledger.unblock_run(
+            run_id,
+            UnblockRequest(
+                reason="operator verified the integrity recovery",
+                evidence_refs=("ticket-42",),
+                source_action_id=action_id,
+            ),
+        )
+        return (first_plan,), repair_fact, unblock
+
+
+@pytest.mark.parametrize("tamper", ("missing", "late"))
+def test_l1_rejects_ordinary_success_without_atomic_promotion_intents(
+    tmp_path, tamper: str
+) -> None:
+    """Catch commit evaluation accepting a missing or post-receipt promotion intent."""
+    root = tmp_path / "ordinary"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    intents = ()
+    if tamper == "late":
+        intents = (
+            facts.promotion_intents[0].model_copy(
+                update={
+                    "created_at": facts.gate_receipts[0].recorded_at
+                    + timedelta(microseconds=1)
+                }
+            ),
+        )
+
+    report = trace_project(proj, facts=facts.model_copy(update={"promotion_intents": intents}))
+
+    assert report.path_conformance_ok is False
+    assert any("promotion intent" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_retry_successor_with_mutated_frozen_facts_and_reused_staging(
+    tmp_path,
+) -> None:
+    """Catch retry evaluation accepting changed manifest authority or attempt-one staging reuse."""
+    root = tmp_path / "retry"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_retry_lineage(proj))
+    facts = load_eval_run_facts(proj)
+    predecessor, successor = facts.attempts
+    bad_successor = successor.model_copy(
+        update={
+            "expected_manifest_digest": "0" * 64,
+            "staging_relpath": predecessor.staging_relpath,
+        }
+    )
+
+    report = trace_project(
+        proj, facts=facts.model_copy(update={"attempts": (predecessor, bad_successor)})
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("retry successor" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_semantic_repair_without_exactly_one_superseding_action(tmp_path) -> None:
+    """Catch semantic repair evaluation accepting zero replacement Actions for its source."""
+    root = tmp_path / "semantic"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    plans, repair_fact, _ = asyncio.run(
+        _seed_repair_lineage(proj, repair_class="semantic")
+    )
+    facts = load_eval_run_facts(proj)
+    original = next(action for action in facts.actions if action.repair_class == "semantic")
+    original_attempt = next(
+        attempt for attempt in facts.attempts if attempt.action_id == original.action_id
+    )
+    broken = facts.model_copy(
+        update={
+            "actions": (original,),
+            "attempts": (original_attempt,),
+            "plan_versions": plans,
+            "repair_facts": (repair_fact,),
+        }
+    )
+
+    report = trace_project(proj, facts=broken)
+
+    assert report.path_conformance_ok is False
+    assert any("semantic repair" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_integrity_replacement_without_matching_unblock(tmp_path) -> None:
+    """Catch integrity evaluation accepting a replacement Action without human unblock evidence."""
+    root = tmp_path / "integrity"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    plans, repair_fact, unblock = asyncio.run(
+        _seed_repair_lineage(proj, repair_class="integrity")
+    )
+    assert unblock is not None
+    facts = load_eval_run_facts(proj).model_copy(
+        update={
+            "plan_versions": plans,
+            "repair_facts": (repair_fact,),
+            "unblock_resolutions": (),
+        }
+    )
+
+    report = trace_project(proj, facts=facts)
+
+    assert report.path_conformance_ok is False
+    assert any("human unblock" in item for item in report.skipped_states)
+
+
+@pytest.mark.asyncio
+async def test_run_ledger_exposes_typed_eval_lineage_reads(tmp_path) -> None:
+    """Catch eval reaching around RunLedger or losing typed plan/repair/unblock lineage facts."""
+    root = tmp_path / "typed-reads"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    await _seed_repair_lineage(proj, repair_class="integrity")
+    async with RunLedger.open(proj.run_db) as ledger:
+        for method_name in (
+            "list_plan_versions",
+            "list_repair_facts",
+            "list_unblock_resolutions",
+        ):
+            method = getattr(ledger, method_name, None)
+            assert callable(method), f"RunLedger.{method_name} must be a public typed read"
+            records = await method("integrity-run")
+            assert records, f"RunLedger.{method_name} dropped durable lineage records"
+            assert all(hasattr(record, "model_dump") for record in records)
+
+
+@pytest.mark.parametrize("tamper", ("pending_intent", "missing_committed_artifact"))
+def test_l1_requires_committed_intents_and_unified_canonical_postcheck(
+    tmp_path, tamper: str
+) -> None:
+    """Catch success accepted before every intent and canonical artifact pass postcheck."""
+    root = tmp_path / f"postcheck-{tamper}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    if tamper == "pending_intent":
+        facts = facts.model_copy(
+            update={
+                "promotion_intents": (
+                    facts.promotion_intents[0].model_copy(
+                        update={"status": "PENDING", "committed_at": None}
+                    ),
+                )
+            }
+        )
+    else:
+        facts = facts.model_copy(
+            update={"snapshot": facts.snapshot.model_copy(update={"artifacts": ()})}
+        )
+
+    report = trace_project(proj, facts=facts)
+
+    assert report.path_conformance_ok is False
+    assert any("postcheck" in item for item in report.skipped_states)
+
+
+def test_l1_requires_outcome_receipt_before_controller_event(tmp_path) -> None:
+    """Catch controller outcome handling recorded before the immutable executor receipt."""
+    root = tmp_path / "outcome-order"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_retry_lineage(proj))
+    facts = load_eval_run_facts(proj)
+
+    async def load_events():
+        async with RunLedger.open(proj.run_db) as ledger:
+            return await ledger.undelivered_events("retry-run")
+
+    events = asyncio.run(load_events())
+    outcome_event = next(item for item in events if item.event_name == "action.outcome")
+    late_receipt = facts.outcome_receipts[0].model_copy(
+        update={"recorded_at": outcome_event.created_at + timedelta(microseconds=1)}
+    )
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={"outcome_receipts": (late_receipt,), "outbox_events": events}
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("outcome receipt" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_plan_rejection_without_reason_codes(tmp_path) -> None:
+    """Catch Planner rejection history losing deterministic policy feedback."""
+    root = tmp_path / "rejection-reasons"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+
+    async def seed_rejection() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.create_run(RunSeed(run_id="rejection-run"))
+            plan = await ledger.append_plan(
+                "rejection-run",
+                PlanPatch(
+                    objective="reject unsafe action",
+                    proposed_actions=(
+                        ProposedAction(proposal_id="unsafe", capability="unsafe.action"),
+                    ),
+                    rationale="exercise policy feedback",
+                ),
+            )
+            await ledger.record_plan_rejection(
+                "rejection-run", plan_version=plan.version, reason_codes=("unsafe",)
+            )
+
+    asyncio.run(seed_rejection())
+    facts = load_eval_run_facts(proj)
+    bad_rejection = facts.snapshot.plan_rejections[0].model_copy(
+        update={"reason_codes": ()}
+    )
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "snapshot": facts.snapshot.model_copy(
+                    update={"plan_rejections": (bad_rejection,)}
+                )
+            }
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("plan rejection" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_reset_or_reuse_of_conflict_history_after_unblock(tmp_path) -> None:
+    """Catch an unblock resetting an immutable CONFLICT intent for reuse."""
+    root = tmp_path / "conflict-history"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+
+    async def block_and_unblock() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.mark_bundle_conflict(
+                "eval-action",
+                1,
+                reason_code="artifact_checksum_conflict",
+                message="canonical artifact drifted",
+            )
+            await ledger.unblock_run(
+                "eval-run",
+                UnblockRequest(
+                    reason="operator removed the conflicting canonical artifact",
+                    evidence_refs=("ticket-42",),
+                    source_action_id="eval-action",
+                    canonical_resolutions=(
+                        CanonicalResolutionEvidence(
+                            canonical_relpath="reports/result.json",
+                            disposition="removed",
+                            evidence_ref="ticket-42",
+                        ),
+                    ),
+                ),
+            )
+
+    asyncio.run(block_and_unblock())
+    facts = load_eval_run_facts(proj)
+    conflict = facts.promotion_intents[0]
+    assert conflict.status == "CONFLICT"
+    reset = conflict.model_copy(update={"status": "PENDING", "committed_at": None})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(update={"promotion_intents": (reset,)}),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("conflict history" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_successful_release_with_uncommitted_prerequisite(tmp_path) -> None:
+    """Catch release success when a declared prerequisite Action was never committed."""
+    root = tmp_path / "release-prerequisite"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    release = facts.actions[0].model_copy(
+        update={"capability": "release.publish", "dependencies": ("missing-prerequisite",)}
+    )
+
+    report = trace_project(proj, facts=facts.model_copy(update={"actions": (release,)}))
+
+    assert report.path_conformance_ok is False
+    assert any("release prerequisite" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_non_probe_failure_mislabeled_as_success(tmp_path) -> None:
+    """Catch a failed non-probe outcome being rewritten to SUCCEEDED."""
+    root = tmp_path / "failed-as-success"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    action_id = "failed-action"
+    manifest = ExpectedArtifactManifest(action_id=action_id)
+    policy = RetryPolicySpec(max_attempts=1)
+    authorized = AuthorizedAction(
+        action_id=action_id,
+        proposal_id="failed-proposal",
+        plan_version=1,
+        capability="report.fail",
+        parameters_json="{}",
+        idempotency_key=action_id,
+        expected_artifact_manifest=manifest,
+        expected_artifact_manifest_digest=sha256_canonical_json(
+            canonical_manifest_json(manifest)
+        ),
+        retry_policy=policy,
+        retry_policy_fingerprint=sha256_canonical_json(canonical_model_json(policy)),
+    )
+    failure = PermanentFailure(error_code="fatal_provider_error", message="failed")
+    outcome_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=failure)
+    )
+
+    async def seed_failure() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.create_run(RunSeed(run_id="failed-run"))
+            await ledger.append_plan(
+                "failed-run",
+                PlanPatch(
+                    objective="exercise failure routing",
+                    proposed_actions=(
+                        ProposedAction(
+                            proposal_id="failed-proposal", capability="report.fail"
+                        ),
+                    ),
+                    rationale="failure is expected",
+                ),
+            )
+            await ledger.authorize_actions("failed-run", (authorized,))
+            await ledger.start_attempt(action_id)
+            await ledger.record_attempt_outcome(
+                AttemptOutcomeReceiptPayload(
+                    action_id=action_id,
+                    attempt=1,
+                    canonical_outcome_json=outcome_json,
+                    outcome_digest=sha256_canonical_json(outcome_json),
+                    error_code="fatal_provider_error",
+                )
+            )
+            await ledger.finish_attempt(
+                action_id, attempt=1, status=ActionStatus.PERMANENT_FAILED
+            )
+
+    asyncio.run(seed_failure())
+    facts = load_eval_run_facts(proj)
+    bad_action = facts.actions[0].model_copy(update={"status": ActionStatus.SUCCEEDED})
+    bad_attempt = facts.attempts[0].model_copy(update={"status": ActionStatus.SUCCEEDED})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(update={"actions": (bad_action,), "attempts": (bad_attempt,)}),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("non-probe outcome" in item for item in report.skipped_states)
+
+
+async def _seed_probe_lineage(proj: BookProject, disposition: str):
+    run_id = f"probe-{disposition}-run"
+    original_id = f"probe-{disposition}-original"
+    operation_key = f"remote:{disposition}"
+    policy = RetryPolicySpec(max_attempts=2, retryable_codes=("provider_timeout",))
+    authorized = _eval_authorized_action(
+        action_id=original_id,
+        proposal_id="remote-proposal",
+        capability="remote.publish",
+        policy=policy,
+        idempotency_key=f"operation:{disposition}",
+    )
+    signature = canonical_failure_signature("remote.publish", "{}", "provider_timeout")
+    indeterminate = Indeterminate(
+        operation_key=operation_key,
+        error_code="provider_timeout",
+        failure_signature=signature,
+        message="remote result unknown",
+    )
+    indeterminate_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=original_id, attempt=1, outcome=indeterminate)
+    )
+    binding = ProbeActionInput(
+        original_action_id=original_id,
+        original_attempt=1,
+        operation_key=operation_key,
+        probe_capability="remote.probe",
+    )
+    probe_id = f"probe-{disposition}-action"
+    probe_action = _eval_authorized_action(
+        action_id=probe_id,
+        proposal_id="probe-proposal",
+        plan_version=2,
+        capability="remote.probe",
+        parameters_json=binding.model_dump_json(),
+    )
+    async with RunLedger.open(proj.run_db) as ledger:
+        await _create_authorized_attempt(
+            ledger,
+            run_id=run_id,
+            authorized=authorized,
+            objective="publish remotely",
+            rationale="publication is required",
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=original_id,
+                attempt=1,
+                canonical_outcome_json=indeterminate_json,
+                outcome_digest=sha256_canonical_json(indeterminate_json),
+                error_code="provider_timeout",
+                failure_signature=signature,
+            )
+        )
+        await ledger.finish_attempt(
+            original_id,
+            attempt=1,
+            status=ActionStatus.INDETERMINATE,
+            failure_signature=signature,
+        )
+        await ledger.authorize_probe_action(
+            run_id,
+            binding=binding,
+            patch=PlanPatch(
+                objective="resolve remote result",
+                proposed_actions=(
+                    ProposedAction(proposal_id="probe-proposal", capability="remote.probe"),
+                ),
+                rationale="probe before retry",
+            ),
+            action=probe_action,
+            expected_previous_plan_version=1,
+        )
+        await ledger.start_attempt(probe_id)
+        probe_outcome = ProbeResolution(
+            operation_key=operation_key,
+            disposition=disposition,
+            evidence_refs=(f"probe:{disposition}",),
+            message=f"remote operation {disposition}",
+        )
+        probe_json = canonical_model_json(
+            ActionOutcomeEnvelope(action_id=probe_id, attempt=1, outcome=probe_outcome)
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=probe_id,
+                attempt=1,
+                canonical_outcome_json=probe_json,
+                outcome_digest=sha256_canonical_json(probe_json),
+                evidence_refs=(f"probe:{disposition}",),
+            )
+        )
+        resolution = await ledger.resolve_indeterminate(
+            ProbeResolutionRequest(
+                original_action_id=original_id,
+                original_attempt=1,
+                probe_action_id=probe_id,
+                probe_attempt=1,
+                operation_key=operation_key,
+                original_idempotency_key=f"operation:{disposition}",
+                retry_policy_fingerprint=authorized.retry_policy_fingerprint,
+            )
+        )
+        if disposition == "absent":
+            await ledger.create_next_attempt(original_id, previous_attempt=1)
+        return resolution
+
+
+@pytest.mark.parametrize("disposition", ("succeeded", "absent", "unknown"))
+def test_l1_rejects_probe_resolution_that_breaks_original_authority(
+    tmp_path, disposition: str
+) -> None:
+    """Catch probe routing that loses immutable outcome/error/policy binding or safe disposition."""
+    root = tmp_path / f"probe-{disposition}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    resolution = asyncio.run(_seed_probe_lineage(proj, disposition))
+    facts = load_eval_run_facts(proj)
+    if disposition == "succeeded":
+        bad_resolution = resolution.model_copy(update={"error_code": "different_error"})
+        bad_run = facts.run
+    elif disposition == "absent":
+        bad_resolution = resolution.model_copy(
+            update={"retry_policy_fingerprint": "0" * 64}
+        )
+        bad_run = facts.run
+    else:
+        bad_resolution = resolution
+        bad_run = facts.run.model_copy(update={"status": RunStatus.RUNNING})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={"run": bad_run, "probe_resolutions": (bad_resolution,)}
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("probe resolution" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_probe_action_masquerading_as_ordinary_success(tmp_path) -> None:
+    """Catch evidence-only ProbeResolution being replaced by an ungated artifact success."""
+    root = tmp_path / "probe-ordinary-success"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    resolution = asyncio.run(_seed_probe_lineage(proj, "succeeded"))
+    facts = load_eval_run_facts(proj)
+    probe_receipt = next(
+        item for item in facts.outcome_receipts if item.action_id == resolution.probe_action_id
+    )
+    bundle = ArtifactBundle(
+        action_id=resolution.probe_action_id,
+        attempt=1,
+        entries=(
+            ArtifactBundleEntry(
+                staged_relpath=(
+                    f"state/staging/{resolution.probe_action_id}/1/reports/probe.json"
+                ),
+                canonical_relpath="reports/probe.json",
+                media_type="application/json",
+                evidence_role="report",
+            ),
+        ),
+    )
+    envelope_json = canonical_model_json(
+        ActionOutcomeEnvelope(
+            action_id=resolution.probe_action_id,
+            attempt=1,
+            outcome=Succeeded(artifact_bundle=bundle, evidence_refs=("report",)),
+        )
+    )
+    bundle_json = canonical_bundle_json(bundle)
+    bad_receipt = probe_receipt.model_copy(
+        update={
+            "canonical_outcome_json": envelope_json,
+            "outcome_digest": sha256_canonical_json(envelope_json),
+            "canonical_bundle_json": bundle_json,
+            "bundle_digest": sha256_canonical_json(bundle_json),
+            "evidence_refs": ("report",),
+        }
+    )
+    receipts = tuple(
+        bad_receipt if item.action_id == resolution.probe_action_id else item
+        for item in facts.outcome_receipts
+    )
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={"outcome_receipts": receipts, "probe_resolutions": (resolution,)}
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("probe" in item and "ordinary success" in item for item in report.skipped_states)
+
+
+async def _seed_hitl_continuation(proj: BookProject, *, block_started: bool = False):
+    action_id = "hitl-action"
+    manifest = ExpectedArtifactManifest(
+        action_id=action_id,
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath="reports/hitl.json",
+                media_type="application/json",
+                evidence_role="report",
+            ),
+        ),
+    )
+    policy = RetryPolicySpec(max_attempts=1)
+    authorized = AuthorizedAction(
+        action_id=action_id,
+        proposal_id="hitl-proposal",
+        plan_version=1,
+        capability="report.hitl",
+        parameters_json="{}",
+        idempotency_key=action_id,
+        expected_artifact_manifest=manifest,
+        expected_artifact_manifest_digest=sha256_canonical_json(
+            canonical_manifest_json(manifest)
+        ),
+        retry_policy=policy,
+        retry_policy_fingerprint=sha256_canonical_json(canonical_model_json(policy)),
+    )
+    paused = Paused(
+        reason="hitl",
+        message="approval required",
+        pending_hitl_interrupts=(
+            PendingHitlInterrupt(
+                interrupt_id="public-interrupt",
+                action_reviews=(
+                    PendingHitlActionReview(
+                        tool_name="publish",
+                        arguments_json="{}",
+                        allowed_decisions=("approve", "reject"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    paused_json = canonical_model_json(
+        ActionOutcomeEnvelope(action_id=action_id, attempt=1, outcome=paused)
+    )
+    bundle = ArtifactBundle(
+        action_id=action_id,
+        attempt=1,
+        entries=(
+            ArtifactBundleEntry(
+                staged_relpath="state/staging/hitl-action/1/reports/hitl.json",
+                canonical_relpath="reports/hitl.json",
+                media_type="application/json",
+                evidence_role="report",
+            ),
+        ),
+    )
+    async with RunLedger.open(proj.run_db) as ledger:
+        await ledger.create_run(RunSeed(run_id="hitl-run"))
+        await ledger.append_plan(
+            "hitl-run",
+            PlanPatch(
+                objective="run approved report",
+                proposed_actions=(
+                    ProposedAction(proposal_id="hitl-proposal", capability="report.hitl"),
+                ),
+                rationale="approval is required",
+            ),
+        )
+        await ledger.authorize_actions("hitl-run", (authorized,))
+        await ledger.start_attempt(action_id)
+        original = await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=action_id,
+                attempt=1,
+                canonical_outcome_json=paused_json,
+                outcome_digest=sha256_canonical_json(paused_json),
+            )
+        )
+        await ledger.finish_attempt(action_id, attempt=1, status=ActionStatus.PAUSED)
+        await ledger.set_run_status("hitl-run", RunStatus.PAUSED_HITL)
+        await ledger.claim_hitl_interrupt(
+            run_id="hitl-run",
+            action_id=action_id,
+            attempt=1,
+            interrupt_id="public-interrupt",
+            decisions=("approve",),
+            feedback=(None,),
+        )
+        await ledger.start_hitl_resume("public-interrupt")
+        if block_started:
+            incident = await ledger.block_hitl_resume_indeterminate(
+                "public-interrupt", message="provider resume result is unknown"
+            )
+            return original, incident, None
+        continuation = await ledger.record_hitl_continuation(
+            "public-interrupt",
+            ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=1,
+                outcome=Succeeded(artifact_bundle=bundle, evidence_refs=("report",)),
+            ),
+        )
+        effective = await ledger.get_effective_attempt_outcome(action_id, 1)
+        return original, continuation, effective
+
+
+def test_l1_hitl_continuation_preserves_pause_and_cannot_skip_gate_authority(tmp_path) -> None:
+    """Catch HITL effective success rewriting Paused or bypassing gate and promotion receipts."""
+    root = tmp_path / "hitl"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    original, continuation, effective = asyncio.run(_seed_hitl_continuation(proj))
+    facts = load_eval_run_facts(proj)
+    assert isinstance(
+        ActionOutcomeEnvelope.model_validate_json(original.canonical_outcome_json).outcome,
+        Paused,
+    )
+    assert continuation.sequence == 1
+    assert effective.source == "hitl_continuation"
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "hitl_continuations": (continuation,),
+                "effective_outcomes": (effective,),
+            }
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("HITL" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_started_hitl_indeterminate_that_does_not_remain_blocked(tmp_path) -> None:
+    """Catch a STARTED unresolved HITL resume being reopened instead of integrity-blocked."""
+    root = tmp_path / "hitl-indeterminate"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    original, incident, _ = asyncio.run(
+        _seed_hitl_continuation(proj, block_started=True)
+    )
+    facts = load_eval_run_facts(proj)
+    assert incident.repair_class == "integrity"
+    bad_run = facts.run.model_copy(update={"status": RunStatus.RUNNING})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={"run": bad_run, "hitl_initial_receipts": (original,)}
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("HITL" in item and "BLOCKED" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_unblock_whose_evidence_digest_or_replacement_identity_drifted(
+    tmp_path,
+) -> None:
+    """Catch integrity unblock evaluation accepting changed evidence or replacement identity."""
+    root = tmp_path / "unblock-binding"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_repair_lineage(proj, repair_class="integrity"))
+    facts = load_eval_run_facts(proj)
+    unblock = facts.unblock_resolutions[0]
+    changed_request = unblock.request.model_copy(
+        update={"evidence_refs": ("different-ticket",)}
+    )
+    bad_unblock = unblock.model_copy(update={"request": changed_request})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(update={"unblock_resolutions": (bad_unblock,)}),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("unblock evidence" in item for item in report.skipped_states)
+
+
+def test_l1_rejects_manual_unblock_attached_to_semantic_repair(tmp_path) -> None:
+    """Catch semantic repair evaluation accepting a human unblock bypass."""
+    integrity_root = tmp_path / "integrity-source"
+    semantic_root = tmp_path / "semantic-target"
+    (integrity_root / "state").mkdir(parents=True)
+    (semantic_root / "state").mkdir(parents=True)
+    integrity = BookProject(integrity_root)
+    semantic = BookProject(semantic_root)
+    asyncio.run(_seed_repair_lineage(integrity, repair_class="integrity"))
+    asyncio.run(_seed_repair_lineage(semantic, repair_class="semantic"))
+    foreign_unblock = load_eval_run_facts(integrity).unblock_resolutions[0]
+    facts = load_eval_run_facts(semantic)
+    semantic_action = next(action for action in facts.actions if action.repair_class == "semantic")
+    bad_unblock = foreign_unblock.model_copy(
+        update={"run_id": facts.run.run_id, "source_action_id": semantic_action.action_id}
+    )
+
+    report = trace_project(
+        semantic,
+        facts=facts.model_copy(update={"unblock_resolutions": (bad_unblock,)}),
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("semantic repair" in item and "unblock" in item for item in report.skipped_states)
 
 
 def test_load_glossary_only_enforced(tmp_path):

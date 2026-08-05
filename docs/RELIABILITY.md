@@ -1,209 +1,93 @@
 # RELIABILITY.md
 
-> 翻译一本书可能要数小时、数千次 LLM 调用、数十美金。任何环节都会失败。
-> 本文件定义**失败处理、检查点、幂等、重试、限流**。
+> ABI 的长任务恢复以 `state/run.db` 的 durable facts 为准。checkpoint、events 和文件时间戳都不能
+> 单独证明业务成功。本文件定义当前重试、检查点、幂等、冲突与人工恢复语义。
 
-## 1. 失败模式分类
+## 1. 权威边界
 
-| 类别 | 例子 | 策略 |
+| 数据 | 位置 | 权威性 |
 | --- | --- | --- |
-| 瞬时网络 | 5xx, 超时 | 指数退避重试（最多 N 次） |
-| 限流 | 429, RateLimit | token-bucket 等待 + 重试 |
-| Schema 错 | LLM 返回非 JSON / 字段错 | RevisionTranslator 带反馈重试 |
-| 内容错 | term_drift, length outlier | flag + RevisionTranslator |
-| 拒答 | "I cannot translate this" | 改 prompt（去敏感词 / 上下文遮蔽）重试一次，仍拒 → flag |
-| API key 失效 | 401, 403 | 立即停（无意义重试） |
-| 余额不足 | 402 / 特定错误码 | 立即停 + 触发成本上限事件 |
-| 输入解析 | pdf 损坏 | 失败前导出诊断 → 用户介入 |
-| 内部 bug | KeyError 等 | 落 events，run 停，下次续跑跳过此段并 flag |
+| run、plan、Action、attempt、receipt、gate、intent、incident、human decision | `state/run.db` | 唯一业务真相 |
+| Action 消息、工具游标、interrupt | `state/graph-checkpoints.sqlite` | 仅恢复 provider runtime |
+| attempt 输出 | `state/staging/{action_id}/{attempt}/` | promotion 输入；由 receipt/intent 绑定 |
+| canonical 工件 | 书籍工程目录 | 只有 ledger checksum/receipt 绑定后才是 committed fact |
+| events、metrics、status projection | `events.jsonl` 等 | 可重建投影，不授权 transition |
 
-## 2. 重试策略
+启动和 `resume` 总是先运行 Reconciler。零 run、多 run、foreign checkpoint、stale identity、缺失或冲突
+receipt 都 fail closed；不得隐式创建第二个 run 或复活旧 attempt。
 
-### 2.1 网络/限流
+## 2. 执行与成功协议
 
-v0.1 用 LangChain `Runnable.with_retry(...)`：
-- 退避：`wait_exponential_jitter=True`，base=2, max=30
-- 最多次数：默认 3 次；429 单独走 token-bucket 等待，不计入重试计数
-- 超时：单次 120 秒（`ChatOpenAI.request_timeout`）、整体 600 秒（`asyncio.wait_for`）
-- 非可重试错误（4xx 中 401/403/404）立即失败，不重试
+每个 Action 在 dispatch 前冻结 parameters、expected manifest、evidence refs、retry policy/fingerprint，
+并创建唯一 staging namespace。executor 返回后先写 immutable `attempt_outcome_receipts`，然后 controller
+才可处理结果。
 
-### 2.1.1 已知失败模式：LengthFinishReasonError
+普通 `Succeeded` 的顺序不可缩短：
 
-某些 OpenAI 兼容端点（如 DeepSeek-V4-Pro）在 json_mode 下输出 token 占用偏多。当 `max_output_tokens` 设得太小时，会触发 `openai.LengthFinishReasonError`。
+1. 校验 outcome 的 caller-canonical、非空、exact-manifest bundle；
+2. staging-aware validator 产生绑定 validator identity/version、bundle digest、ordered checksums 的决定；
+3. PASS gate receipt 与完整 promotion intent 集在一个 SQLite 事务中创建；
+4. 每个 intent 以 create-only 语义提升并标记 `COMMITTED`；
+5. 对完整 canonical bundle 做 unified postcheck；
+6. 最后一个 ledger transaction 提交 artifacts、gate evidence、cost 与 Action success。
 
-v0.1 默认 `max_output_tokens=4096`。该错误目前走"agent 优雅降级"路径——例如 `chapter_summarizer` 失败时给该章一个空 abstract，整体流水线继续。
+文件系统与 SQLite 不跨介质原子。任一步崩溃都由 Reconciler 按 durable intent/checksum 补完；identity、
+checksum、目录安全或后验 drift 会把 intent 变为不可逆 `CONFLICT` 并阻断，而不是猜测成功。
 
-v0.2 计划：对 `LengthFinishReasonError` 单独识别，重试时自动把 `max_tokens` 提升 2 倍（最多 16k）。
+## 3. 结果分类与恢复矩阵
 
-### 2.2 内容错
-
-不简单"再试一次"。重试时把上一次的输出 + 错误注入到 `RevisionTranslator` prompt：
-```
-上次的译文：<...>
-检测到的问题：
-- term_drift: "embodiment" 应译为「具身」而非「体现」
-- length_ratio: 0.32 偏低
-请基于这些反馈重新翻译。
-```
-
-最多 `max_revision_rounds = 2` 轮。
-
-### 2.3 整段失败
-
-某段达到所有重试上限仍失败：
-- `TranslationUnit` 写入 `flags=[...]`，`translated_text` 设为 `source_text`（透传）
-- 加 HTML 注释 `<!-- abi:flagged ... -->`
-- 进入 `translate/flagged.jsonl`
-- **不阻塞**其他段落
-
-## 3. Checkpoint
-
-### 3.1 颗粒度
-
-- Pass 0：整体或不存在；不做段落级 checkpoint（重跑廉价）
-- Pass 1：章节级 checkpoint（一章一文件）
-- Pass 2：**段落级 checkpoint**（每段一文件，命名为 `<paragraph_id>.json`）
-- Pass 3：无需 checkpoint（纯本地，秒级）
-
-### 3.2 检测已完成
-
-```python
-def is_paragraph_done(run_dir, p: Paragraph) -> bool:
-    f = run_dir / "translate" / "paragraphs" / f"{p.paragraph_id}.json"
-    if not f.exists():
-        return False
-    unit = TranslationUnit.model_validate_json(f.read_text())
-    # 还要检查 prompt_version / glossary_version 是否与当前一致
-    return (unit.prompt_version == current_prompt_version()
-            and unit.context_window.glossary_version >= current_glossary_version())
-```
-
-glossary 版本提升后，只重跑"用到了变化术语"的段落（按 `terms_used` 反向查询）。
-
-### 3.3 续跑入口
-
-`abi resume` 检测最近一次 run，自动判断该跑哪步：
-- IR 缺失 → Pass 0 全跑
-- Survey 缺失或不完整 → Pass 1 续跑
-- 有未完成段落 → Pass 2 续跑
-- 所有段落完成但 assemble 未跑 → Pass 3
-
-## 4. 幂等
-
-### 4.1 段落 ID 纯函数
-见 `data-model.md §3`。保证同一段在同一 IR 下永远同 ID。
-
-### 4.2 Run 目录隔离
-每次新 run 用新 `run_id`，但**共享** `book-id` 下的同名段落文件可被跨 run 复用（通过 hard link 或 explicit copy）。
-默认行为：续跑复用最近 run；用户可 `--isolate` 强制全新。
-
-### 4.3 LLM 调用 cache（可选）
-
-按 `(prompt_hash, model, temperature)` 缓存响应。
-- 默认开启 in-memory cache（单次 run）
-- `--cache-dir` 启用持久 cache（跨 run）
-- temperature > 0.3 时自动禁用 cache（无意义）
-
-## 5. 限流
-
-### 5.1 客户端 token-bucket
-
-`providers.llm` 内置：
-- 全局 RPM / TPM 上限
-- 按 provider / model 独立 bucket
-- 配置：`providers.openai.rpm: 500`、`tpm: 600000`
-
-### 5.2 自适应退让
-
-收到 429 时：
-- 该 bucket 立即减半 RPM 5 分钟
-- 5 分钟后线性回升
-
-### 5.3 并发 gate
-
-`runtime` 维护全局 `asyncio.Semaphore(concurrency)`，章节并行受其限制。
-
-## 6. 成本控制
-
-### 6.1 预算 gate
-
-```python
-async def llm_call(...):
-    expected_cost = estimate_cost(messages, model)
-    if metrics.total_cost + expected_cost > config.cost.hard_cap_usd:
-        raise BudgetExceeded(...)   # 触发优雅停
-```
-
-### 6.2 触发优雅停
-
-`BudgetExceeded` 被 runtime 捕获：
-- 取消正在跑的章节
-- 等待已发起的调用完成（不放弃已花的钱）
-- 写 checkpoint
-- exit code 4
-
-用户可以 `--max-cost-usd $N` 提升上限后续跑。
-
-### 6.3 warn 阈值
-
-到达 `warn_at_usd` 时打事件 + stderr 提示，但不停。
-
-## 7. 可观测性
-
-v0.1 采用**两层可观测**：
-
-- **Langfuse**：所有 LLM 调用的 trace（prompt / completion / token / cost / latency / retry 链路），按 `run_id` 聚根，按 `book_id` / `paragraph_id` 检索
-- **本地 `events.jsonl`**：业务级事件（段落、章节、glossary、checkpoint、预算）的真相源，离线可消费
-
-详见 [`design-docs/tech-stack.md §4`](./design-docs/tech-stack.md#4-两套观测的分工)。
-
-### 7.1 事件流
-
-`runs/.../events.jsonl` 严格 JSON Lines，每行独立 parse。
-事件类型至少包括：
-
-| event | 含义 |
+| Durable facts | 安全恢复 |
 | --- | --- |
-| `run.start` / `run.end` | 整体边界 |
-| `pass.start` / `pass.end` | 每 pass 边界 |
-| `agent.call` | LLM 调用（成功） |
-| `agent.retry` | 重试发起 |
-| `agent.failed` | 重试用尽 |
-| `paragraph.translated` | Pass 2 段完 |
-| `paragraph.flagged` | 段落被 flag |
-| `glossary.updated` | term 入库 |
-| `context.trimmed` | 上下文裁剪 |
-| `budget.warn` / `budget.hard_cap` | 成本事件 |
-| `checkpoint.saved` | checkpoint 落盘 |
+| `AUTHORIZED`，attempt 未开始 | 首次 claim，持久化 `RUNNING` 后 dispatch |
+| `RUNNING`，outcome receipt 缺失 | 按 frozen manifest 精确扫描 staging；不能证明则 integrity block |
+| outcome receipt 已有、未路由 | 读取 effective outcome，幂等执行确定性路由 |
+| `RetryableFailure` 且 frozen policy 允许 | 旧 attempt/Action=`RETRY_WAIT`；显式创建 attempt+1、新 staging |
+| retry 不允许或耗尽 | `PERMANENT_FAILED` 或按证据阻断；不能改 policy 后重放旧 attempt |
+| mapped semantic repair | 旧 attempt/Action=`REPAIR_REQUIRED`，run 保持 `RUNNING`；新 plan/action/staging |
+| integrity、未知分类或 conflict | 保留事实，run=`BLOCKED`；Planner 不自动 repair |
+| `Indeterminate` 外部副作用 | 只授权绑定原 operation/idempotency/policy 的只读 probe |
+| probe=`succeeded` | 原 Action 可按 immutable resolution 解析成功 |
+| probe=`absent` 且 retry 合法 | 原 Action=`RETRY_WAIT`，创建 attempt+1 |
+| probe=`unknown` | integrity incident + `BLOCKED` |
+| gate/intents 已有、promotion 部分完成 | 对账并补完；不重跑 executor |
+| ledger success、canonical drift | 原 success 不改写；新 integrity incident + `BLOCKED` |
+| `PAUSED_BUDGET` | 调高预算并记录 evidence 后恢复 |
+| `COMPLETED` / `CANCELLED` | terminal；resume/unblock/cancel 不得重开 |
 
-### 7.2 metrics.json
+## 4. HITL continuation
 
-实时聚合（每 30 秒刷一次）：
-```json
-{
-  "started_at": "...",
-  "updated_at": "...",
-  "paragraphs": {"total": 3421, "done": 1208, "flagged": 4, "failed": 0},
-  "tokens": {"input": 4123456, "output": 891234, "cached": 1234567},
-  "cost_usd": 12.34,
-  "duration_s": 1845
-}
+初始 `Paused(reason="hitl")` outcome receipt 永不改写。`approve` 验证 exact run/action/attempt/thread、
+public interrupt ID、ordered decisions 与原 pause digest，在 ledger 中依次记录：
+
+```text
+CLAIMED → STARTED(stable resume_invocation_id) → RESOLVED(continuation sequence)
 ```
 
-### 7.3 日志
+continuation 是 append-only receipt；effective-outcome API 选择最新 sequence。若 `STARTED` 后崩溃，
+inspector 只能读取公共 checkpoint state：可证明 terminal/next pause 才追加 receipt，否则 Action/attempt
+变为 integrity-class `INDETERMINATE`，run=`BLOCKED`。`Succeeded` continuation 仍走完整 gate/promotion/
+postcheck/commit，不因人工批准而直接成功。
 
-`logs/info.log`、`logs/warn.log`、`logs/error.log`，结构化 JSON 行。
+## 5. 人工 unblock
 
-## 8. 安全失败
+`unblock` 只接受：
 
-**默认偏保守**：
-- 不删除已存在的 run 目录（手动 `abi runs rm` 才删）
-- 不覆盖已存在的输出文件（除非 `--overwrite`）
-- Ctrl-C 时优雅捕获 → checkpoint → 退出（exit 130）
+- budget pause，且不携带 replacement/canonical resolution；或
+- integrity block，带 source Action、reason、evidence refs，以及每个 conflict canonical path 的 exact
+  `removed` / `selected:sha256` 处置。
 
-## 9. 不变量
+integrity unblock 保留旧 Action、attempt、receipt、intent 与 conflict，创建 exactly one new plan version、
+new Action ID 和 `state/staging/{new_action}/1`。request canonical JSON/digest 与 replacement identity 写入
+`unblock_resolutions`。semantic repair 禁止借 manual unblock 绕过自动 policy-mapped replan。
 
-1. 任何运行结束（成功/失败/中断）必有完整 `events.jsonl` + `metrics.json`
-2. 段落级文件落盘是**原子**的（先写 `.tmp`，再 `os.replace`）
-3. checkpoint 在故障重启后保证"至少一致"语义：可能有重复翻译同一段（被覆盖），但不会遗漏
-4. budget hard cap 永不超出（gate 在调用前）
+## 6. 预算、限流与可观测性
+
+预算在 Planner、Action、agent turn 与工具调用前检查；hard cap 产生 `PAUSED_BUDGET`，不取消 durable
+事实。provider 的瞬时网络/429 退避属于调用层；它不能替代 Action-level frozen retry policy。所有 LLM
+调用经 providers 写 trace、token/cost/latency；outbox 事件在业务事务中创建，再幂等投影到本地事件流。
+
+## 7. 故障演练要求
+
+测试必须覆盖 outcome receipt、gate/intents、单个 promotion、unified postcheck、success transaction、
+retry successor、semantic repair、probe resolution、HITL CLAIMED/STARTED/continuation 与 unblock 前后的
+崩溃边界。恢复后不得重复 executor attempt ID、覆盖 canonical 工件、重置 conflict 或把 projection 当真相。

@@ -1,6 +1,8 @@
 # 受约束的动态 Agent 编排
 
-> **状态：已批准，实施中。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
+> **状态：实现已落地，Task 12 全量验证待完成。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
+> Task 11 已移除旧固定宏观控制源码并同步 L1 eval 与权威文档；最终 `Implemented` 状态仅由
+> Task 12 的全量验证记录确认。本文中的旧符号只保留在明确标注的旧设计、拒绝方案或迁移边界中。
 >
 > **协议修订：已批准、具有约束力。** 2026-08-05；artifact bundle、attempt-scoped staging、
 > staging-aware validation、multi-intent commit 与 typed probe resolution 是对 Tasks 1/4/7/8/9

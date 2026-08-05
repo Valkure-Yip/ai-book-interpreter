@@ -10,15 +10,16 @@
 ### 规则 D1: 单向依赖
 
 ```
-types → config → ir → project → epub → qa → release → tools → stages → orchestrator → cli
+types → config → ir → project → epub → qa → release → tools → actions → planning → orchestrator → cli
 providers (llm, agent_runtime, observability) ← 任何业务层（但 providers 不依赖业务）
 ```
 
-- `project`：书籍工程目录合约 + `pipeline_state.json` 状态机（替代旧 `runs/<book_id>/<run_id>` 布局）。
+- `project`：书籍工程目录、artifact promotion 与 `state/run.db` RunLedger 合约。
 - `epub` / `qa` / `release`：确定性产物层（EPUB 构建、出版 lint、随机抽检、版本发布），不调用 LLM，只被 `tools` 调用。
-- `tools`：暴露给 agent 的工具带（文件读写、ingest、门禁脚本、子 agent），是业务确定性层与 agent 运行时之间的唯一桥梁。
-- `stages`：00→19 各阶段的 agent 调用 + 确定性门禁校验。
-- `orchestrator`：驱动 28 态状态机，按阶段顺序自循环到 `DONE`。
+- `tools`：attempt-aware、默认拒绝的 scoped 工具带，是业务层与 agent runtime 的桥梁。
+- `actions`：注册 capability、schema、effects、权限、validator、retry 与 read/write sets。
+- `planning`：从完整 policy snapshot 计算 eligibility，验证 Planner 的短期 `PlanPatch` 并调度无冲突 Action。
+- `orchestrator`：controller、dispatcher、reconciler、committer 与 lifecycle；不拥有绕过 ledger 的状态写入口。
 
 **Lint**：`tools/lint/layered_imports.py` 解析 import 图，违反时报错并指出修复方法。
 
@@ -92,15 +93,16 @@ log.event("paragraph.translated", paragraph_id=pid, tokens=tu, cost_usd=c)
 
 ## 5. Prompt 工程
 
-### 规则 D10: 阶段提示集中且参数化
+### 规则 D10: Planner 与 Action prompt 分离
 
-00→19 阶段提示位于 `src/abi/prompts/stages/*.md.j2`，由 `src/abi/prompts/stages.py` 的
-`STAGE_SEQUENCE` 绑定到状态、门禁、工具子集与迭代上限，并以 `{source}-{target}` /
-`{target}` 参数化。全局编排守则（含 forbidden 列表）在 `_system.md.j2`。
+Planner 只接收压缩的 `planner_snapshot`、eligible capabilities 与预算，输出强类型 `PlanPatch`；
+Action harness 只加载该 Action 的输入、skills 与 scoped tools。翻译 Action 仍只得到原文、5–8 条
+文体规则与命中术语，禁止混入 QA、EPUB、release 或宏观 transition 指令。
 
-### 规则 D11: 阶段链可渲染
+### 规则 D11: Prompt 不授权业务事实
 
-每个 `StageSpec` 的模板必须能用标准上下文变量渲染（CI 中遍历 `STAGE_SEQUENCE` 渲染断言）。
+Prompt、模型输出、LangGraph checkpoint 和 `events.jsonl` 都不能写 run/Action/gate/success。
+业务 transition 只由 PolicyEngine、RunLedger、Reconciler 或 Committer 的确定性代码完成。
 
 ## 6. 输出与装配
 
@@ -111,12 +113,13 @@ log.event("paragraph.translated", paragraph_id=pid, tokens=tu, cost_usd=c)
 - `asset_manifest_check`：所有被引用图片均为本地且存在
 - `epubcheck`：EPUBCheck（Java jar）无 fatal / error
 
-任一 FAIL 即阻断；门禁结果写入 `output/*.json`，由 stage validator 复核。
+任一 FAIL 即按 Registry 映射进入 semantic repair，或 fail closed 为 integrity block；PASS gate receipt
+必须与完整 promotion intent 集同事务持久化，并在 unified canonical postcheck 后才能提交 success。
 
 ### 规则 D13: 章节-译文对应完整
 
 `chapters/src/` 中每个章节都必须在 `chapters/translated/` 有对应译文，并在章节门禁
-PASS 后进入 `chapters/final/`；缺一即 stage validator 失败，不得进入构建。
+PASS 后进入 `chapters/final/`；缺一即 validator 失败，不得授权构建或 release Action。
 
 ## 7. 文档与代码同步
 

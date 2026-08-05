@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +31,44 @@ from abi.types.orchestration import (
     Succeeded,
 )
 from abi.types.tools import ReviewActionIdentity, ToolBinding
+
+
+def _architecture_linter(name: str):  # type: ignore[no-untyped-def]
+    path = Path("tools/lint/architecture.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_architecture_linter_reports_legacy_control_symbols(tmp_path: Path) -> None:
+    """Catch a fixed macro controller being introduced anywhere in business source."""
+    module = tmp_path / "src/abi/orchestrator/old.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("HAPPY_PATH = []\n", encoding="utf-8")
+
+    violations = _architecture_linter("legacy_symbol_fixture").scan_tree(
+        tmp_path / "src/abi"
+    )
+
+    assert [(item.rule, item.symbol) for item in violations] == [
+        ("fixed-macro-control", "HAPPY_PATH")
+    ]
+
+
+def test_repository_has_no_legacy_control_symbols() -> None:
+    """Catch the removed fixed stage/state path surviving under another import or alias."""
+    violations = _architecture_linter("repository_legacy_symbols").scan_tree(
+        Path("src/abi")
+    )
+
+    assert [
+        (item.path, item.line, item.symbol)
+        for item in violations
+        if item.rule == "fixed-macro-control"
+    ] == []
 
 
 class _Project:

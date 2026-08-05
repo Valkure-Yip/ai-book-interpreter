@@ -7,8 +7,8 @@
 
 ## 项目一句话
 
-一个**自包含的自主翻译 agent**：输入公版书（txt/epub），按编号阶段提示 `00→19` 驱动
-**28 态状态机**，调用工具、自循环过质量门禁，输出版本化、经质量门禁的 EPUB 译本。
+一个**自包含的自主翻译 agent**：输入公版书（txt/epub），由受约束的
+`Planner + Policy + durable action loop` 选择下一动作，自循环过确定性质量门禁，输出版本化 EPUB。
 （这是 `public-domain-books-translation` 工作流的进程内独立 agent 化实现。）
 
 ## 仓库布局
@@ -39,25 +39,25 @@ ai-book-interpreter/
 | --- | --- |
 | 理解整体架构与分层 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) |
 | 看强制不变量与分层规则 | [`docs/DESIGN.md`](./docs/DESIGN.md) |
-| 理解 28 态状态机与阶段链 | `src/abi/project/state.py` + `src/abi/prompts/stages.py` |
-| 看阶段提示（00→19） | `src/abi/prompts/stages/*.md.j2` |
+| 理解动态控制循环与 durable state | `src/abi/orchestrator/controller.py` + `src/abi/project/run_ledger.py` |
+| 看 Action 注册、权限与执行合约 | `src/abi/actions/` + `src/abi/planning/` |
 | 看 agent 工具带 | `src/abi/tools/` |
 | 看 agent 运行时（LangGraph） | `src/abi/providers/agent_runtime/` |
-| 理解 LangGraph 单元如何组建 28 态流水线 + 持久化分层 | [`docs/design-docs/langgraph-and-state-machine.md`](./docs/design-docs/langgraph-and-state-machine.md) |
+| 理解 LangGraph runtime 与 RunLedger/checkpoint 分层 | [`docs/design-docs/langgraph-and-state-machine.md`](./docs/design-docs/langgraph-and-state-machine.md) |
 | 看下一代受约束动态编排设计（Planner + Policy + durable loop） | [`docs/design-docs/dynamic-agent-orchestration.md`](./docs/design-docs/dynamic-agent-orchestration.md) |
 | 看 EPUB 构建 / 门禁 | `src/abi/epub/` |
 | 看随机抽检 / 卓越线 | `src/abi/qa/` + `src/abi/assets/references/stratified_random_spotcheck.md` |
 | 看版本化发布 / 私人自用 | `src/abi/release/` + `src/abi/assets/references/release_versioning.md` |
 | 改 CLI 命令或参数 | `src/abi/cli/main.py` |
-| 处理重试、限流、断点 | [`docs/RELIABILITY.md`](./docs/RELIABILITY.md) + `state/pipeline_state.json` |
+| 处理重试、限流、断点 | [`docs/RELIABILITY.md`](./docs/RELIABILITY.md) + `state/run.db` |
 | 看 eval 标准 / 该衡量哪些指标 | [`docs/design-docs/eval-standard.md`](./docs/design-docs/eval-standard.md)（L1 流程可信度 / L2 中间产物+逐章译文 / L3 最终产物） |
 | 现在该干什么？ | [`docs/exec-plans/active/`](./docs/exec-plans/active/) |
 
 ## 核心不变量（违反就是 bug，由 linter 强制）
 
-1. **分层依赖单向**：`types → config → ir → project → epub → qa → release → tools → stages → orchestrator → cli`，横切只能走 `providers`。详见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
+1. **分层依赖单向**：`types → config → ir → project → epub → qa → release → tools → actions → planning → orchestrator → cli`，横切只能走 `providers`。详见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
 2. **边界处解析数据形状**：所有外部输入（LLM 响应、文件、CLI 参数）必须用 `pydantic` 在边界处解析为强类型，不允许 dict 透传。
-3. **状态机是唯一真相**：流程进度只由 `state/pipeline_state.json`（28 态）决定；门禁结果由确定性 validator 判定，agent 不得自行宣布 PASS。
+3. **RunLedger 是唯一业务真相**：run/plan/Action/attempt/receipt/gate/intent/incident 只写 `state/run.db`；checkpoint 与投影不授权 transition，agent 不得自行宣布 PASS。
 4. **LLM 调用必须可观测**：所有 LLM 调用（含子 agent）走 `providers.llm` 的 `LLMRouter` 或 `providers.agent_runtime` 的 `AgentRuntime`，自动接入 Langfuse trace + `events.jsonl` + `BudgetGate`。业务层禁止直接 import `langchain*` / `langgraph*` / `langfuse*`。
 5. **结构化日志**：禁止 `print` / 裸 `logging.info(str)`；事件走 `events.jsonl`。
 6. **翻译调用精简**：每章翻译只喂原文 + 5-8 条文体规则 + 命中术语，只输出译文；不混入 QA / EPUB / release 规则。

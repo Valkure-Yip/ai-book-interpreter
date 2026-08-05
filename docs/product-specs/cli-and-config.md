@@ -1,94 +1,84 @@
 # CLI and Configuration
 
-## 命令总览
+## 1. Lifecycle commands
 
-```
-abi <subcommand> [options]
-```
-
-| 子命令 | 用途 |
-| --- | --- |
-| `abi translate` | 跑完整三遍流水线 |
-| `abi survey` | 仅跑 Pass 0+1（产出概要、思维导图、术语表） |
-| `abi resume` | 从最近的 run 续跑 |
-| `abi runs ls` | 列出本地 run |
-| `abi runs show <run-id>` | 查看某 run 的 manifest + 报告 |
-| `abi glossary edit <book-id>` | 启动编辑器编辑术语表，保存后自动重跑受影响段落 |
-| `abi config` | 查看/设置配置 |
-| `abi cost` | 汇总历史成本 |
-
-## `abi translate`
-
-```
-abi translate <input> [-o OUTPUT] [options]
+```text
+abi make-book SOURCE [options]
+abi resume PROJECT_ROOT [options]
+abi inspect PROJECT_ROOT
+abi approve PROJECT_ROOT --interrupt ID --decision approve|reject [--feedback TEXT]
+abi unblock PROJECT_ROOT --reason TEXT --evidence-ref REF ... [recovery options]
+abi cancel PROJECT_ROOT
 ```
 
-### 主要参数
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `<input>` | — | 输入文件（txt/epub/pdf） |
-| `-o, --output` | `./out` | 输出目录或单文件路径 |
-| `--target` | `zh` | 目标语言（ISO 639-1） |
-| `--source-lang` | auto | 源语言（自动检测） |
-| `--mode` | `translated` | 一个或多个：`translated,bilingual,annotated,survey-only` |
-| `--base-url` | `$LLM_BASE_URL` | OpenAI 兼容端点（如 `https://api.deepseek.com/v1`） |
-| `--model` | 配置默认 | 模型名（如 `gpt-4o-mini`、`deepseek-chat`） |
-| `--quality` | `standard` | `fast` / `standard` / `high` |
-| `--concurrency` | `4` | 章节并行度 |
-| `--max-cost-usd` | none | 超额自动暂停（带 checkpoint） |
-| `--dry-run` | false | 仅产出 Pass 1，不翻译 |
-| `--force-rerun` | false | 忽略 checkpoint，从头重跑 |
-| `--chapters` | none | 仅翻译指定的顶层章节，如 `1,3-5`（1-indexed） |
-| `--resume` | none | 从已有 run 续跑；传 `<run_id>` 或 `latest`，复用同一 run dir + 已有 survey/checkpoint |
-| `--no-refine-toc` | false | 跳过 ingest 与 survey 之间的 LLM 目录重建步骤；保留 heuristic 切章结果，少一次 LLM 调用 |
-| `--ocr` | false | PDF 走 OCR |
-
-### 通过环境变量调优 (v0.1)
-
-| 环境变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `ABI_WINDOW_BEFORE` | `3` | 滑动窗口的"前若干段"数量 |
-| `ABI_WINDOW_AFTER` | `2` | 滑动窗口的"后若干段"数量 |
-| `ABI_BATCH_SIZE` | `1` | 单次 LLM 请求翻译多少段。> 1 时启用批量翻译模板，显著降低请求数。代价：同一批次内的段落彼此看不到对方译文。批量模式下 `prev_window` / `next_window` 自动剔除 batch 内段落，避免上下文与目标段重复。 |
-| `ABI_SHORT_CHAPTER_THRESHOLD` | `15` | 当章节段落数 ≤ N 时，忽略上面的 `ABI_WINDOW_*`，把**整章作为上下文**喂给每一段（即 `prev_window` = 该段之前的同章全部段，`next_window` = 之后的同章全部段，永不跨章）。消除短文（新闻评论、随笔、博客）场景下 naive single-prompt baseline 的结构优势。设为 `0` 关闭。 |
-| `ABI_CONCURRENCY` | `4` | 章节并行度（等价于 `--concurrency`） |
-| `ABI_TOC_REFINE` | `1` | 是否启用 ingest 后的 LLM 目录重建（pass 0.5）。`0` 跳过。CLI `--no-refine-toc` 等价。失败/超时会安全降级回 heuristic 切章。 |
-
-### 上下文调参
-
-| 参数 | 默认 |
+| 命令 | 用户可见行为 |
 | --- | --- |
-| `--window.before` | 3 |
-| `--window.after` | 2 |
-| `--window.glossary-max` | 40 |
-| `--window.token-budget` | 6000 |
+| `make-book` | scaffold 书籍工程、放置 txt/epub 输入、创建唯一 durable run、驱动到 terminal 或 safe stop |
+| `resume` | 从 `state/run.db` 恢复该工程唯一 run；零/多 run 或 identity 不一致 fail closed |
+| `inspect` | 只读 run/plan/Action/receipt/gate/intent/incident/budget 与当前 public HITL identity，给出下一安全操作 |
+| `approve` | 对 exact public interrupt 提交 ordered decision/feedback，走 append-only HITL continuation |
+| `unblock` | 恢复 budget pause，或以人工 evidence 替换 integrity-blocked Action；不处理 semantic repair |
+| `cancel` | 幂等取消非 completed run；不重开 terminal run |
 
-### 风格参数
+没有宏观阶段参数或“运行到某一步”的兼容入口。Planner 根据 durable facts 选择 eligible capability；用户
+通过 `inspect` 查看当前事实和可复制的 recovery command。
 
-| 参数 | 说明 |
-| --- | --- |
-| `--register` | 强制覆盖自动检测（`academic-formal` / `academic-accessible` / `popular-science` / `textbook` / `literary`） |
-| `--quote-style` | `「」` / `"…"` / `""`。**注意**：这里设定的是 _源文本身出现引号_ 时翻译应使用的引号样式 — prompt 显式告诉模型不要给术语 / 概念 / 专名包引号，除非源文也包了。 |
-| `--punctuation` | `full` / `half` / `preserve` |
+## 2. `make-book`
 
-### 高级
+```text
+abi make-book SOURCE \
+  --source-target en-zh-Hans \
+  [--title SLUG] [--books-root books] \
+  [--mode public_domain|licensed|private_use] [--profile NAME] \
+  [--base-url URL] [--model MODEL] [--max-cost-usd N] [--config FILE]
+```
 
-| 参数 | 说明 |
-| --- | --- |
-| `--no-survey` | 跳过 Pass 1（不推荐；用已有 survey 时配合 `--survey-from`） |
-| `--survey-from <dir>` | 复用已有 Pass 1 工件 |
-| `--prompt-version <agent>=<v>` | 指定某 agent 的 prompt 版本 |
-| `--config <file>` | 加载配置文件 |
+输入仅支持实现声明的 txt/epub path 或 URL。`private_use` 写入 private books root。命令创建书籍工程、
+`state/run.db`、attempt staging 和 checkpoint 父目录；同一工程只拥有一个 business run。
 
-## 配置文件
+## 3. HITL approve
 
-`~/.abi/config.yaml`（用户级） + `./abi.yaml`（项目级，优先级更高）：
+`inspect` 显示 interrupt ID、action/attempt、claim status、continuation sequence 与完整 approve command。
+`approve` 的 decision/feedback 顺序必须和 public reviews 一一对应，且只接受该 review 声明的 decision。
+命令不会改写初始 Paused receipt，也不会直接提交成功；continuation 交回 Reconciler/Committer。
+
+## 4. Integrity unblock
+
+```text
+abi unblock PROJECT_ROOT \
+  --reason "operator resolved canonical conflict" \
+  --evidence-ref ticket-42 \
+  --source-action ACTION_ID \
+  --resolved-canonical path/to/file:removed
+
+abi unblock PROJECT_ROOT \
+  --reason "selected verified canonical artifact" \
+  --evidence-ref ticket-43 \
+  --source-action ACTION_ID \
+  --resolved-canonical path/to/file:selected:SHA256
+```
+
+每个 conflict path 必须 exact coverage。成功后旧 Action/attempt/receipt/intent 保持不变，创建 new plan、
+Action ID 与 staging。budget-only unblock 只需 reason/evidence，不带 source 或 canonical resolution。
+
+## 5. Eval commands
+
+```text
+abi eval trace PROJECT_ROOT
+abi eval book PROJECT_ROOT [--source-lang en] [--target-lang zh-Hans]
+abi eval calibrate DATASET
+```
+
+`trace` 从 RunLedger typed reads 重放 L1 gate/policy conformance；`book` 汇总 L1/L2/L3。eval 不读取
+checkpoint 私有表或 raw SQLite。
+
+## 6. Configuration
+
+优先级：CLI overrides > `--config`/项目配置 > 用户配置 > 内置默认值。边界解析为 frozen `RunConfig`。
 
 ```yaml
-# v0.1：所有 LLM 都通过 OpenAI 兼容协议接入，靠 base_url 区分
 llm:
-  base_url: https://api.openai.com/v1   # 由 LLM_BASE_URL env 覆盖
+  base_url: https://api.openai.com/v1
   api_key_env: LLM_API_KEY
   model: gpt-4o-mini
   temperature: 0.2
@@ -96,110 +86,18 @@ llm:
 
 observability:
   langfuse:
-    enabled: true                       # 缺凭据时自动 no-op，不报错
-    host: https://cloud.langfuse.com    # 自托管时换成你自己的 URL
-    public_key_env: LANGFUSE_PUBLIC_KEY
-    secret_key_env: LANGFUSE_SECRET_KEY
-    upload_full_payload: false          # 默认仅上传 metadata + token usage
-
-defaults:
-  target: zh
-  mode: [translated, annotated]
-  quality: standard
-  concurrency: 4
-
-# LLM-driven目录/章节识别（pass 0.5）。默认 true；失败时安全降级，仅一次额外 LLM 调用。
-refine_toc: true
-
-window:
-  before: 3
-  after: 2
-  glossary_max: 40
-  token_budget: 6000
-
-style:
-  quote_style: "「」"
-  punctuation: full
+    enabled: true
+    upload_full_payload: false
 
 cost:
-  hard_cap_usd: 50           # 单 run 上限
+  hard_cap_usd: 50
   warn_at_usd: 10
 ```
 
-### 常用兼容端点示例
+API keys 只从环境变量读取，不写入工程、events、checkpoint 或 report。`--max-cost-usd` 只覆盖本次运行
+预算；hard cap 产生 durable budget pause，可提高额度后显式恢复。
 
-```bash
-# OpenAI 官方
-export LLM_BASE_URL=https://api.openai.com/v1
-export LLM_API_KEY=$OPENAI_API_KEY
+## 7. 退出与安全停止
 
-# DeepSeek
-export LLM_BASE_URL=https://api.deepseek.com/v1
-export LLM_API_KEY=$DEEPSEEK_API_KEY
-
-# 本地 Ollama（启动时加 OpenAI 兼容层）
-export LLM_BASE_URL=http://localhost:11434/v1
-export LLM_API_KEY=ollama   # 占位即可
-
-# 自建 vLLM
-export LLM_BASE_URL=http://gpu-host:8000/v1
-export LLM_API_KEY=$INTERNAL_TOKEN
-```
-
-## 配置优先级
-
-CLI 参数 > 项目 `./abi.yaml` > 用户 `~/.abi/config.yaml` > 内置默认值
-
-所有配置最终合并为一个 `RunConfig`，写入 `manifest.json`，便于复现。
-
-## Quality Preset
-
-| preset | 行为 |
-| --- | --- |
-| `fast` | window.before=1, after=0, 关闭自审，模型可降级 |
-| `standard` | 默认参数（见上） |
-| `high` | window.before=5, after=3, 启用 `TranslationReviewer` 自审，max_retries=3 |
-
-## 退出码
-
-| code | 含义 |
-| --- | --- |
-| 0 | 成功，无 flag |
-| 0 + warning | 成功但有 flagged 段（stderr 输出汇总） |
-| 1 | 参数错误 |
-| 2 | 输入文件解析失败 |
-| 3 | LLM provider 不可用 |
-| 4 | 成本上限触发，已 checkpoint |
-| 5 | 其他运行时错误（详见 `events.jsonl`） |
-
-## 进度显示
-
-默认（TTY 下）：rich 进度条，显示 当前 pass / 章节进度 / 段落进度 / 累计 token 与 cost。
-
-`--quiet`：仅输出错误。
-`--json-events`：把 `events.jsonl` 镜像到 stdout，便于 CI/脚本消费。
-
-## 示例
-
-```bash
-# 最简（默认走 $LLM_BASE_URL）
-abi translate book.epub
-
-# 显式指定端点 + 模型
-abi translate book.epub --base-url https://api.deepseek.com/v1 --model deepseek-chat
-
-# 高质量 + 多输出（v0.2 才支持 annotated / quality high）
-abi translate book.txt -o ./out --mode translated,bilingual
-
-# 仅概要
-abi survey book.epub -o ./survey-only
-
-# 本地离线（Ollama 兼容端点）
-abi translate book.txt --base-url http://localhost:11434/v1 --model qwen2.5:32b
-
-# 续跑
-abi resume
-
-# 编辑术语表后增量重跑（v0.2）
-abi glossary edit ab12cd34
-```
+CLI 输出 run ID、status、blocked reason 与工程路径。参数/输入/provider/运行时错误使用非零退出；预算、
+HITL 与 integrity stop 是可检查的 durable 状态，不通过删除 checkpoint 或改写 projection 恢复。

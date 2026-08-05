@@ -208,3 +208,7 @@ terminal、next pause 与不确定阻断三类裁决支持同一 attempt/thread 
 
 业务层继续不得 import `langchain*` / `langgraph*` / `langfuse*`。公共边界只传 frozen typed model；
 checkpoint 永远不能替代 RunLedger，也不能被 lifecycle 当作可查询业务数据库。
+
+L1 eval 同样只通过 RunLedger typed public reads 取得 plan、attempt、outcome/effective outcome、gate、
+intent、repair、probe、HITL、unblock 与 outbox facts；不得读取 checkpointer 私有表或绕过 repository
+查询 SQLite。它重放 policy conformance，而不是固定路径的状态子序列。

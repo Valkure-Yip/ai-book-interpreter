@@ -351,6 +351,20 @@ class RepairFactRecord(FrozenModel):
     recorded_at: datetime
 
 
+class UnblockResolutionRecord(FrozenModel):
+    """Immutable operator evidence bound to one durable unblock decision."""
+
+    resolution_id: str
+    run_id: str
+    source_action_id: str | None = None
+    request_digest: str
+    request: UnblockRequest
+    plan_version: int | None = Field(default=None, ge=1)
+    replacement_action_id: str | None = None
+    staging_relpath: str | None = None
+    resolved_at: datetime
+
+
 class ProbeResolutionRequest(FrozenModel):
     """Caller-bound facts required to resolve one indeterminate operation."""
 
@@ -480,6 +494,14 @@ class RunLedger:
         """List durable business runs in stable creation order."""
         rows = await self._fetch_all("SELECT * FROM runs ORDER BY created_at, run_id", ())
         return tuple(self._run_from_row(row) for row in rows)
+
+    async def list_plan_versions(self, run_id: str) -> tuple[PlanVersionRecord, ...]:
+        """List immutable Planner patches in their durable version order."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT * FROM plan_versions WHERE run_id = ? ORDER BY version", (run_id,)
+        )
+        return tuple(self._plan_version_from_row(row) for row in rows)
 
     async def append_plan(self, run_id: str, patch: PlanPatch) -> PlanVersionRecord:
         now = self._now()
@@ -1456,6 +1478,18 @@ class RunLedger:
         if row is None:
             raise LedgerNotFoundError("probe resolution is absent")
         return self._probe_resolution_from_row(row)
+
+    async def list_probe_resolutions(self, run_id: str) -> tuple[ProbeResolutionRecord, ...]:
+        """List immutable probe decisions whose original Action belongs to one run."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT probe_resolutions.* FROM probe_resolutions "
+            "JOIN actions ON actions.action_id = probe_resolutions.original_action_id "
+            "WHERE actions.run_id = ? ORDER BY probe_resolutions.resolved_at, "
+            "probe_resolutions.original_action_id, probe_resolutions.original_attempt",
+            (run_id,),
+        )
+        return tuple(self._probe_resolution_from_row(row) for row in rows)
 
     async def get_probe_resolution_for_probe(
         self, probe_action_id: str, probe_attempt: int
@@ -3406,6 +3440,15 @@ class RunLedger:
         )
         return tuple(self._outbox_event_from_row(row) for row in rows)
 
+    async def list_outbox_events(self, run_id: str) -> tuple[OutboxEventRecord, ...]:
+        """List all durable business events, including already projected events."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT rowid AS sequence, * FROM event_outbox WHERE run_id = ? ORDER BY rowid",
+            (run_id,),
+        )
+        return tuple(self._outbox_event_from_row(row) for row in rows)
+
     async def mark_event_delivered(
         self, event_id: str, *, run_id: str | None = None
     ) -> OutboxEventRecord:
@@ -3599,6 +3642,53 @@ class RunLedger:
             (run_id,),
         )
         return tuple(self._gate_receipt_from_row(row) for row in rows)
+
+    async def list_repair_facts(self, run_id: str) -> tuple[RepairFactRecord, ...]:
+        """List receipt-bound repair classifications for one run."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT repair_facts.* FROM repair_facts "
+            "JOIN actions ON actions.action_id = repair_facts.action_id "
+            "WHERE actions.run_id = ? ORDER BY repair_facts.recorded_at, "
+            "repair_facts.action_id, repair_facts.attempt",
+            (run_id,),
+        )
+        return tuple(self._repair_fact_from_row(row) for row in rows)
+
+    async def list_unblock_resolutions(
+        self, run_id: str
+    ) -> tuple[UnblockResolutionRecord, ...]:
+        """List immutable human/budget unblock decisions for one run."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT * FROM unblock_resolutions WHERE run_id = ? "
+            "ORDER BY resolved_at, resolution_id",
+            (run_id,),
+        )
+        return tuple(self._unblock_resolution_from_row(row) for row in rows)
+
+    async def list_interrupt_decisions(
+        self, run_id: str
+    ) -> tuple[InterruptDecisionRecord, ...]:
+        """List durable HITL decisions for a run in public-claim order."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT * FROM interrupts WHERE run_id = ? ORDER BY created_at, interrupt_id",
+            (run_id,),
+        )
+        return tuple(self._interrupt_decision_from_row(row) for row in rows)
+
+    async def list_run_hitl_continuation_receipts(
+        self, run_id: str
+    ) -> tuple[HitlContinuationReceiptRecord, ...]:
+        """List append-only HITL continuation receipts for one run."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT * FROM hitl_continuation_receipts WHERE run_id = ? "
+            "ORDER BY action_id, attempt, sequence",
+            (run_id,),
+        )
+        return tuple(self._hitl_continuation_from_row(row) for row in rows)
 
     async def list_incidents(
         self, run_id: str, *, open_only: bool = False
@@ -4116,6 +4206,15 @@ class RunLedger:
         )
 
     @staticmethod
+    def _plan_version_from_row(row: aiosqlite.Row) -> PlanVersionRecord:
+        return PlanVersionRecord(
+            run_id=row["run_id"],
+            version=row["version"],
+            patch=PlanPatch.model_validate_json(row["patch_json"]),
+            created_at=_parse_time(row["created_at"]),
+        )
+
+    @staticmethod
     def _promotion_intent_from_row(row: aiosqlite.Row) -> PromotionIntent:
         status = _promotion_status(row["status"], row["intent_id"])
         return PromotionIntent(
@@ -4275,6 +4374,20 @@ class RunLedger:
             message=row["message"],
             outcome_digest=row["outcome_digest"],
             recorded_at=_parse_time(row["recorded_at"]),
+        )
+
+    @staticmethod
+    def _unblock_resolution_from_row(row: aiosqlite.Row) -> UnblockResolutionRecord:
+        return UnblockResolutionRecord(
+            resolution_id=row["resolution_id"],
+            run_id=row["run_id"],
+            source_action_id=row["source_action_id"],
+            request_digest=row["request_digest"],
+            request=UnblockRequest.model_validate_json(row["request_json"]),
+            plan_version=row["plan_version"],
+            replacement_action_id=row["replacement_action_id"],
+            staging_relpath=row["staging_relpath"],
+            resolved_at=_parse_time(row["resolved_at"]),
         )
 
     @staticmethod
