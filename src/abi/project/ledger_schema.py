@@ -1,6 +1,5 @@
 """SQLite schema for the durable orchestration business ledger."""
 
-
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -8,6 +7,12 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
+    book_slug TEXT NOT NULL,
+    source_lang TEXT NOT NULL,
+    target_lang TEXT NOT NULL,
+    source_target TEXT NOT NULL,
+    publication_mode TEXT NOT NULL,
+    profile TEXT,
     budget_usd REAL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -242,11 +247,31 @@ WHERE status = 'OPEN' AND subject IS NOT NULL;
 CREATE TABLE IF NOT EXISTS interrupts (
     interrupt_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    reason TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
+    action_id TEXT NOT NULL REFERENCES actions(action_id),
+    attempt INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    pause_outcome_digest TEXT NOT NULL,
+    pending_interrupt_json TEXT NOT NULL,
+    decisions_json TEXT NOT NULL,
+    decision_digest TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    continuation_sequence INTEGER,
     resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS hitl_continuation_receipts (
+    continuation_id TEXT PRIMARY KEY,
+    interrupt_id TEXT NOT NULL UNIQUE REFERENCES interrupts(interrupt_id),
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    action_id TEXT NOT NULL REFERENCES actions(action_id),
+    attempt INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    canonical_outcome_json TEXT NOT NULL,
+    outcome_digest TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (action_id, attempt, sequence)
 );
 
 CREATE TABLE IF NOT EXISTS budget_entries (
@@ -256,6 +281,19 @@ CREATE TABLE IF NOT EXISTS budget_entries (
     attempt INTEGER,
     amount_usd REAL NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS unblock_resolutions (
+    resolution_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    source_action_id TEXT REFERENCES actions(action_id),
+    request_digest TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    plan_version INTEGER,
+    replacement_action_id TEXT REFERENCES actions(action_id),
+    staging_relpath TEXT,
+    resolved_at TEXT NOT NULL,
+    UNIQUE (run_id, request_digest)
 );
 
 CREATE TABLE IF NOT EXISTS event_outbox (

@@ -155,9 +155,7 @@ class ArtifactBundleEntry(FrozenModel):
 
     @field_validator("metadata")
     @classmethod
-    def _ordered_metadata(
-        cls, value: tuple[ArtifactMetadata, ...]
-    ) -> tuple[ArtifactMetadata, ...]:
+    def _ordered_metadata(cls, value: tuple[ArtifactMetadata, ...]) -> tuple[ArtifactMetadata, ...]:
         names = tuple(item.name for item in value)
         if names != tuple(sorted(names)) or len(names) != len(set(names)):
             raise ValueError("artifact metadata must be uniquely ordered by name")
@@ -208,9 +206,7 @@ class ExpectedArtifact(FrozenModel):
 
     @field_validator("metadata")
     @classmethod
-    def _ordered_metadata(
-        cls, value: tuple[ArtifactMetadata, ...]
-    ) -> tuple[ArtifactMetadata, ...]:
+    def _ordered_metadata(cls, value: tuple[ArtifactMetadata, ...]) -> tuple[ArtifactMetadata, ...]:
         names = tuple(item.name for item in value)
         if names != tuple(sorted(names)) or len(names) != len(set(names)):
             raise ValueError("expected metadata must be uniquely ordered by name")
@@ -223,9 +219,7 @@ class ExpectedArtifactManifest(FrozenModel):
 
     @field_validator("entries")
     @classmethod
-    def _ordered_entries(
-        cls, value: tuple[ExpectedArtifact, ...]
-    ) -> tuple[ExpectedArtifact, ...]:
+    def _ordered_entries(cls, value: tuple[ExpectedArtifact, ...]) -> tuple[ExpectedArtifact, ...]:
         paths = tuple(item.canonical_relpath for item in value)
         if paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
             raise ValueError("expected artifacts must be uniquely ordered by canonical path")
@@ -299,7 +293,9 @@ class ActionView(FrozenModel):
         values = (self.repair_class, self.repair_source, self.reason_code)
         if self.status is ActionStatus.REPAIR_REQUIRED and not all(values):
             raise ValueError("REPAIR_REQUIRED actions need class/source/reason")
-        if self.status is not ActionStatus.REPAIR_REQUIRED and any(item is not None for item in values):
+        if self.status is not ActionStatus.REPAIR_REQUIRED and any(
+            item is not None for item in values
+        ):
             raise ValueError("non-repair actions may not carry repair classification")
         return self
 
@@ -450,8 +446,13 @@ class Paused(FrozenModel):
 
 
 ActionOutcome = Annotated[
-    Succeeded | RetryableFailure | RepairRequired | PermanentFailure | Indeterminate
-    | ProbeResolution | Paused,
+    Succeeded
+    | RetryableFailure
+    | RepairRequired
+    | PermanentFailure
+    | Indeterminate
+    | ProbeResolution
+    | Paused,
     Field(discriminator="kind"),
 ]
 
@@ -543,9 +544,7 @@ class GateReceiptPayload(FrozenModel):
 
     @model_validator(mode="after")
     def _validate_gate(self) -> Self:
-        _require_canonical_json(
-            self.canonical_gate_decision_json, label="gate receipt JSON"
-        )
+        _require_canonical_json(self.canonical_gate_decision_json, label="gate receipt JSON")
         if sha256_canonical_json(self.canonical_gate_decision_json) != self.gate_decision_digest:
             raise ValueError("gate receipt digest mismatch")
         decision = GateDecision.model_validate_json(self.canonical_gate_decision_json)
@@ -553,7 +552,10 @@ class GateReceiptPayload(FrozenModel):
             raise ValueError("gate receipt JSON is not canonical")
         if decision.passed is not True:
             raise ValueError("gate receipt requires a PASS decision")
-        if decision.validator_id != self.validator_id or decision.validator_version != self.validator_version:
+        if (
+            decision.validator_id != self.validator_id
+            or decision.validator_version != self.validator_version
+        ):
             raise ValueError("gate validator identity mismatch")
         if decision.bundle_digest != self.bundle_digest:
             raise ValueError("gate bundle digest mismatch")
@@ -593,3 +595,53 @@ class RunResult(FrozenModel):
     status: RunStatus
     cost_usd: float = Field(default=0.0, ge=0)
     blocked_reason: str | None = None
+
+
+class CanonicalResolutionEvidence(FrozenModel):
+    """Human evidence that one conflicting canonical path was explicitly resolved."""
+
+    canonical_relpath: str
+    disposition: Literal["removed", "selected"]
+    evidence_ref: str = Field(min_length=1)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("canonical_relpath")
+    @classmethod
+    def _canonical_key(cls, value: str) -> str:
+        return canonical_artifact_key(value)
+
+    @model_validator(mode="after")
+    def _selected_checksum(self) -> Self:
+        if self.disposition == "selected" and self.sha256 is None:
+            raise ValueError("selected canonical resolution requires its verified sha256")
+        if self.disposition == "removed" and self.sha256 is not None:
+            raise ValueError("removed canonical resolution may not claim a surviving sha256")
+        return self
+
+
+class UnblockRequest(FrozenModel):
+    """Explicit operator evidence for an integrity or budget unblock."""
+
+    reason: str = Field(min_length=1)
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+    source_action_id: str | None = None
+    canonical_resolutions: tuple[CanonicalResolutionEvidence, ...] = ()
+
+    @model_validator(mode="after")
+    def _unique_evidence(self) -> Self:
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("unblock evidence refs must be unique")
+        paths = tuple(item.canonical_relpath for item in self.canonical_resolutions)
+        if len(paths) != len(set(paths)):
+            raise ValueError("canonical resolutions must address each path exactly once")
+        if any(item.evidence_ref not in self.evidence_refs for item in self.canonical_resolutions):
+            raise ValueError("canonical resolution evidence must be listed in evidence_refs")
+        return self
+
+
+class UnblockResult(FrozenModel):
+    run_id: str
+    status: RunStatus
+    plan_version: int | None = Field(default=None, ge=1)
+    replacement_action_id: str | None = None
+    staging_relpath: str | None = None

@@ -17,9 +17,27 @@ from abi.config.loader import (
     default_user_config_path,
     load_dotenv,
 )
-from abi.orchestrator import make_book, resume
-from abi.project.layout import BookProject
-from abi.project.state import HAPPY_PATH, Status, happy_index
+from abi.orchestrator.run import (
+    InterruptDecisionRequest,
+    approve_interrupt,
+    cancel,
+    inspect_run,
+    make_book,
+    resume,
+    unblock,
+)
+from abi.project import BookProject, RunLedger
+from abi.project.run_ledger import LedgerTransitionError
+from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
+    ActionStatus,
+    CanonicalResolutionEvidence,
+    Paused,
+    RunResult,
+    RunStatus,
+    UnblockRequest,
+)
+from abi.types.run import RunConfig
 
 app = typer.Typer(
     add_completion=False,
@@ -51,7 +69,7 @@ def _overrides(
     return o
 
 
-def _config(config_file: Path | None, **ov: Any):
+def _config(config_file: Path | None, **ov: Any) -> RunConfig:
     load_dotenv()
     return build_run_config(
         user_config_path=default_user_config_path(),
@@ -60,21 +78,13 @@ def _config(config_file: Path | None, **ov: Any):
     )
 
 
-def _resolve_until(until: str | None) -> Status | None:
-    if not until:
-        return None
-    try:
-        return Status(until)
-    except ValueError as exc:
-        valid = ", ".join(s.value for s in HAPPY_PATH)
-        raise typer.BadParameter(f"invalid --until {until!r}. Valid: {valid}") from exc
-
-
 @app.command("make-book")
 def make_book_cmd(
     source: str = typer.Argument(..., help="Source file path or URL (.txt or .epub)."),
     source_target: str = typer.Option(
-        "en-zh-Hans", "--source-target", "-st",
+        "en-zh-Hans",
+        "--source-target",
+        "-st",
         help="Language-pair template, e.g. 'en-zh-Hans', 'ja-es', 'fr-en'.",
     ),
     title: str | None = typer.Option(None, "--title", help="Book slug / title."),
@@ -82,23 +92,20 @@ def make_book_cmd(
         Path("books"), "--books-root", help="Root for book projects: {root}/{target}/..."
     ),
     mode: str = typer.Option(
-        "public_domain", "--mode",
+        "public_domain",
+        "--mode",
         help="public_domain | licensed | private_use.",
     ),
     profile: str | None = typer.Option(None, "--profile", help="Optional book-type profile."),
-    until: str | None = typer.Option(
-        None, "--until", help="Stop after reaching this Status (e.g. TRANSLATED)."
-    ),
     base_url: str | None = typer.Option(None, "--base-url"),
     model: str | None = typer.Option(None, "--model"),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd"),
     config_file: Path | None = typer.Option(None, "--config"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
-    """Scaffold a new book project and run the agent to DONE (or --until)."""
+    """Scaffold a project, create one durable run, and drive it to a safe stop."""
     _setup_logging(verbose)
     config = _config(config_file, base_url=base_url, model=model, max_cost_usd=max_cost_usd)
-    until_status = _resolve_until(until)
     if mode == "private_use":
         books_root = books_root / "private"
 
@@ -114,8 +121,6 @@ def make_book_cmd(
             book_slug=title,
             publication_mode=mode,
             profile=profile,
-            until=until_status,
-            max_stage_attempts=config.max_stage_attempts,
         )
     )
     _print_result(project, result)
@@ -124,52 +129,208 @@ def make_book_cmd(
 @app.command("resume")
 def resume_cmd(
     project_root: Path = typer.Argument(..., help="Existing book-project directory."),
-    until: str | None = typer.Option(None, "--until"),
     base_url: str | None = typer.Option(None, "--base-url"),
     model: str | None = typer.Option(None, "--model"),
     max_cost_usd: float | None = typer.Option(None, "--max-cost-usd"),
     config_file: Path | None = typer.Option(None, "--config"),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
-    """Resume an existing book project from its persisted pipeline state."""
+    """Resume the exact durable business run owned by a book project."""
     _setup_logging(verbose)
     config = _config(config_file, base_url=base_url, model=model, max_cost_usd=max_cost_usd)
     project, result = asyncio.run(
         resume(
             project_root=project_root,
             config=config,
-            until=_resolve_until(until),
-            max_stage_attempts=config.max_stage_attempts,
         )
     )
     _print_result(project, result)
 
 
-@app.command("state")
-def state_cmd(
+@app.command("inspect")
+def inspect_cmd(
     project_root: Path = typer.Argument(..., help="Book-project directory."),
 ) -> None:
-    """Show the pipeline state machine + gate status for a project."""
-    project = BookProject(Path(project_root).expanduser().resolve())
-    if not project.exists():
-        console.print(f"[red]no project state at[/] {project.state_path}")
-        raise typer.Exit(code=1)
-    st = project.load_state()
-    console.print(f"[bold]{project.root.name}[/]  ({st.source_target}, {st.publication_mode})")
-    console.print(f"  status: [green]{st.status.value}[/]  step: {st.current_step}")
-    if st.last_error:
-        console.print(f"  last_error: [red]{st.last_error}[/]")
+    """Inspect authoritative run facts and print the next safe recovery."""
+    report = asyncio.run(inspect_run(project_root=project_root))
+    console.print(f"[bold]{report.run.run_id}[/]  [green]{report.run.status.value}[/]")
+    console.print(f"Plan version: {report.snapshot.plan_version}")
+    actions = Table(title="Actions")
+    actions.add_column("Capability")
+    actions.add_column("Status")
+    actions.add_column("Action ID")
+    for action in report.actions:
+        actions.add_row(action.capability, action.status.value, action.action_id)
+    console.print(actions)
+    console.print(f"Gates: {len(report.gate_receipts)} durable PASS receipt(s)")
+    console.print(f"Outcome receipts: {len(report.outcome_receipts)}")
+    console.print(f"Promotion intents: {len(report.promotion_intents)}")
+    console.print("Open incidents")
+    for incident in report.open_incidents:
+        console.print(f"  - {incident.error_code}: {incident.message}")
+    remaining = report.snapshot.remaining_budget_usd
+    console.print(
+        f"Budget: spent=${report.budget_spent_usd:.4f} "
+        f"remaining={'unlimited' if remaining is None else f'${remaining:.4f}'}"
+    )
+    console.print(f"Next safe recovery: {report.next_safe_recovery}")
 
-    table = Table(title="Happy path")
-    table.add_column("")
-    table.add_column("Status")
-    cur = happy_index(st.status)
-    for i, s in enumerate(HAPPY_PATH):
-        mark = "[green]✓[/]" if i < cur else ("[yellow]>[/]" if i == cur else " ")
-        table.add_row(mark, s.value)
-    console.print(table)
-    if st.gates:
-        console.print("Gates: " + ", ".join(f"{k}={v}" for k, v in st.gates.items()))
+
+@app.command("cancel")
+def cancel_cmd(
+    project_root: Path = typer.Argument(..., help="Book-project directory."),
+) -> None:
+    """Idempotently cancel a non-completed durable run."""
+    run = asyncio.run(cancel(project_root=project_root))
+    console.print(f"{run.run_id}: {run.status.value}")
+
+
+@app.command("unblock")
+def unblock_cmd(
+    project_root: Path = typer.Argument(..., help="Book-project directory."),
+    reason: str = typer.Option(..., "--reason"),
+    evidence_refs: list[str] = typer.Option(..., "--evidence-ref"),
+    source_action_id: str | None = typer.Option(None, "--source-action"),
+    resolved_canonical: list[str] | None = typer.Option(
+        None,
+        "--resolved-canonical",
+        help="PATH:removed or PATH:selected:SHA256; repeat for every conflict.",
+    ),
+) -> None:
+    """Resume budget pause or replace one evidence-resolved integrity Action."""
+    resolutions = tuple(_parse_resolution(value) for value in resolved_canonical or ())
+    result = asyncio.run(
+        unblock(
+            project_root=project_root,
+            request=UnblockRequest(
+                reason=reason,
+                evidence_refs=tuple(evidence_refs),
+                source_action_id=source_action_id,
+                canonical_resolutions=resolutions,
+            ),
+        )
+    )
+    console.print(f"{result.run_id}: {result.status.value}")
+    if result.replacement_action_id is not None:
+        console.print(f"replacement action: {result.replacement_action_id}")
+
+
+def _parse_resolution(value: str) -> CanonicalResolutionEvidence:
+    parts = value.rsplit(":", 2)
+    if len(parts) == 2 and parts[1] == "removed":
+        return CanonicalResolutionEvidence(
+            canonical_relpath=parts[0],
+            disposition="removed",
+            evidence_ref="cli-canonical-resolution",
+        )
+    if len(parts) == 3 and parts[1] == "selected":
+        return CanonicalResolutionEvidence(
+            canonical_relpath=parts[0],
+            disposition="selected",
+            sha256=parts[2],
+            evidence_ref="cli-canonical-resolution",
+        )
+    raise typer.BadParameter("resolved canonical must be PATH:removed or PATH:selected:SHA256")
+
+
+@app.command("approve")
+def approve_cmd(
+    project_root: Path = typer.Argument(..., help="Book-project directory."),
+    interrupt_id: str = typer.Argument(..., help="One public HITL interrupt ID."),
+    decision: list[str] = typer.Option(
+        ..., "--decision", help="approve | reject; repeat in checkpoint order."
+    ),
+    feedback: list[str] | None = typer.Option(
+        None, "--feedback", help="Optional feedback; repeat one-for-one with decisions."
+    ),
+    base_url: str | None = typer.Option(None, "--base-url"),
+    model: str | None = typer.Option(None, "--model"),
+    max_cost_usd: float | None = typer.Option(None, "--max-cost-usd"),
+    config_file: Path | None = typer.Option(None, "--config"),
+    verbose: bool = typer.Option(False, "-v", "--verbose"),
+) -> None:
+    """Resume one durable HITL interrupt by its public ID."""
+    invalid = tuple(item for item in decision if item not in ("approve", "reject"))
+    if invalid:
+        raise typer.BadParameter("decision must be lowercase approve or reject")
+    ordered_feedback: tuple[str | None, ...]
+    if feedback is None:
+        ordered_feedback = tuple(None for _ in decision)
+    elif len(feedback) != len(decision):
+        raise typer.BadParameter("feedback must be repeated one-for-one with decisions")
+    else:
+        ordered_feedback = tuple(feedback)
+    _setup_logging(verbose)
+    config = _config(
+        config_file,
+        base_url=base_url,
+        model=model,
+        max_cost_usd=max_cost_usd,
+    )
+    outcome = asyncio.run(
+        approve_interrupt_by_id(
+            project_root=project_root,
+            interrupt_id=interrupt_id,
+            decisions=tuple(decision),
+            feedback=ordered_feedback,
+            config=config,
+        )
+    )
+    console.print(f"{outcome.action_id}:{outcome.attempt}: {outcome.outcome.kind}")
+
+
+async def approve_interrupt_by_id(
+    *,
+    project_root: Path,
+    interrupt_id: str,
+    decisions: tuple[str, ...],
+    feedback: tuple[str | None, ...],
+    config: RunConfig,
+) -> ActionOutcomeEnvelope:
+    """Resolve one public interrupt solely from current authoritative ledger facts."""
+    project = BookProject(Path(project_root).expanduser().resolve())
+    report = await inspect_run(project_root=project.root)
+    if report.run.status is not RunStatus.PAUSED_HITL:
+        raise LedgerTransitionError(
+            f"run {report.run.run_id} is not PAUSED_HITL; inspect before approving"
+        )
+    paused_actions = {
+        action.action_id for action in report.actions if action.status is ActionStatus.PAUSED
+    }
+    matches: list[tuple[str, int]] = []
+    async with RunLedger.open(project.run_db) as ledger:
+        for receipt in report.outcome_receipts:
+            if receipt.action_id not in paused_actions:
+                continue
+            effective = await ledger.get_effective_attempt_outcome(
+                receipt.action_id, receipt.attempt
+            )
+            envelope = ActionOutcomeEnvelope.model_validate_json(effective.canonical_outcome_json)
+            if not isinstance(envelope.outcome, Paused):
+                continue
+            if any(
+                pending.interrupt_id == interrupt_id
+                for pending in envelope.outcome.pending_hitl_interrupts
+            ):
+                matches.append((receipt.action_id, receipt.attempt))
+    if len(matches) != 1:
+        raise LedgerTransitionError(
+            f"public interrupt {interrupt_id!r} matched {len(matches)} current paused "
+            "attempts; inspect the durable run before approving"
+        )
+    action_id, attempt = matches[0]
+    return await approve_interrupt(
+        project_root=project.root,
+        request=InterruptDecisionRequest(
+            run_id=report.run.run_id,
+            action_id=action_id,
+            attempt=attempt,
+            interrupt_id=interrupt_id,
+            decisions=decisions,
+            feedback=feedback,
+        ),
+        config=config,
+    )
 
 
 eval_app = typer.Typer(
@@ -184,7 +345,9 @@ app.add_typer(eval_app, name="eval")
 @eval_app.command("calibrate")
 def eval_calibrate_cmd(
     dataset: str = typer.Option(
-        ..., "--dataset", "-d",
+        ...,
+        "--dataset",
+        "-d",
         help="Dataset spec, e.g. 'wmt24pp:en-zh_CN:literary' (add ':stub=true' offline).",
     ),
     out_dir: Path = typer.Option(Path("eval-out"), "--out", "-o", help="Output root."),
@@ -207,8 +370,12 @@ def eval_calibrate_cmd(
         table.add_column(col)
     for r in results:
         table.add_row(
-            r.source_target, str(r.n), f"{r.ratio_p10}", f"{r.ratio_p50}",
-            f"{r.ratio_p90}", f"[{r.suggested_lo}, {r.suggested_hi}]",
+            r.source_target,
+            str(r.n),
+            f"{r.ratio_p10}",
+            f"{r.ratio_p50}",
+            f"{r.ratio_p90}",
+            f"[{r.suggested_lo}, {r.suggested_hi}]",
             f"[{r.current_lo}, {r.current_hi}]",
         )
     console.print(table)
@@ -228,8 +395,9 @@ def eval_trace_cmd(
     _setup_logging(verbose)
     report = run_trace(project_root, out_dir=out_dir)
     color = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}.get(report.verdict, "white")
-    console.print(f"[bold]{report.book}[/]  status={report.status}  "
-                  f"verdict=[{color}]{report.verdict}[/]")
+    console.print(
+        f"[bold]{report.book}[/]  status={report.status}  verdict=[{color}]{report.verdict}[/]"
+    )
     console.print(
         f"  gate_integrity={report.gate_integrity_ok}  "
         f"reached_states={report.reached_states_ok}  "
@@ -237,8 +405,10 @@ def eval_trace_cmd(
     )
     for g in report.gate_integrity:
         if not g.consistent:
-            console.print(f"  [red]✗ {g.gate}[/]: recorded={g.recorded} "
-                          f"replay_ok={g.replay_ok} — {g.replay_reason}")
+            console.print(
+                f"  [red]✗ {g.gate}[/]: recorded={g.recorded} "
+                f"replay_ok={g.replay_ok} — {g.replay_reason}"
+            )
     if report.skipped_states:
         console.print(f"  [yellow]skipped:[/] {', '.join(report.skipped_states)}")
     console.print(
@@ -256,10 +426,10 @@ def eval_book_cmd(
         Path("eval-out"), "--out", "-o", help="Write reports here (set '' to skip)."
     ),
     source_lang: str | None = typer.Option(
-        None, "--source-lang", help="Override source lang (default from pipeline_state)."
+        None, "--source-lang", help="Override source lang (default from durable run metadata)."
     ),
     target_lang: str | None = typer.Option(
-        None, "--target-lang", help="Override target lang (default from pipeline_state)."
+        None, "--target-lang", help="Override target lang (default from durable run metadata)."
     ),
     verbose: bool = typer.Option(False, "-v", "--verbose"),
 ) -> None:
@@ -276,9 +446,7 @@ def eval_book_cmd(
     def _c(v: str) -> str:
         return f"[{col.get(v, 'white')}]{v}[/]"
 
-    console.print(
-        f"[bold]{report.book}[/]  status={report.status}  总判定={_c(report.verdict)}"
-    )
+    console.print(f"[bold]{report.book}[/]  status={report.status}  总判定={_c(report.verdict)}")
     console.print(
         f"  L1 流程={_c(report.l1.verdict)}  "
         f"L2 译文={_c(report.l2.verdict)}  "
@@ -309,15 +477,12 @@ def eval_book_cmd(
         raise typer.Exit(code=1)
 
 
-def _print_result(project: BookProject, result: Any) -> None:
+def _print_result(project: Any, result: RunResult) -> None:
     console.print()
-    icon = "[bold green]✓[/]" if result.final_status == Status.DONE else "[bold yellow]…[/]"
-    console.print(f"{icon} pipeline stopped at [bold]{result.final_status.value}[/]")
+    icon = "[bold green]✓[/]" if result.status.value == "COMPLETED" else "[bold yellow]…[/]"
+    console.print(f"{icon} run stopped at [bold]{result.status.value}[/]")
     console.print(f"  project: {project.root}")
     console.print(f"  cost:    ${result.cost_usd:.4f}")
-    for o in result.stages_run:
-        status = "[green]ok[/]" if o.ok else f"[red]FAIL: {o.reason}[/]"
-        console.print(f"   - {o.stage_id}: {status} ({o.attempts} attempt(s))")
     if result.blocked_reason:
         console.print(f"  [red]blocked:[/] {result.blocked_reason}")
         console.print(f"  resume with: [dim]abi resume {project.root}[/]")

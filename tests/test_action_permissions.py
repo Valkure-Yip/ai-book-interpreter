@@ -65,9 +65,9 @@ def test_filesystem_handler_rechecks_action_permissions(tmp_path: Path) -> None:
     with pytest.raises(PermissionError, match="not allowed to write"):
         write_file.callable(path="glossary/terms.csv", content="forbidden")
 
-    assert (
-        tmp_path / "state/staging/translate-001/1/chapters/translated/001.md"
-    ).read_text(encoding="utf-8") == "allowed"
+    assert (tmp_path / "state/staging/translate-001/1/chapters/translated/001.md").read_text(
+        encoding="utf-8"
+    ) == "allowed"
     assert not (tmp_path / "chapters/translated/001.md").exists()
     assert not (tmp_path / "glossary/terms.csv").exists()
     store.close()
@@ -97,7 +97,9 @@ def test_reviewers_cannot_write_canonical_translation_or_output() -> None:
     )
 
     assert envelope.permissions.can_read("chapters/final/001.md")
-    assert not envelope.permissions.can_write("reviews/random_spotcheck/round_001/validation_report.json")
+    assert not envelope.permissions.can_write(
+        "reviews/random_spotcheck/round_001/validation_report.json"
+    )
     assert not envelope.permissions.can_write("chapters/final/001.md")
     assert not envelope.permissions.can_write("output/book.epub")
 
@@ -119,9 +121,7 @@ def test_retrospective_can_propose_but_not_mutate_shared_skills() -> None:
     envelope = build_action_envelope("retrospective.capture", EmptyInput())
 
     assert envelope.permissions.can_write("retrospective/template_update_suggestions.md")
-    assert not envelope.permissions.can_write(
-        "skills/translation-quality-defect-families/skill.md"
-    )
+    assert not envelope.permissions.can_write("skills/translation-quality-defect-families/skill.md")
 
 
 def test_build_epub_input_rejects_ignored_path_and_chapter_options() -> None:
@@ -149,7 +149,8 @@ def test_gate_handler_checks_all_read_roots_before_calling_lower_layer(
         write_files=("output/publication_lint.json",),
     )
     tool = next(
-        item for item in make_gate_tools(context, permissions=permissions)
+        item
+        for item in make_gate_tools(context, permissions=permissions)
         if item.name == "publication_lint"
     )
 
@@ -171,7 +172,7 @@ def test_publication_lint_gate_uses_typed_metadata_without_legacy_state(
     def forbidden_state_access(self: BookProject) -> object:
         raise AssertionError("Action gate must not read pipeline_state.json")
 
-    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access, raising=False)
     permissions = ActionPathPermissions(
         read_dirs=("frontmatter", "chapters/final", "metadata"),
         write_files=("output/publication_lint.json",),
@@ -218,7 +219,7 @@ def test_release_gate_uses_typed_mode_without_legacy_state(
     def forbidden_state_access(self: BookProject) -> object:
         raise AssertionError("Action release must not read pipeline_state.json")
 
-    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access, raising=False)
     permissions = ActionPathPermissions(
         read_files=("output/book.epub",),
         read_dirs=("reviews/random_spotcheck", "metadata"),
@@ -262,9 +263,7 @@ def test_release_gate_checks_every_read_and_destination_root_before_lower_call(
     monkeypatch.setattr("abi.release.create.create_release", forbidden_lower_layer)
     read_files = () if missing_root == "output/book.epub" else ("output/book.epub",)
     read_dirs = tuple(
-        root
-        for root in ("reviews/random_spotcheck", "metadata")
-        if root != missing_root
+        root for root in ("reviews/random_spotcheck", "metadata") if root != missing_root
     )
     write_dirs = () if missing_root == "output/release" else ("output/release",)
     permissions = ActionPathPermissions(

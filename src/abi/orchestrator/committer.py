@@ -70,7 +70,7 @@ class Committer:
     ) -> CommittedAction:
         """Validate receipts, persist all intents, promote all, then commit once."""
         try:
-            receipt = await self._ledger.get_attempt_outcome(action.action_id, attempt)
+            receipt = await self._ledger.get_effective_attempt_outcome(action.action_id, attempt)
             caller_envelope = ActionOutcomeEnvelope(
                 action_id=action.action_id,
                 attempt=attempt,
@@ -110,9 +110,7 @@ class Committer:
                 raise ValueError("bundle contains a canonical path outside Action write permission")
             await self._artifacts.require_exact_staging(action.action_id, attempt)
             snapshot = await self._ledger.load_snapshot(run_id)
-            view = StagingEvidenceView.for_bundle(
-                self._project, snapshot.artifacts, bundle
-            )
+            view = StagingEvidenceView.for_bundle(self._project, snapshot.artifacts, bundle)
         except (OSError, TypeError, ValueError) as exc:
             await self._integrity_conflict(
                 action,
@@ -123,12 +121,8 @@ class Committer:
             raise ArtifactConflictError("commit receipt or bundle binding failed") from exc
 
         try:
-            resolved = self._registry.resolve_json(
-                action.capability, action.parameters_json
-            )
-            decision = resolved.definition.validator(
-                view, resolved.parameters, bundle
-            )
+            resolved = self._registry.resolve_json(action.capability, action.parameters_json)
+            decision = resolved.definition.validator(view, resolved.parameters, bundle)
         except Exception as exc:
             await self._integrity_conflict(
                 action,
@@ -162,9 +156,7 @@ class Committer:
                 canonical_relpath=entry.canonical_relpath,
                 checksum=checksum,
             )
-            for entry, checksum in zip(
-                bundle.entries, view.artifact_checksums, strict=True
-            )
+            for entry, checksum in zip(bundle.entries, view.artifact_checksums, strict=True)
         )
         gate_json = canonical_model_json(decision)
         gate_payload = GateReceiptPayload(
@@ -179,9 +171,7 @@ class Committer:
             evidence_refs=decision.evidence_refs,
         )
         self._invoke_hook("before_gate_receipt_and_intents", gate_payload)
-        _, intents = await self._ledger.create_gate_receipt_and_bundle_intents(
-            gate_payload
-        )
+        _, intents = await self._ledger.create_gate_receipt_and_bundle_intents(gate_payload)
         self._invoke_hook("after_gate_receipt_and_intents", intents)
 
         return await self._promote_and_finalize(
@@ -203,12 +193,9 @@ class Committer:
         """Resume promotion from the durable gate receipt without rerunning validation."""
         if action.run_id != run_id:
             raise ValueError("Action belongs to a different run; reconcile the owning run")
-        gate, intents = await self._ledger.get_gate_receipt_and_intents(
-            action.action_id, attempt
-        )
+        gate, intents = await self._ledger.get_gate_receipt_and_intents(action.action_id, attempt)
         expected_paths = tuple(
-            item.canonical_relpath
-            for item in action.expected_artifact_manifest.entries
+            item.canonical_relpath for item in action.expected_artifact_manifest.entries
         )
         actual_paths = tuple(item.canonical_relpath for item in intents)
         if actual_paths != expected_paths:
@@ -219,9 +206,7 @@ class Committer:
                 message="Durable promotion intents are not the complete expected bundle.",
             )
             raise ArtifactConflictError("durable promotion intent set is partial")
-        decision = GateDecision.model_validate_json(
-            gate.canonical_gate_decision_json
-        )
+        decision = GateDecision.model_validate_json(gate.canonical_gate_decision_json)
         return await self._promote_and_finalize(
             action=action,
             attempt=attempt,
@@ -251,9 +236,7 @@ class Committer:
                 raise ArtifactConflictError("bundle contains a conflicting intent")
             self._invoke_hook("before_intent_promotion", intent)
             promoted_intent = (
-                intent
-                if intent.status == "COMMITTED"
-                else await self._artifacts.promote(intent)
+                intent if intent.status == "COMMITTED" else await self._artifacts.promote(intent)
             )
             promoted.append(promoted_intent)
             self._invoke_hook("after_intent_promotion", promoted_intent)
@@ -261,15 +244,11 @@ class Committer:
                 self._invoke_hook("between_bundle_entries", promoted_intent)
         self._invoke_hook("after_all_intents_committed", tuple(promoted))
 
-        committed_intents = await self._artifacts.verify_committed_bundle(
-            action.action_id, attempt
-        )
+        committed_intents = await self._artifacts.verify_committed_bundle(action.action_id, attempt)
         self._invoke_hook("after_unified_bundle_postcheck", committed_intents)
         artifacts = tuple(
             ArtifactCommit(
-                artifact_id=(
-                    f"artifact:{action.action_id}:{attempt}:{intent.ordinal}"
-                ),
+                artifact_id=(f"artifact:{action.action_id}:{attempt}:{intent.ordinal}"),
                 relpath=intent.canonical_relpath,
                 sha256=intent.checksum,
                 producer_action_id=action.action_id,
@@ -284,9 +263,7 @@ class Committer:
             validator_version=decision.validator_version,
             artifact_checksums=decision.artifact_checksums,
         )
-        self._invoke_hook(
-            "before_success_ledger_commit", (artifacts, gate_evidence)
-        )
+        self._invoke_hook("before_success_ledger_commit", (artifacts, gate_evidence))
         result = await self._ledger.commit_success(
             SuccessCommit(
                 action_id=action.action_id,
@@ -308,10 +285,8 @@ class Committer:
         cost_usd: float = 0.0,
     ) -> CommittedAction:
         """Resume only from the immutable ordinary-success receipt."""
-        receipt = await self._ledger.get_attempt_outcome(action.action_id, attempt)
-        envelope = ActionOutcomeEnvelope.model_validate_json(
-            receipt.canonical_outcome_json
-        )
+        receipt = await self._ledger.get_effective_attempt_outcome(action.action_id, attempt)
+        envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
         if not isinstance(envelope.outcome, Succeeded):
             raise ValueError(
                 "resume_success requires an ordinary-success receipt; route the durable outcome kind"
@@ -346,7 +321,6 @@ class Committer:
 
 def _write_allowed(canonical_relpath: str, write_set: tuple[str, ...]) -> bool:
     return any(
-        canonical_relpath == permitted
-        or canonical_relpath.startswith(permitted.rstrip("/") + "/")
+        canonical_relpath == permitted or canonical_relpath.startswith(permitted.rstrip("/") + "/")
         for permitted in write_set
     )

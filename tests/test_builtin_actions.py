@@ -55,11 +55,22 @@ def test_builtin_catalog_has_closed_dependencies_and_validators() -> None:
     registry = build_action_registry()
     registry.validate_startup()
     assert {item.capability for item in registry.specs()} >= {
-        "source.ingest", "source.split", "research.global", "research.book",
-        "translation.trial", "glossary.prepare", "chapter.translate",
-        "chapter.control", "chapter.review", "preproduction.spec",
-        "preproduction.sample", "epub.build", "review.spotcheck",
-        "review.independent", "release.prepare", "output.finalize",
+        "source.ingest",
+        "source.split",
+        "research.global",
+        "research.book",
+        "translation.trial",
+        "glossary.prepare",
+        "chapter.translate",
+        "chapter.control",
+        "chapter.review",
+        "preproduction.spec",
+        "preproduction.sample",
+        "epub.build",
+        "review.spotcheck",
+        "review.independent",
+        "release.prepare",
+        "output.finalize",
         "retrospective.capture",
     }
 
@@ -175,9 +186,7 @@ async def test_source_action_executes_the_typed_source_path(tmp_path: Path) -> N
         for entry in result.outcome.artifact_bundle.entries
         if entry.canonical_relpath == "source/source_text.txt"
     )
-    assert "Alternate source." in (project.root / clean.staged_relpath).read_text(
-        encoding="utf-8"
-    )
+    assert "Alternate source." in (project.root / clean.staged_relpath).read_text(encoding="utf-8")
     assert not project.source_clean.exists()
 
 
@@ -197,7 +206,7 @@ async def test_release_action_passes_typed_mode_without_legacy_state(
     def forbidden_state_access(self: BookProject) -> object:
         raise AssertionError("release.prepare must not read pipeline_state.json")
 
-    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access, raising=False)
     tool_context = SimpleNamespace(
         project=project,
         config=None,
@@ -219,9 +228,7 @@ async def test_release_action_passes_typed_mode_without_legacy_state(
     )
 
     assert isinstance(result.outcome, Succeeded)
-    assert tuple(
-        entry.canonical_relpath for entry in result.outcome.artifact_bundle.entries
-    ) == (
+    assert tuple(entry.canonical_relpath for entry in result.outcome.artifact_bundle.entries) == (
         "output/release/book_v0.0.1.epub",
         "output/release/release_state.json",
     )
@@ -294,7 +301,12 @@ def test_prompt_snapshot_never_reads_legacy_pipeline_state(
     def forbidden_state_access() -> object:
         raise AssertionError("Action prompts must not read pipeline_state.json")
 
-    monkeypatch.setattr(BookProject, "load_state", lambda self: forbidden_state_access())
+    monkeypatch.setattr(
+        BookProject,
+        "load_state",
+        lambda self: forbidden_state_access(),
+        raising=False,
+    )
     context = ActionExecutionContext(
         project=project,
         run_id="run-1",
@@ -333,9 +345,7 @@ def test_registry_rejects_nonportable_machine_namespaces(
     async def executor(context: object, parameters: object) -> object:
         raise AssertionError("not executed")
 
-    registry = ActionRegistry(
-        predicates=PredicateCatalog(), validators={"unused": validator}
-    )
+    registry = ActionRegistry(predicates=PredicateCatalog(), validators={"unused": validator})
     definition = ActionDefinition(
         spec=ActionSpec(
             capability=capability,

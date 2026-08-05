@@ -7,15 +7,9 @@ directory names. The agent's filesystem tools are sandboxed to ``root``.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-
-from abi.project.state import PipelineState, Status
-
-STATE_FILE = "state/pipeline_state.json"
-RUN_LOG = "state/run.log"
 
 # Full directory contract — created on scaffold.
 CONTRACT_DIRS: tuple[str, ...] = (
@@ -215,14 +209,6 @@ class BookProject:
 
     # --- state ---
     @property
-    def state_path(self) -> Path:
-        return self.root / STATE_FILE
-
-    @property
-    def run_log(self) -> Path:
-        return self.root / RUN_LOG
-
-    @property
     def run_db(self) -> Path:
         """SQLite business ledger for this book project."""
         return self.root / "state/run.db"
@@ -258,26 +244,6 @@ class BookProject:
         except ValueError:
             return False
 
-    def load_state(self) -> PipelineState:
-        data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        return PipelineState.model_validate(data)
-
-    def save_state(self, state: PipelineState) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(
-            state.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(self.state_path)
-
-    def append_log(self, line: str) -> None:
-        self.run_log.parent.mkdir(parents=True, exist_ok=True)
-        with self.run_log.open("a", encoding="utf-8") as f:
-            f.write(line.rstrip("\n") + "\n")
-
     def exists(self) -> bool:
-        return self.state_path.exists()
-
-    def initial_status(self) -> Status:
-        return self.load_state().status if self.exists() else Status.INIT
+        """Return whether this project has an initialized durable business ledger."""
+        return self.run_db.is_file()

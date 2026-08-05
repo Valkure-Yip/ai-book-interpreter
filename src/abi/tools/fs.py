@@ -77,9 +77,7 @@ def make_fs_tools(
     def read_file(path: str) -> str:
         """Read a UTF-8 text file inside the project. Path is project-relative."""
         require_read(path)
-        if writer is not None and path in {
-            entry.canonical_relpath for entry in writer.entries
-        }:
+        if writer is not None and path in {entry.canonical_relpath for entry in writer.entries}:
             return writer.read_bytes(path).decode("utf-8", errors="replace")
         p = ctx.resolve(path)
         if not p.exists():
@@ -112,7 +110,6 @@ def make_fs_tools(
             evidence_role=expected.evidence_role if expected is not None else "action_output",
             metadata=expected.metadata if expected is not None else (),
         )
-        ctx.project.append_log(f"write_file: {path} ({len(content)} chars)")
         return f"wrote {len(content)} chars to {path}"
 
     def append_file(path: str, content: str) -> str:
@@ -159,8 +156,7 @@ def make_fs_tools(
         matches = sorted(
             ctx.project.rel(p)
             for p in ctx.project.root.glob(pattern)
-            if p.is_file()
-            and (permissions is None or permissions.can_read(ctx.project.rel(p)))
+            if p.is_file() and (permissions is None or permissions.can_read(ctx.project.rel(p)))
         )
         return "\n".join(matches) if matches else "(no matches)"
 

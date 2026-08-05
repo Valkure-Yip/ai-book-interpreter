@@ -1,201 +1,309 @@
-"""End-to-end orchestrator run with a stubbed agent (no network / no LLM).
-
-The stub inspects which stage is running and writes exactly the artifacts the
-deterministic validators require, exercising the full state machine, gates, and
-driver wiring from INIT to DONE.
-"""
+"""Offline end-to-end proof for the durable dynamic controller."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
-from abi.orchestrator.driver import Orchestrator
-from abi.project import ScaffoldRequest, Status, scaffold_project
-from abi.providers.agent_runtime import AgentActionRequest
-from abi.tools.context import ToolContext
+from abi.actions import ActionDefinition, ActionRegistry, PredicateCatalog
+from abi.actions.evidence import StagingEvidenceView
+from abi.orchestrator.committer import Committer
+from abi.orchestrator.controller import DynamicController
+from abi.orchestrator.dispatcher import Dispatcher
+from abi.orchestrator.projector import OutboxProjector
+from abi.orchestrator.reconcile import Reconciler
+from abi.planning.context import SnapshotBuilder
+from abi.planning.policy import PolicyEngine
+from abi.planning.scheduler import Scheduler
+from abi.project import ArtifactStore, RunLedger, RunSeed, ScaffoldRequest, scaffold_project
+from abi.providers.observability.events import EventLogger
+from abi.providers.orchestration_runtime import DurableLoopRuntime
+from abi.types._base import FrozenModel
 from abi.types.orchestration import (
-    AgentRunResult,
-    ArtifactBundle,
-    ArtifactBundleEntry,
+    ActionArgument,
+    ActionKind,
+    ActionOutcomeEnvelope,
+    ActionSpec,
+    ActionStatus,
+    EffectSpec,
+    EvidenceSpec,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
+    GateDecision,
+    PlanningContext,
+    PlanPatch,
+    PredicateSpec,
+    ProposedAction,
+    RetryPolicySpec,
+    RunSnapshot,
+    RunStatus,
     Succeeded,
 )
+from abi.types.tools import GateRuntimeMetadata
 
 
-class _FakeServices:
-    """Minimal stand-in for RunServices and its Action runtime."""
-
-    def __init__(self, project, ingest_split, gates) -> None:
-        self.agent = _FakeAgent(project, ingest_split, gates)
-        self.events = _NullEvents()
-        self.metrics = _NullMetrics()
-
-    def flush(self) -> None:
-        pass
+class EmptyInput(FrozenModel):
+    pass
 
 
-class _NullEvents:
-    def event(self, *a, **k):
-        pass
+class _DeterministicPlanner:
+    """Propose ingest first, then a conflict-free two-chapter batch."""
 
+    def __init__(self) -> None:
+        self.calls = 0
 
-class _NullMetrics:
-    def flush(self):
-        pass
-
-    def record_llm_call(self, **k):
-        pass
-
-
-class _FakeAgent:
-    def __init__(self, project, ingest_split, gates) -> None:
-        self._p = project
-        self._ingest_split = ingest_split
-        self._gates = gates
-
-    async def run_action(self, request: AgentActionRequest) -> AgentRunResult:
-        self._ingest_split(request.agent_name, self._p)
-        self._gates(request.agent_name, self._p)
-        return AgentRunResult(
-            outcome=Succeeded(
-                artifact_bundle=ArtifactBundle(
-                    action_id="offline",
-                    attempt=1,
-                    entries=(
-                        ArtifactBundleEntry(
-                            staged_relpath="state/staging/offline/1/result.json",
-                            canonical_relpath="result.json",
-                            media_type="application/json",
-                            evidence_role="offline_fixture",
-                        ),
-                    ),
-                )
+    async def plan(self, context: PlanningContext) -> PlanPatch:
+        self.calls += 1
+        if context.policy_snapshot.plan_version == 0:
+            return PlanPatch(
+                objective="ingest the source",
+                proposed_actions=(
+                    ProposedAction(proposal_id="ingest", capability="source.ingest"),
+                ),
+                rationale="Create the committed source evidence first.",
+            )
+        return PlanPatch(
+            objective="translate independent chapters",
+            proposed_actions=(
+                ProposedAction(proposal_id="chapter-001", capability="chapter.translate.001"),
+                ProposedAction(proposal_id="chapter-002", capability="chapter.translate.002"),
             ),
-            tool_calls=0,
-            llm_calls=0,
-            cost_usd=0.0,
-            stopped_reason="completed",
+            rationale="The chapters have disjoint canonical write sets.",
         )
 
 
-def _make_stage_writer(project):
-    """Return a function that writes the artifacts each stage needs to pass."""
+class _ChapterBatchBarrier:
+    """The test deadlocks if the two chapter actions are not dispatched together."""
 
-    def write(agent_name: str, p) -> None:
-        sid = agent_name
-        if sid.startswith("01"):
-            p.source_clean.write_text("clean text", encoding="utf-8")
-            p.source_manifest.write_text(json.dumps({"format": "txt"}), encoding="utf-8")
-        elif sid.startswith("02"):
-            p.toc_json.write_text("[]", encoding="utf-8")
-            for i in (1, 2):
-                (p.chapters_src / f"{i:03d}_c.md").write_text(
-                    f"# C{i}\n\nsrc {i}\n", encoding="utf-8"
-                )
-        elif sid.startswith("03"):
-            (p.root / "qa/benchmark").mkdir(parents=True, exist_ok=True)
-            (p.root / "qa/benchmark/global_research_ack.md").write_text("ack", encoding="utf-8")
-        elif sid.startswith("04"):
-            p.book_research.write_text("research", encoding="utf-8")
-            p.style_profile.write_text("style", encoding="utf-8")
-        elif sid.startswith("05"):
-            p.pretranslation_report.write_text("result: PASS\n", encoding="utf-8")
-        elif sid.startswith("06"):
-            p.terms_csv.write_text("term,target,status\nfoo,甲,locked\n", encoding="utf-8")
-            p.style_guide.write_text("rules", encoding="utf-8")
-        elif sid.startswith("07"):
-            for f in p.chapters_src.glob("*.md"):
-                (p.chapters_translated / f.name).write_text("# 章\n\n译文\n", encoding="utf-8")
-        elif sid.startswith("08a"):
-            for f in p.chapters_translated.glob("*.md"):
-                p.chapter_control(f.stem).write_text(
-                    "scope: FULL_CHAPTER\nissues_found: 0\nfixes_applied: 0\n"
-                    "unresolved_blocking_issues: 0\nlatest_round_status: PASS\n"
-                    "allow_next_chapter: true\n",
-                    encoding="utf-8",
-                )
-        elif sid.startswith("11"):
-            for f in p.chapters_translated.glob("*.md"):
-                p.chapter_gate(f.stem).write_text("result: PASS\n", encoding="utf-8")
-                (p.chapters_final / f.name).write_text(
-                    f.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-        elif sid.startswith("13"):
-            p.book_yaml.write_text(
-                "title: 书\nlanguage: zh-Hans\nidentifier: ''\n", encoding="utf-8"
-            )
-            p.production_spec.write_text("spec", encoding="utf-8")
-        elif sid.startswith("14"):
-            from abi.epub.build import build_sample_epub
+    def __init__(self) -> None:
+        self.started: set[str] = set()
+        self.ready = asyncio.Event()
 
-            build_sample_epub(p)
-            p.sample_review.write_text("sample_review_status: PASS\n", encoding="utf-8")
-        elif sid.startswith("15"):
-            from abi.epub import asset_manifest_check, build_epub, publication_lint
+    async def enter(self, capability: str) -> None:
+        self.started.add(capability)
+        if len(self.started) == 2:
+            self.ready.set()
+        await asyncio.wait_for(self.ready.wait(), timeout=1)
 
-            publication_lint(p)
-            asset_manifest_check(p)
-            build_epub(p)
-        elif sid.startswith("16a"):
-            from abi.qa import select_random_review_passages, validate_random_spotcheck
 
-            for _ in range(2):
-                select_random_review_passages(p, agents=2)
-                rd = sorted(p.random_spotcheck_dir.glob("round_*"))[-1]
-                for lbl in ("agent_a", "agent_b"):
-                    (rd / "reviews" / f"{lbl}_summary.json").write_text(
-                        json.dumps(
-                            {
-                                "average_score": 95,
-                                "lowest_score": 91,
-                                "open_p0_p1_p2": 0,
-                                "confidence": 0.9,
-                                "samples": [{"unit_id": "x", "score": 95}],
-                            }
-                        ),
-                        encoding="utf-8",
-                    )
-                validate_random_spotcheck(p)
-        elif sid.startswith("16_"):
-            for lbl in ("agent_a", "agent_b"):
-                (p.root / f"reviews/{lbl}").mkdir(parents=True, exist_ok=True)
-                (p.root / f"reviews/{lbl}/review.md").write_text("result: PASS\n", encoding="utf-8")
-        elif sid.startswith("18a"):
-            from abi.release import create_release
+_OUTPUTS = {
+    "source.ingest": "source/source.txt",
+    "chapter.translate.001": "chapters/translated/001.md",
+    "chapter.translate.002": "chapters/translated/002.md",
+}
 
-            create_release(p)
-        elif sid.startswith("18_"):
-            p.final_manifest.write_text("manifest", encoding="utf-8")
-        elif sid.startswith("19"):
-            p.retrospective.write_text("retro", encoding="utf-8")
-            (p.root / "retrospective/template_update_suggestions.md").write_text(
-                "s", encoding="utf-8"
-            )
 
-    return write
+def _action_succeeded(snapshot: object, arguments: tuple[ActionArgument, ...]) -> bool:
+    if len(arguments) != 1 or arguments[0].name != "capability":
+        return False
+    capability = json.loads(arguments[0].value_json)
+    return any(
+        action.capability == capability and action.status is ActionStatus.SUCCEEDED
+        for action in getattr(snapshot, "actions", ())
+    )
+
+
+def _manifest(
+    capability: str, action_id: str, _parameters: FrozenModel
+) -> ExpectedArtifactManifest:
+    return ExpectedArtifactManifest(
+        action_id=action_id,
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath=_OUTPUTS[capability],
+                media_type="text/markdown",
+                evidence_role="offline-evidence",
+            ),
+        ),
+    )
+
+
+def _gate(
+    view: StagingEvidenceView,
+    _parameters: FrozenModel,
+    _bundle: object,
+) -> GateDecision:
+    assert view.read_text(next(iter(view.paths()))).strip()
+    return GateDecision(
+        passed=True,
+        reason_code="offline_pass",
+        message="deterministic fixture evidence passed",
+        validator_id="offline",
+        validator_version="1",
+        bundle_digest=view.bundle_digest,
+        artifact_checksums=view.artifact_checksums,
+        evidence_refs=("offline-evidence",),
+    )
+
+
+def _definition(
+    capability: str,
+    *,
+    store: ArtifactStore,
+    barrier: _ChapterBatchBarrier,
+) -> ActionDefinition:
+    async def execute(context, _parameters):  # type: ignore[no-untyped-def]
+        if capability.startswith("chapter.translate"):
+            await barrier.enter(capability)
+        writer = store.writer(context.action_id, context.attempt)
+        writer.write_text(
+            _OUTPUTS[capability],
+            f"durable output for {capability}\n",
+            media_type="text/markdown",
+            evidence_role="offline-evidence",
+        )
+        return ActionOutcomeEnvelope(
+            action_id=context.action_id,
+            attempt=context.attempt,
+            outcome=Succeeded(
+                artifact_bundle=writer.artifact_bundle(),
+                evidence_refs=("offline-evidence",),
+            ),
+        )
+
+    prerequisites = ()
+    if capability.startswith("chapter.translate"):
+        prerequisites = (
+            PredicateSpec(
+                name="action.succeeded",
+                arguments=(ActionArgument(name="capability", value_json='"source.ingest"'),),
+            ),
+        )
+    output = _OUTPUTS[capability]
+    return ActionDefinition(
+        spec=ActionSpec(
+            capability=capability,
+            description=f"offline {capability}",
+            input_schema="EmptyInput",
+            action_kind=ActionKind.DETERMINISTIC,
+            prerequisites=prerequisites,
+            effects=(EffectSpec(name="artifact.produced", artifact_pattern=output),),
+            expected_evidence=(EvidenceSpec(name="offline-evidence"),),
+            tool_allowlist=(),
+            read_set=("source/source.txt",) if prerequisites else (),
+            write_set=(output,),
+            retry_policy=RetryPolicySpec(max_attempts=1),
+            validator="offline",
+        ),
+        input_model=EmptyInput,
+        executor=execute,
+        validator=_gate,  # type: ignore[arg-type]
+        effect_expander=_manifest,
+    )
+
+
+def _completed(snapshot: RunSnapshot) -> bool:
+    completed = {
+        action.capability for action in snapshot.actions if action.status is ActionStatus.SUCCEEDED
+    }
+    return {
+        "chapter.translate.001",
+        "chapter.translate.002",
+    } <= completed
 
 
 @pytest.mark.asyncio
-async def test_full_pipeline_offline(tmp_path: Path) -> None:
+async def test_dynamic_run_replans_batches_chapters_and_commits_durable_evidence(
+    tmp_path: Path,
+) -> None:
+    """Catch fixed-path orchestration or executors that bypass attempt staging."""
     project = scaffold_project(
         ScaffoldRequest(
-            target_root=tmp_path / "zh-Hans",
-            book_slug="t",
+            target_root=tmp_path,
+            book_slug="offline",
             source_lang="en",
-            target_lang="zh-Hans",
-            source_target="en-zh-Hans",
-        )
+            target_lang="zh-hans",
+            source_target="en-zh-hans",
+        ),
+        root=tmp_path / "offline",
     )
-    writer = _make_stage_writer(project)
-    services = _FakeServices(project, writer, lambda *_: None)
-    ctx = ToolContext(project=project, services=services)  # type: ignore[arg-type]
+    planner = _DeterministicPlanner()
+    barrier = _ChapterBatchBarrier()
 
-    orch = Orchestrator(ctx, max_stage_attempts=1)
-    result = await orch.run()
+    async with RunLedger.open(project.run_db) as ledger:
+        run_id = await ledger.create_run(RunSeed(run_id="offline-run"))
+        store = ArtifactStore(project, ledger)
+        try:
+            registry = ActionRegistry(
+                predicates=PredicateCatalog({"action.succeeded": _action_succeeded}),
+                validators={"offline": _gate},  # type: ignore[dict-item]
+            )
+            for capability in _OUTPUTS:
+                registry.register(_definition(capability, store=store, barrier=barrier))
+            registry.validate_startup()
+            committer = Committer(
+                ledger=ledger,
+                registry=registry,
+                project=project,
+                artifacts=store,
+            )
+            reconciler = Reconciler(
+                ledger=ledger,
+                artifacts=store,
+                registry=registry,
+                committer=committer,
+            )
+            controller = DynamicController(
+                ledger=ledger,
+                registry=registry,
+                planner=planner,
+                policy=PolicyEngine(registry),
+                snapshots=SnapshotBuilder(ledger=ledger, registry=registry),
+                scheduler=Scheduler(max_parallel=2),
+                dispatcher=Dispatcher(
+                    ledger=ledger,
+                    registry=registry,
+                    project=project,
+                    runtime_metadata=GateRuntimeMetadata(
+                        target_language="zh-hans",
+                        publication_mode="public_domain",
+                    ),
+                    source_lang="en",
+                    source_target="en-zh-hans",
+                    book_slug="offline",
+                    timeout_s=2,
+                ),
+                committer=committer,
+                reconciler=reconciler,
+                projector=OutboxProjector(
+                    ledger=ledger,
+                    events=EventLogger(project.root / "events.jsonl", run_id),
+                    status_path=project.status_projection,
+                ),
+                complete_when=_completed,
+            )
+            await DurableLoopRuntime(
+                checkpoint_path=project.graph_checkpoints,
+                max_cycles=8,
+                on_exhausted=controller.on_cycles_exhausted,
+            ).run(run_id=run_id, tick=controller.tick)
 
-    assert result.final_status == Status.DONE, result.blocked_reason
-    assert project.load_state().status == Status.DONE
-    assert project.book_epub.exists()
-    assert any(project.release_dir.glob("*.epub"))
+            snapshot = await ledger.load_snapshot(run_id)
+            assert snapshot.status is RunStatus.COMPLETED
+            assert planner.calls >= 2
+            assert barrier.started == {
+                "chapter.translate.001",
+                "chapter.translate.002",
+            }
+            assert len(snapshot.artifacts) == 3
+            assert len(snapshot.gate_evidence) == 3
+            assert all(
+                intent.status == "COMMITTED" for intent in await ledger.promotion_intents(run_id)
+            )
+            for action in await ledger.list_actions(run_id):
+                assert (await ledger.get_attempt_outcome(action.action_id, 1)).outcome_digest
+                assert (await ledger.get_gate_receipt_and_intents(action.action_id, 1))[0]
+            assert all(
+                not definition.spec.tool_allowlist
+                for definition in (
+                    registry.get("source.ingest"),
+                    registry.get("chapter.translate.001"),
+                    registry.get("chapter.translate.002"),
+                )
+            )
+            assert not (project.root / "state/pipeline_state.json").exists()
+        finally:
+            store.close()

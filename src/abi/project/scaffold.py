@@ -1,19 +1,19 @@
 """Scaffold a new book-project directory from in-package templates.
 
-This replaces PDBT's ``books/scripts/create_book_project.py`` + template copy:
-ABI ships the reference docs, skills, and metadata stubs *inside the package*
-(``abi/assets``), so a single ``abi make-book`` produces a self-contained
-project with the full directory contract and an ``INIT`` state file.
+ABI ships the reference docs, skills, and metadata stubs *inside the package*.
+Scaffolding creates the filesystem contract and empty SQLite schema; the public
+``make-book`` lifecycle creates the one durable business run.
 """
 
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from abi.project.layout import CONTRACT_DIRS, BookProject, slugify
-from abi.project.state import PipelineState, Status
+from abi.project.ledger_schema import SCHEMA_SQL
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
@@ -78,8 +78,7 @@ def _copy_assets(project: BookProject, req: ScaffoldRequest) -> None:
         _copytree(profile_overlay, project.root / "references")
 
     if req.publication_mode == "private_use":
-        _copytree(ASSETS_DIR / "modes" / "private_use" / "references",
-                  project.root / "references")
+        _copytree(ASSETS_DIR / "modes" / "private_use" / "references", project.root / "references")
 
 
 def _write_metadata_stubs(project: BookProject, req: ScaffoldRequest) -> None:
@@ -102,9 +101,7 @@ def _write_metadata_stubs(project: BookProject, req: ScaffoldRequest) -> None:
         )
     stub = ASSETS_DIR / "metadata" / "rights_checklist.template.md"
     if stub.exists() and not project.rights_checklist.exists():
-        project.rights_checklist.write_text(
-            stub.read_text(encoding="utf-8"), encoding="utf-8"
-        )
+        project.rights_checklist.write_text(stub.read_text(encoding="utf-8"), encoding="utf-8")
 
     if req.publication_mode == "private_use":
         decl = ASSETS_DIR / "modes" / "private_use" / "private_use_declaration.template.md"
@@ -123,10 +120,12 @@ def _write_metadata_stubs(project: BookProject, req: ScaffoldRequest) -> None:
 
 
 def scaffold_project(req: ScaffoldRequest, *, root: Path | None = None) -> BookProject:
-    """Create the project directory tree + INIT state. Idempotent-ish.
+    """Create the project directory tree and empty durable-ledger schema.
 
     ``root`` overrides the auto-numbered location (used by tests / explicit
     project paths). Otherwise the path is ``{target_root}/{NNNN}_{slug}``.
+    Scaffolding does not create a business run; ``make_book`` owns that exactly-once
+    lifecycle boundary.
     """
     project_root = root or project_dir_for(req)
     project = BookProject(project_root)
@@ -137,18 +136,11 @@ def scaffold_project(req: ScaffoldRequest, *, root: Path | None = None) -> BookP
     _copy_assets(project, req)
     _write_metadata_stubs(project, req)
 
-    if not project.exists():
-        state = PipelineState(
-            book_slug=req.book_slug,
-            source_lang=req.source_lang,
-            target_lang=req.target_lang,
-            source_target=req.source_target,
-            publication_mode=req.publication_mode,
-            profile=req.profile,
-            status=Status.INIT,
-            current_step="00_orchestrator",
-        )
-        project.save_state(state)
-        project.append_log(f"scaffold: created project {project_root}")
+    project.staging_root.mkdir(parents=True, exist_ok=True)
+    project.graph_checkpoints.parent.mkdir(parents=True, exist_ok=True)
+    if not project.run_db.exists():
+        with sqlite3.connect(project.run_db) as db:
+            db.executescript(SCHEMA_SQL)
+            db.commit()
 
     return project

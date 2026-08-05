@@ -49,10 +49,7 @@ class Reconciler:
 
     async def reconcile(self, run_id: str) -> RunSnapshot:
         """Reconcile post-success drift and every RUNNING attempt without reexecution."""
-        actions = {
-            action.action_id: action
-            for action in await self._ledger.list_actions(run_id)
-        }
+        actions = {action.action_id: action for action in await self._ledger.list_actions(run_id)}
         await self._verify_prior_successes(run_id, tuple(actions.values()))
         if (await self._ledger.get_run(run_id)).status is RunStatus.BLOCKED:
             return await self._ledger.load_snapshot(run_id)
@@ -60,30 +57,24 @@ class Reconciler:
         for attempt in await self._ledger.running_attempts(run_id):
             action = actions[attempt.action_id]
             try:
-                receipt = await self._ledger.get_attempt_outcome(
+                receipt = await self._ledger.get_effective_attempt_outcome(
                     action.action_id, attempt.attempt
                 )
             except LedgerNotFoundError:
                 try:
-                    await self._artifacts.rebuild_outcome_receipt(
-                        action.action_id, attempt.attempt
-                    )
-                    receipt = await self._ledger.get_attempt_outcome(
+                    await self._artifacts.rebuild_outcome_receipt(action.action_id, attempt.attempt)
+                    receipt = await self._ledger.get_effective_attempt_outcome(
                         action.action_id, attempt.attempt
                     )
                 except ArtifactConflictError:
                     continue
-            envelope = ActionOutcomeEnvelope.model_validate_json(
-                receipt.canonical_outcome_json
-            )
+            envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
             await self._route_receipt(run_id, action, envelope)
 
         await self._project_reconciled_intents(run_id)
         return await self._ledger.load_snapshot(run_id)
 
-    async def _verify_prior_successes(
-        self, run_id: str, actions: tuple[ActionRecord, ...]
-    ) -> None:
+    async def _verify_prior_successes(self, run_id: str, actions: tuple[ActionRecord, ...]) -> None:
         for action in actions:
             if action.status is not ActionStatus.SUCCEEDED:
                 continue
@@ -92,26 +83,20 @@ class Reconciler:
                 await self._ledger.set_run_status(run_id, RunStatus.BLOCKED)
                 continue
             try:
-                resolution = await self._ledger.get_probe_resolution(
-                    action.action_id, attempts[-1]
-                )
+                resolution = await self._ledger.get_probe_resolution(action.action_id, attempts[-1])
             except LedgerNotFoundError:
                 pass
             else:
                 if resolution.disposition == "succeeded":
                     continue
             try:
-                await self._ledger.get_probe_resolution_for_probe(
-                    action.action_id, attempts[-1]
-                )
+                await self._ledger.get_probe_resolution_for_probe(action.action_id, attempts[-1])
             except LedgerNotFoundError:
                 pass
             else:
                 continue
             try:
-                await self._artifacts.verify_committed_bundle(
-                    action.action_id, attempts[-1]
-                )
+                await self._artifacts.verify_committed_bundle(action.action_id, attempts[-1])
             except ArtifactConflictError:
                 continue
 
@@ -125,18 +110,14 @@ class Reconciler:
         outcome = envelope.outcome
         if isinstance(outcome, Succeeded):
             try:
-                await self._ledger.get_gate_receipt_and_intents(
-                    action.action_id, attempt
-                )
+                await self._ledger.get_gate_receipt_and_intents(action.action_id, attempt)
             except LedgerNotFoundError:
                 try:
                     await self._committer.resume_success(
                         run_id=run_id, action=action, attempt=attempt
                     )
                 except CommitValidationError as exc:
-                    mapped = self._registry.has_semantic_repair(
-                        exc.decision.reason_code
-                    )
+                    mapped = self._registry.has_semantic_repair(exc.decision.reason_code)
                     await self._ledger.record_repair_required(
                         action_id=action.action_id,
                         attempt=attempt,
@@ -162,9 +143,7 @@ class Reconciler:
             return
         if isinstance(outcome, RetryableFailure):
             try:
-                await self._ledger.route_retry_from_receipt(
-                    action.action_id, attempt=attempt
-                )
+                await self._ledger.route_retry_from_receipt(action.action_id, attempt=attempt)
             except LedgerTransitionError:
                 await self._ledger.record_incident(
                     run_id,
@@ -178,9 +157,8 @@ class Reconciler:
                 await self._ledger.set_run_status(run_id, RunStatus.BLOCKED)
             return
         if isinstance(outcome, RepairRequired):
-            mapped = (
-                outcome.repair_class == "semantic"
-                and self._registry.has_semantic_repair(outcome.reason_code)
+            mapped = outcome.repair_class == "semantic" and self._registry.has_semantic_repair(
+                outcome.reason_code
             )
             await self._ledger.record_repair_required(
                 action_id=action.action_id,
@@ -236,19 +214,13 @@ class Reconciler:
             )
             await self._ledger.set_run_status(
                 run_id,
-                RunStatus.PAUSED_BUDGET
-                if outcome.reason == "budget"
-                else RunStatus.PAUSED_HITL,
+                RunStatus.PAUSED_BUDGET if outcome.reason == "budget" else RunStatus.PAUSED_HITL,
             )
             return
         if isinstance(outcome, ProbeResolution):
             try:
-                binding = ProbeActionInput.model_validate_json(
-                    action.parameters_json
-                )
-                original = await self._ledger.get_action(
-                    binding.original_action_id
-                )
+                binding = ProbeActionInput.model_validate_json(action.parameters_json)
+                original = await self._ledger.get_action(binding.original_action_id)
                 if (
                     original.run_id != run_id
                     or not self._registry.contains(original.capability)
@@ -260,13 +232,13 @@ class Reconciler:
                     )
                 await self._ledger.resolve_indeterminate(
                     ProbeResolutionRequest(
-                    probe_action_id=action.action_id,
-                    probe_attempt=attempt,
-                    original_action_id=binding.original_action_id,
-                    original_attempt=binding.original_attempt,
-                    operation_key=binding.operation_key,
-                    original_idempotency_key=original.idempotency_key,
-                    retry_policy_fingerprint=original.retry_policy_fingerprint,
+                        probe_action_id=action.action_id,
+                        probe_attempt=attempt,
+                        original_action_id=binding.original_action_id,
+                        original_attempt=binding.original_attempt,
+                        operation_key=binding.operation_key,
+                        original_idempotency_key=original.idempotency_key,
+                        retry_policy_fingerprint=original.retry_policy_fingerprint,
                     )
                 )
             except (LedgerError, TypeError, ValueError):
@@ -304,7 +276,5 @@ class Reconciler:
                     },
                     sort_keys=True,
                 ),
-                idempotency_key=(
-                    f"action.reconciled:{intent.intent_id}:{intent.status.lower()}"
-                ),
+                idempotency_key=(f"action.reconciled:{intent.intent_id}:{intent.status.lower()}"),
             )

@@ -23,6 +23,7 @@ from typing import Any
 from abi.eval.align import align_paragraphs, is_low_info, split_paragraphs
 from abi.eval.mechanical import score_paragraph
 from abi.eval.report import aggregate_mechanical
+from abi.eval.run_facts import load_eval_run_facts
 from abi.eval.trace import TraceReport, trace_project
 from abi.eval.types import MechanicalScores
 from abi.project.layout import BookProject
@@ -165,8 +166,11 @@ def score_book_l2(
             granularity = "chapter"
             chapter_scores.append(
                 score_paragraph(
-                    source_md, None, source_lang=source_lang,
-                    target_lang=target_lang, glossary=glossary_arg,
+                    source_md,
+                    None,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    glossary=glossary_arg,
                 )
             )
         elif alignment.chapter_align_failed:
@@ -177,8 +181,11 @@ def score_book_l2(
             tgt_body = "\n\n".join(split_paragraphs(target_md))
             chapter_scores.append(
                 score_paragraph(
-                    src_body, tgt_body, source_lang=source_lang,
-                    target_lang=target_lang, glossary=glossary_arg,
+                    src_body,
+                    tgt_body,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    glossary=glossary_arg,
                 )
             )
         else:
@@ -187,8 +194,11 @@ def score_book_l2(
                     continue
                 chapter_scores.append(
                     score_paragraph(
-                        pair.source, pair.target, source_lang=source_lang,
-                        target_lang=target_lang, glossary=glossary_arg,
+                        pair.source,
+                        pair.target,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        glossary=glossary_arg,
                     )
                 )
 
@@ -246,9 +256,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def _report_clean(data: dict[str, Any] | None) -> bool:
     if not data:
         return False
-    return bool(data.get("ok")) and int(
-        data.get("hard_errors", data.get("errors", 0)) or 0
-    ) == 0
+    return bool(data.get("ok")) and int(data.get("hard_errors", data.get("errors", 0)) or 0) == 0
 
 
 def check_book_l3(project: BookProject) -> BookL3Report:
@@ -325,17 +333,17 @@ def eval_book(
     target_lang: str | None = None,
 ) -> BookEvalReport:
     """Run all three planes over ``project`` and roll up a combined verdict."""
-    state = project.load_state()
-    sl = source_lang or state.source_lang
-    tl = target_lang or state.target_lang
+    facts = load_eval_run_facts(project)
+    sl = source_lang or facts.run.source_lang
+    tl = target_lang or facts.run.target_lang
 
-    l1 = trace_project(project)
+    l1 = trace_project(project, facts=facts)
     l2 = score_book_l2(project, source_lang=sl, target_lang=tl)
     l3 = check_book_l3(project)
 
     return BookEvalReport(
         book=project.root.name,
-        status=state.status.value,
+        status=facts.run.status.value,
         l1=l1,
         l2=l2,
         l3=l3,
@@ -368,9 +376,7 @@ def render_book_md(report: BookEvalReport) -> str:
     ]
     for g in l1.gate_integrity:
         mark = "n/a" if not g.verifiable else ("✓" if g.consistent else "✗")
-        lines.append(
-            f"| {g.gate} | {g.produces} | {g.recorded} | {g.replay_ok} | {mark} |"
-        )
+        lines.append(f"| {g.gate} | {g.produces} | {g.recorded} | {g.replay_ok} | {mark} |")
 
     lines += [
         "",

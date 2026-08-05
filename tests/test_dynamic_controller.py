@@ -87,9 +87,7 @@ class SuccessTemplate(FrozenModel):
 
 
 PlannedOutcome = ActionOutcome | SuccessTemplate
-ValidatorFn = Callable[
-    [StagingEvidenceView, FrozenModel, ArtifactBundle], GateDecision
-]
+ValidatorFn = Callable[[StagingEvidenceView, FrozenModel, ArtifactBundle], GateDecision]
 
 _FIXTURE_OUTPUTS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "work.multi": (
@@ -130,9 +128,7 @@ class SequenceExecutor:
         planned = self._outcomes.popleft()
         if isinstance(planned, SuccessTemplate):
             writer = self._store.writer(context.action_id, context.attempt)
-            for canonical_relpath, media_type, evidence_role in _fixture_outputs(
-                self._capability
-            ):
+            for canonical_relpath, media_type, evidence_role in _fixture_outputs(self._capability):
                 writer.write_text(
                     canonical_relpath,
                     f"result from {context.action_id} at {canonical_relpath}",
@@ -245,9 +241,7 @@ def _expand_fixture(
                 media_type=media_type,
                 evidence_role=evidence_role,
             )
-            for canonical_relpath, media_type, evidence_role in _fixture_outputs(
-                capability
-            )
+            for canonical_relpath, media_type, evidence_role in _fixture_outputs(capability)
         ),
     )
 
@@ -261,9 +255,7 @@ def _expand_probe(
 def _patch(proposal_id: str, capability: str) -> PlanPatch:
     return PlanPatch(
         objective=f"run {capability}",
-        proposed_actions=(
-            ProposedAction(proposal_id=proposal_id, capability=capability),
-        ),
+        proposed_actions=(ProposedAction(proposal_id=proposal_id, capability=capability),),
         rationale="advance using one registered capability",
     )
 
@@ -327,9 +319,7 @@ def _definition(
     )
 
 
-def _probe_definition(
-    capability: str, executor: SequenceExecutor
-) -> ActionDefinition:
+def _probe_definition(capability: str, executor: SequenceExecutor) -> ActionDefinition:
     return ActionDefinition(
         spec=ActionSpec(
             capability=capability,
@@ -398,7 +388,6 @@ async def _controller_rig(
     project = BookProject(tmp_path)
     project.root.mkdir(parents=True, exist_ok=True)
     project.run_db.parent.mkdir(parents=True, exist_ok=True)
-    project.state_path.parent.mkdir(parents=True, exist_ok=True)
     async with RunLedger.open(project.run_db) as ledger:
         run_id = await ledger.create_run(RunSeed(run_id="run-1"))
         store = ArtifactStore(project, ledger)
@@ -406,9 +395,7 @@ async def _controller_rig(
             "fixture": cast(ActionValidator, _pass_gate)
         }
         for capability, validator in (validators or {}).items():
-            validator_catalog[f"fixture.{capability}"] = cast(
-                ActionValidator, validator
-            )
+            validator_catalog[f"fixture.{capability}"] = cast(ActionValidator, validator)
         registry = ActionRegistry(
             predicates=PredicateCatalog(),
             validators=validator_catalog,
@@ -441,9 +428,7 @@ async def _controller_rig(
                     capability,
                     executor,
                     validator_id=(
-                        f"fixture.{capability}"
-                        if capability in (validators or {})
-                        else "fixture"
+                        f"fixture.{capability}" if capability in (validators or {}) else "fixture"
                     ),
                     validator=(validators or {}).get(capability, _pass_gate),
                     retryable_codes=raw_retryable_codes,
@@ -453,9 +438,7 @@ async def _controller_rig(
                         if options.get("probe_capability") is not None
                         else None
                     ),
-                    may_have_side_effects=bool(
-                        options.get("may_have_side_effects", False)
-                    ),
+                    may_have_side_effects=bool(options.get("may_have_side_effects", False)),
                 )
             )
         registry.validate_startup()
@@ -540,9 +523,7 @@ def _completed_capability(capability: str) -> Callable[[RunSnapshot], bool]:
 async def _authorize_one(
     rig: ControllerRig, capability: str, *, proposal_id: str = "work"
 ) -> tuple[ActionRecord, RunSnapshot]:
-    context = await SnapshotBuilder(ledger=rig.ledger, registry=rig.registry).build(
-        rig.run_id
-    )
+    context = await SnapshotBuilder(ledger=rig.ledger, registry=rig.registry).build(rig.run_id)
     patch = _patch(proposal_id, capability)
     plan = await rig.ledger.append_plan(rig.run_id, patch)
     decision = PolicyEngine(rig.registry).authorize(
@@ -578,9 +559,7 @@ async def _assert_repair_incident_outbox_matches_rows(ledger: RunLedger) -> None
             "run_id": incident["run_id"],
         }
         matching = tuple(
-            payload
-            for payload in parsed
-            if payload.get("incident_id") == incident["incident_id"]
+            payload for payload in parsed if payload.get("incident_id") == incident["incident_id"]
         )
         assert matching == (expected,)
 
@@ -623,9 +602,7 @@ async def test_dispatcher_receipt_boundary_precedes_controller_hook(
         assert await rig.ledger.attempt_status(action.action_id, 1) is ActionStatus.RUNNING
         if receipt_durable:
             receipt = await rig.ledger.get_attempt_outcome(action.action_id, 1)
-            envelope = ActionOutcomeEnvelope.model_validate_json(
-                receipt.canonical_outcome_json
-            )
+            envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
             assert envelope.action_id == action.action_id
             assert envelope.attempt == 1
             assert observed == [
@@ -646,10 +623,12 @@ async def test_dispatcher_rejects_mismatched_envelope_without_rebinding_identity
     """Catch Dispatcher silently replacing an executor's wrong action identity."""
     async with _controller_rig(
         tmp_path,
-        definitions=((
-            "work.identity",
-            (PermanentFailure(error_code="wrong", message="wrong identity"),),
-        ),),
+        definitions=(
+            (
+                "work.identity",
+                (PermanentFailure(error_code="wrong", message="wrong identity"),),
+            ),
+        ),
         patches=(),
         spec_options={"work.identity": {"envelope_action_id": "wrong-action"}},
     ) as rig:
@@ -662,9 +641,7 @@ async def test_dispatcher_rejects_mismatched_envelope_without_rebinding_identity
         assert envelope.outcome.repair_class == "integrity"
         assert envelope.outcome.reason_code == "artifact_identity_conflict"
         receipt = await rig.ledger.get_attempt_outcome(action.action_id, 1)
-        assert receipt.outcome_digest == sha256_canonical_json(
-            receipt.canonical_outcome_json
-        )
+        assert receipt.outcome_digest == sha256_canonical_json(receipt.canonical_outcome_json)
 
 
 @pytest.mark.asyncio
@@ -672,15 +649,19 @@ async def test_dispatcher_rejects_probe_resolution_from_non_probe(tmp_path: Path
     """Catch an ordinary capability resolving an unrelated external operation."""
     async with _controller_rig(
         tmp_path,
-        definitions=((
-            "work.not-probe",
-            (ProbeResolution(
-                operation_key="external:1",
-                disposition="succeeded",
-                evidence_refs=("external:1",),
-                message="not authorized as a probe",
-            ),),
-        ),),
+        definitions=(
+            (
+                "work.not-probe",
+                (
+                    ProbeResolution(
+                        operation_key="external:1",
+                        disposition="succeeded",
+                        evidence_refs=("external:1",),
+                        message="not authorized as a probe",
+                    ),
+                ),
+            ),
+        ),
         patches=(),
     ) as rig:
         action, snapshot = await _authorize_one(rig, "work.not-probe")
@@ -697,7 +678,7 @@ async def test_dispatcher_rejects_probe_resolution_from_non_probe(tmp_path: Path
 @pytest.mark.asyncio
 async def test_committer_persists_complete_multi_file_bundle_before_success(
     tmp_path: Path,
-    ) -> None:
+) -> None:
     """Catch single-file promotion or success before every exact intent is committed."""
     async with _controller_rig(
         tmp_path,
@@ -871,15 +852,9 @@ async def test_two_entry_crash_matrix_recovers_without_redispatch(
     def crash_at(point: str, detail: object) -> None:
         matches = point == boundary
         if boundary == "after_first_intent_promotion":
-            matches = (
-                point == "after_intent_promotion"
-                and getattr(detail, "ordinal", None) == 0
-            )
+            matches = point == "after_intent_promotion" and getattr(detail, "ordinal", None) == 0
         elif boundary == "after_second_intent_promotion":
-            matches = (
-                point == "after_intent_promotion"
-                and getattr(detail, "ordinal", None) == 1
-            )
+            matches = point == "after_intent_promotion" and getattr(detail, "ordinal", None) == 1
         if matches:
             raise BoundaryCrash(boundary)
 
@@ -925,25 +900,19 @@ async def test_two_entry_crash_matrix_recovers_without_redispatch(
         else:
             assert await rig.ledger.get_attempt_outcome(action.action_id, 1)
         if boundary == "after_gate_receipt_and_intents":
-            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(
-                action.action_id, 1
-            )
+            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(action.action_id, 1)
             assert len(crash_intents) == 2
             assert {intent.status for intent in crash_intents} == {"PENDING"}
             assert not (tmp_path / "reports/a.json").exists()
             assert not (tmp_path / "reports/b.json").exists()
         if boundary == "after_first_intent_promotion":
-            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(
-                action.action_id, 1
-            )
+            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(action.action_id, 1)
             assert tuple(intent.status for intent in crash_intents) == (
                 "COMMITTED",
                 "PENDING",
             )
         if boundary == "after_second_intent_promotion":
-            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(
-                action.action_id, 1
-            )
+            _, crash_intents = await rig.ledger.get_gate_receipt_and_intents(action.action_id, 1)
             assert {intent.status for intent in crash_intents} == {"COMMITTED"}
         if boundary == "after_success_ledger_commit":
             assert await rig.ledger.action_status(action.action_id) is ActionStatus.SUCCEEDED
@@ -1042,9 +1011,7 @@ async def test_committer_fails_closed_on_unsafe_or_mismatched_bundle(
         assert await rig.ledger.promotion_intents(rig.run_id) == ()
         assert await rig.ledger.count_artifacts_for(persisted_action.action_id) == 0
         with pytest.raises(LedgerNotFoundError, match="gate receipt"):
-            await rig.ledger.get_gate_receipt_and_intents(
-                persisted_action.action_id, 1
-            )
+            await rig.ledger.get_gate_receipt_and_intents(persisted_action.action_id, 1)
         assert not (tmp_path / "reports/a.json").exists()
         assert not (tmp_path / "reports/b.json").exists()
         await _assert_repair_incident_outbox_matches_rows(rig.ledger)
@@ -1058,9 +1025,7 @@ async def test_committer_boundary_exception_durably_compensates_once(
     failure_site: str,
 ) -> None:
     validators: dict[str, ValidatorFn] = (
-        {"work.commit-boundary": _raising_gate}
-        if failure_site == "validator"
-        else {}
+        {"work.commit-boundary": _raising_gate} if failure_site == "validator" else {}
     )
     async with _controller_rig(
         tmp_path,
@@ -1074,10 +1039,10 @@ async def test_committer_boundary_exception_durably_compensates_once(
         )
         assert isinstance(envelope.outcome, Succeeded)
         staged_paths = tuple(
-            tmp_path / entry.staged_relpath
-            for entry in envelope.outcome.artifact_bundle.entries
+            tmp_path / entry.staged_relpath for entry in envelope.outcome.artifact_bundle.entries
         )
         if failure_site == "registry":
+
             def fail_resolve(capability: str, parameters_json: str) -> object:
                 raise RuntimeError("registry implementation crashed")
 
@@ -1098,10 +1063,10 @@ async def test_committer_boundary_exception_durably_compensates_once(
         assert all(path.is_file() for path in staged_paths)
         assert await rig.ledger.promotion_intents(rig.run_id) == ()
         assert await rig.ledger.count_artifacts_for(action.action_id) == 0
-        assert sum(
-            incident.reason_code == "gate_binding_conflict"
-            for incident in second.incidents
-        ) == 1
+        assert (
+            sum(incident.reason_code == "gate_binding_conflict" for incident in second.incidents)
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -1130,9 +1095,7 @@ async def test_real_source_ingest_stages_receipts_promotes_bundle_then_succeeds(
                         proposal_id="ingest",
                         capability="source.ingest",
                         arguments=(
-                            ActionArgument(
-                                name="source_relpath", value_json='"source/raw.txt"'
-                            ),
+                            ActionArgument(name="source_relpath", value_json='"source/raw.txt"'),
                         ),
                     ),
                 ),
@@ -1285,9 +1248,7 @@ async def test_semantic_repair_crash_boundaries_create_one_replacement_action(
             matches = getattr(detail, "version", None) == 2
         elif boundary == "after_repair_authorization" and point == "after_authorization":
             authorized = cast(tuple[ActionRecord, ...], detail)
-            matches = any(
-                action.capability == "repair.glossary" for action in authorized
-            )
+            matches = any(action.capability == "repair.glossary" for action in authorized)
         if matches:
             raise BoundaryCrash(boundary)
 
@@ -1373,12 +1334,8 @@ async def test_validator_failure_receipt_drives_repair_without_pass_or_promotion
             for action in await rig.ledger.list_actions(rig.run_id)
             if action.capability == "work.validator"
         )
-        raw_failure = await rig.ledger.get_validator_failure_receipt(
-            initial.action_id, 1
-        )
-        decision = GateDecision.model_validate_json(
-            raw_failure.canonical_gate_decision_json
-        )
+        raw_failure = await rig.ledger.get_validator_failure_receipt(initial.action_id, 1)
+        decision = GateDecision.model_validate_json(raw_failure.canonical_gate_decision_json)
         assert not decision.passed
         assert (initial.repair_class, initial.repair_source, initial.reason_code) == (
             "semantic",
@@ -1401,8 +1358,7 @@ async def test_validator_failure_receipt_drives_repair_without_pass_or_promotion
         )
         assert len(outcome_events) == 1
         assert {
-            key: outcome_events[0][key]
-            for key in ("repair_class", "repair_source", "reason_code")
+            key: outcome_events[0][key] for key in ("repair_class", "repair_source", "reason_code")
         } == {
             "repair_class": "semantic",
             "repair_source": "validator",
@@ -1424,12 +1380,8 @@ async def test_unmapped_validator_failure_preserves_raw_fact_and_blocks_integrit
         await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
 
         action = (await rig.ledger.list_actions(rig.run_id))[0]
-        raw_failure = await rig.ledger.get_validator_failure_receipt(
-            action.action_id, 1
-        )
-        raw_decision = GateDecision.model_validate_json(
-            raw_failure.canonical_gate_decision_json
-        )
+        raw_failure = await rig.ledger.get_validator_failure_receipt(action.action_id, 1)
+        raw_decision = GateDecision.model_validate_json(raw_failure.canonical_gate_decision_json)
         assert raw_decision.reason_code == "unmapped_validator_reason"
         assert (action.repair_class, action.repair_source, action.reason_code) == (
             "integrity",
@@ -1447,10 +1399,7 @@ async def test_unmapped_validator_failure_preserves_raw_fact_and_blocks_integrit
             for line in rig.events_path.read_text(encoding="utf-8").splitlines()
             if json.loads(line).get("event") == "action.outcome"
         )
-        assert {
-            key: outcome[key]
-            for key in ("repair_class", "repair_source", "reason_code")
-        } == {
+        assert {key: outcome[key] for key in ("repair_class", "repair_source", "reason_code")} == {
             "repair_class": "integrity",
             "repair_source": "integrity_guard",
             "reason_code": "repair_class_unknown",
@@ -1465,16 +1414,20 @@ async def test_integrity_repair_blocks_without_planner_or_replacement(
     """Catch integrity evidence entering the semantic Planner repair path."""
     async with _controller_rig(
         tmp_path,
-        definitions=((
-            "work.integrity",
-            (RepairRequired(
-                repair_class="integrity",
-                repair_source="action_outcome",
-                reason_code="artifact_identity_conflict",
-                defect_codes=("artifact_identity_conflict",),
-                message="preserve evidence for human resolution",
-            ),),
-        ),),
+        definitions=(
+            (
+                "work.integrity",
+                (
+                    RepairRequired(
+                        repair_class="integrity",
+                        repair_source="action_outcome",
+                        reason_code="artifact_identity_conflict",
+                        defect_codes=("artifact_identity_conflict",),
+                        message="preserve evidence for human resolution",
+                    ),
+                ),
+            ),
+        ),
         patches=(_patch("a1", "work.integrity"),),
     ) as rig:
         await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
@@ -1495,16 +1448,20 @@ async def test_unmapped_semantic_repair_becomes_integrity_unknown(
     """Catch an unmapped semantic reason defaulting to automatic repair."""
     async with _controller_rig(
         tmp_path,
-        definitions=((
-            "work.unknown-repair",
-            (RepairRequired(
-                repair_class="semantic",
-                repair_source="action_outcome",
-                reason_code="unknown_quality_reason",
-                defect_codes=("unknown_quality_reason",),
-                message="classification has no registry mapping",
-            ),),
-        ),),
+        definitions=(
+            (
+                "work.unknown-repair",
+                (
+                    RepairRequired(
+                        repair_class="semantic",
+                        repair_source="action_outcome",
+                        reason_code="unknown_quality_reason",
+                        defect_codes=("unknown_quality_reason",),
+                        message="classification has no registry mapping",
+                    ),
+                ),
+            ),
+        ),
         patches=(_patch("a1", "work.unknown-repair"),),
     ) as rig:
         await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
@@ -1583,9 +1540,7 @@ async def test_outbox_projection_is_scoped_to_one_run(tmp_path: Path) -> None:
             json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()
         )
         assert {record["run_id"] for record in records} == {first}
-        assert tuple(event.run_id for event in await ledger.undelivered_events(second)) == (
-            second,
-        )
+        assert tuple(event.run_id for event in await ledger.undelivered_events(second)) == (second,)
 
 
 def test_durable_loop_runtime_has_no_business_module_dependency() -> None:
@@ -1613,20 +1568,19 @@ async def test_durable_loop_runtime_reuses_run_id_as_checkpoint_thread(
         calls.append(run_id)
         return False
 
-    await DurableLoopRuntime(
-        checkpoint_path=checkpoint_path, max_cycles=2
-    ).run(run_id="run-a", tick=stop)
-    await DurableLoopRuntime(
-        checkpoint_path=checkpoint_path, max_cycles=2
-    ).run(run_id="run-a", tick=stop)
-    await DurableLoopRuntime(
-        checkpoint_path=checkpoint_path, max_cycles=2
-    ).run(run_id="run-b", tick=stop)
+    await DurableLoopRuntime(checkpoint_path=checkpoint_path, max_cycles=2).run(
+        run_id="run-a", tick=stop
+    )
+    await DurableLoopRuntime(checkpoint_path=checkpoint_path, max_cycles=2).run(
+        run_id="run-a", tick=stop
+    )
+    await DurableLoopRuntime(checkpoint_path=checkpoint_path, max_cycles=2).run(
+        run_id="run-b", tick=stop
+    )
 
     with sqlite3.connect(checkpoint_path) as db:
         thread_ids = {
-            str(row[0])
-            for row in db.execute("SELECT DISTINCT thread_id FROM checkpoints")
+            str(row[0]) for row in db.execute("SELECT DISTINCT thread_id FROM checkpoints")
         }
     assert thread_ids == {"run-a", "run-b"}
     assert calls == ["run-a", "run-a", "run-b"]
@@ -1657,17 +1611,14 @@ async def test_outbox_flush_preserves_run_order_across_restart_crash_window(
         )
         assert await projector.flush(run_id) == 3
         first_projection = tuple(
-            json.loads(line)
-            for line in events_path.read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()
         )
         assert tuple(item["ordinal"] for item in first_projection) == (0, 1, 2)
         assert tuple(item["sequence"] for item in first_projection) == tuple(
             sorted(item["sequence"] for item in first_projection)
         )
         first_status = (tmp_path / "status.json").read_text(encoding="utf-8")
-        first_metrics = json.loads(
-            (tmp_path / "metrics.json").read_text(encoding="utf-8")
-        )
+        first_metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
 
         await ledger._db.execute(
             "UPDATE event_outbox SET delivered_at = NULL WHERE idempotency_key = ?",
@@ -1740,8 +1691,7 @@ async def test_retry_successor_crash_boundaries_never_reenter_attempt_one(
         if boundary == "after_retry_wait" and point == "after_reconcile":
             snapshot = detail
             if isinstance(snapshot, RunSnapshot) and any(
-                action.status is ActionStatus.RETRY_WAIT
-                for action in snapshot.actions
+                action.status is ActionStatus.RETRY_WAIT for action in snapshot.actions
             ):
                 raise BoundaryCrash(boundary)
         elif boundary == point:
@@ -1756,13 +1706,15 @@ async def test_retry_successor_crash_boundaries_never_reenter_attempt_one(
     }.get(boundary, boundary)
     async with _controller_rig(
         tmp_path,
-        definitions=((
-            "network.fetch",
+        definitions=(
             (
-                RetryableFailure(error_code="temporary", message="try again"),
-                SuccessTemplate(),
+                "network.fetch",
+                (
+                    RetryableFailure(error_code="temporary", message="try again"),
+                    SuccessTemplate(),
+                ),
             ),
-        ),),
+        ),
         patches=(_patch("fetch", "network.fetch"),),
         complete_when=_completed_capability("network.fetch"),
         controller_hook=crash_at,
@@ -1775,7 +1727,9 @@ async def test_retry_successor_crash_boundaries_never_reenter_attempt_one(
         assert rig.executors["network.fetch"].attempt_ids == [1]
         if boundary in {"after_create_next_attempt", "before_dispatch_next_attempt"}:
             assert await rig.ledger.attempt_numbers(action.action_id) == (1, 2)
-            assert (await rig.ledger.get_attempt(action.action_id, 2)).status is ActionStatus.AUTHORIZED
+            assert (
+                await rig.ledger.get_attempt(action.action_id, 2)
+            ).status is ActionStatus.AUTHORIZED
         else:
             assert await rig.ledger.attempt_numbers(action.action_id) == (1,)
 
@@ -2137,9 +2091,9 @@ async def test_probe_binding_replay_ignores_newer_speculative_plan_identity(
             probe_capability="release.probe",
         )
 
-        plan2_context = await SnapshotBuilder(
-            ledger=rig.ledger, registry=rig.registry
-        ).build(rig.run_id)
+        plan2_context = await SnapshotBuilder(ledger=rig.ledger, registry=rig.registry).build(
+            rig.run_id
+        )
         patch2 = _probe_patch("probe-stored", binding)
         decision2 = PolicyEngine(rig.registry).authorize(
             plan2_context.policy_snapshot, patch2, next_plan_version=2
@@ -2155,9 +2109,9 @@ async def test_probe_binding_replay_ignores_newer_speculative_plan_identity(
         assert created
         assert stored.plan_version == 2
 
-        plan3_context = await SnapshotBuilder(
-            ledger=rig.ledger, registry=rig.registry
-        ).build(rig.run_id)
+        plan3_context = await SnapshotBuilder(ledger=rig.ledger, registry=rig.registry).build(
+            rig.run_id
+        )
         patch3 = _probe_patch("probe-speculative", binding)
         decision3 = PolicyEngine(rig.registry).authorize(
             plan3_context.policy_snapshot, patch3, next_plan_version=3
@@ -2177,19 +2131,29 @@ async def test_probe_binding_replay_ignores_newer_speculative_plan_identity(
 
         assert replayed.action_id == stored.action_id
         assert not replay_created
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
+        assert (
+            await rig.ledger._count(
+                "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+            )
+            == 2
+        )
+        assert (
+            await rig.ledger._count("SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,))
+            == 2
+        )
         assert await rig.ledger._count("SELECT COUNT(*) FROM probe_bindings", ()) == 1
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM incidents WHERE run_id = ?", (rig.run_id,)
-        ) == 0
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM event_outbox WHERE run_id = ?", (rig.run_id,)
-        ) == before_outbox
+        assert (
+            await rig.ledger._count(
+                "SELECT COUNT(*) FROM incidents WHERE run_id = ?", (rig.run_id,)
+            )
+            == 0
+        )
+        assert (
+            await rig.ledger._count(
+                "SELECT COUNT(*) FROM event_outbox WHERE run_id = ?", (rig.run_id,)
+            )
+            == before_outbox
+        )
         assert await rig.ledger.action_status(original.action_id) is ActionStatus.INDETERMINATE
         assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.RUNNING
 
@@ -2244,9 +2208,7 @@ async def test_probe_binding_replay_blocks_conflicting_durable_binding(
             operation_key=operation_key,
             probe_capability="release.probe",
         )
-        context = await SnapshotBuilder(
-            ledger=rig.ledger, registry=rig.registry
-        ).build(rig.run_id)
+        context = await SnapshotBuilder(ledger=rig.ledger, registry=rig.registry).build(rig.run_id)
         patch = _probe_patch("probe-stored", binding)
         decision = PolicyEngine(rig.registry).authorize(
             context.policy_snapshot, patch, next_plan_version=2
@@ -2281,12 +2243,16 @@ async def test_probe_binding_replay_blocks_conflicting_durable_binding(
         assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
         assert await rig.ledger.action_status(original.action_id) is ActionStatus.REPAIR_REQUIRED
         assert await rig.ledger.has_open_incident("probe_binding_conflict")
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
+        assert (
+            await rig.ledger._count(
+                "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+            )
+            == 2
+        )
+        assert (
+            await rig.ledger._count("SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,))
+            == 2
+        )
 
 
 @pytest.mark.asyncio
@@ -2344,9 +2310,7 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
         actions = await rig.ledger.list_actions(rig.run_id)
         probes = tuple(item for item in actions if item.capability == "release.probe")
         errors = tuple(
-            (type(item).__name__, str(item))
-            for item in results
-            if isinstance(item, BaseException)
+            (type(item).__name__, str(item)) for item in results if isinstance(item, BaseException)
         )
         durable = await rig.ledger.load_snapshot(rig.run_id)
         probe_attempt_count = 0
@@ -2362,9 +2326,7 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
             tuple(rig.executors["release.probe"].attempt_ids),
         )
         assert observed == ((), 1, 2, (1,), 1, (1,), (1,))
-        binding_count = await rig.ledger._count(
-            "SELECT COUNT(*) FROM probe_bindings", ()
-        )
+        binding_count = await rig.ledger._count("SELECT COUNT(*) FROM probe_bindings", ())
         plan_count = await rig.ledger._count(
             "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
         )
@@ -2376,9 +2338,7 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
             "WHERE run_id = ? GROUP BY event_name ORDER BY event_name",
             (rig.run_id,),
         )
-        outbox_counts = {
-            row["event_name"]: row["event_count"] for row in outbox_rows
-        }
+        outbox_counts = {row["event_name"]: row["event_count"] for row in outbox_rows}
         assert (binding_count, plan_count, action_count) == (1, 2, 2)
         assert outbox_counts == {
             "action.authorized": 2,
@@ -2395,14 +2355,19 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
         for _ in range(3):
             assert not await rig.controller.tick(rig.run_id)
         assert await rig.ledger._count("SELECT COUNT(*) FROM probe_bindings", ()) == 1
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
-        assert await rig.ledger._count(
-            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
-        ) == 2
+        assert (
+            await rig.ledger._count(
+                "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+            )
+            == 2
+        )
+        assert (
+            await rig.ledger._count("SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,))
+            == 2
+        )
         assert rig.executors["release.publish"].attempt_ids == [1]
         assert rig.executors["release.probe"].attempt_ids == [1]
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -2491,9 +2456,7 @@ async def test_indeterminate_runtime_dispatches_one_bound_probe_without_blind_re
     indeterminate = Indeterminate(
         operation_key=operation_key,
         error_code="provider_timeout",
-        failure_signature=canonical_failure_signature(
-            "release.publish", "{}", "provider_timeout"
-        ),
+        failure_signature=canonical_failure_signature("release.publish", "{}", "provider_timeout"),
         message="remote result unknown",
     )
     planned_original: tuple[PlannedOutcome, ...] = tuple(
@@ -2538,22 +2501,16 @@ async def test_indeterminate_runtime_dispatches_one_bound_probe_without_blind_re
             operation_key=operation_key,
             probe_capability="release.probe",
         )
-        assert tuple(rig.executors["release.publish"].attempt_ids) == (
-            expected_original_attempts
-        )
+        assert tuple(rig.executors["release.publish"].attempt_ids) == (expected_original_attempts)
         assert rig.executors["release.probe"].attempt_ids == [1]
-        assert await rig.ledger.attempt_numbers(original.action_id) == (
-            expected_original_attempts
-        )
+        assert await rig.ledger.attempt_numbers(original.action_id) == (expected_original_attempts)
         assert await rig.ledger.attempt_numbers(probe.action_id) == (1,)
         assert await rig.ledger.action_status(probe.action_id) is ActionStatus.SUCCEEDED
         resolution = await rig.ledger.get_probe_resolution(original.action_id, 1)
         assert resolution.disposition == disposition
         assert (await rig.ledger.get_run(rig.run_id)).status is expected_run_status
         if disposition == "absent":
-            assert await rig.ledger.attempt_status(
-                original.action_id, 1
-            ) is ActionStatus.RETRY_WAIT
+            assert await rig.ledger.attempt_status(original.action_id, 1) is ActionStatus.RETRY_WAIT
 
         calls_before_resume = (
             tuple(rig.executors["release.publish"].attempt_ids),
@@ -2617,7 +2574,5 @@ async def test_event_logger_refuses_duplicate_outbox_event_after_restart(
     assert first.append_record("event-1", {"event": "action.committed", "value": 1})
     restarted = EventLogger(events_path, "run-1")
 
-    assert not restarted.append_record(
-        "event-1", {"event": "action.committed", "value": 1}
-    )
+    assert not restarted.append_record("event-1", {"event": "action.committed", "value": 1})
     assert len(events_path.read_text(encoding="utf-8").splitlines()) == 1

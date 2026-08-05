@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 
 import pytest
@@ -20,7 +21,7 @@ from abi.eval.mechanical import length_ratio_ok, resolve_band, score_paragraph
 from abi.eval.report import aggregate_mechanical
 from abi.eval.types import EvalTriple
 from abi.project.layout import BookProject
-from abi.project.state import PipelineState, Status
+from abi.project.run_ledger import RunLedger, RunSeed
 
 
 # --- datasets / spec ---
@@ -185,8 +186,7 @@ def test_bands_min_samples_gate():
 def test_aggregate_mechanical():
     triples = load_triples(parse_dataset_spec("wmt24pp:en-zh_CN:literary:stub=true"))
     scores = [
-        score_paragraph(t.source, t.reference, source_lang=t.source_lang,
-                        target_lang=t.target_lang)
+        score_paragraph(t.source, t.reference, source_lang=t.source_lang, target_lang=t.target_lang)
         for t in triples
     ]
     agg = aggregate_mechanical(scores)
@@ -216,8 +216,12 @@ class _FakeRouter:
 async def test_judge_triple_maps_slots_back():
     router = _FakeRouter()
     triple = EvalTriple(
-        paragraph_id="p1", source="hello", source_lang="en", target_lang="zh-Hans",
-        abi="你好（abi）", baseline="你好（baseline）",
+        paragraph_id="p1",
+        source="hello",
+        source_lang="en",
+        target_lang="zh-Hans",
+        abi="你好（abi）",
+        baseline="你好（baseline）",
     )
     # Force ABI into slot A by seeding so slot A (the '5' scores, preferred) maps to abi.
     rng = random.Random(0)
@@ -236,7 +240,10 @@ async def test_judge_triple_maps_slots_back():
 async def test_judge_skips_when_missing_side():
     router = _FakeRouter()
     triple = EvalTriple(
-        paragraph_id="p1", source="hi", source_lang="en", target_lang="zh-Hans",
+        paragraph_id="p1",
+        source="hi",
+        source_lang="en",
+        target_lang="zh-Hans",
         abi="你好",  # no baseline
     )
     assert await judge_triple(router, triple, rng=random.Random(0)) is None
@@ -260,11 +267,20 @@ def _make_project(tmp_path, *, translated: bool = True, glossary: bool = True):
     proj = BookProject(root)
     for d in ("state", "chapters/src", "chapters/translated", "glossary"):
         (root / d).mkdir(parents=True, exist_ok=True)
-    state = PipelineState(
-        book_slug="book", source_lang="en", target_lang="zh-Hans",
-        source_target="en-zh-Hans", status=Status.TRANSLATED,
-    )
-    proj.save_state(state)
+
+    async def seed_run() -> None:
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.create_run(
+                RunSeed(
+                    run_id="eval-run",
+                    book_slug="book",
+                    source_lang="en",
+                    target_lang="zh-Hans",
+                    source_target="en-zh-Hans",
+                )
+            )
+
+    asyncio.run(seed_run())
     (proj.chapters_src / "001_intro.md").write_text(_SRC_CH1, encoding="utf-8")
     if translated:
         (proj.chapters_translated / "001_intro.md").write_text(_TGT_CH1_GOOD, encoding="utf-8")

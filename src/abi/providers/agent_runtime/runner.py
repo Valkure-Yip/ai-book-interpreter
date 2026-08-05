@@ -87,6 +87,20 @@ class HitlResume(FrozenModel):
         return self
 
 
+class HitlCheckpointInspection(FrozenModel):
+    """Read-only classification of one claimed HITL checkpoint."""
+
+    disposition: Literal["outcome", "not_started", "indeterminate"]
+    outcome: ActionOutcome | None = None
+    detail: str | None = None
+
+    @model_validator(mode="after")
+    def _typed_outcome(self) -> HitlCheckpointInspection:
+        if (self.disposition == "outcome") != (self.outcome is not None):
+            raise ValueError("only an outcome checkpoint inspection may carry an outcome")
+        return self
+
+
 AgentResume: TypeAlias = CheckpointResume | HitlResume
 
 
@@ -392,9 +406,7 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         return _empty_result(
             _integrity_repair(
                 "checkpoint_permission_denied",
-                (
-                    "The checkpoint store is not readable. Repair its permissions before resuming."
-                ),
+                ("The checkpoint store is not readable. Repair its permissions before resuming."),
             )
         )
     if raw_sqlite_code in _sqlite_codes("SQLITE_IOERR_CORRUPTFS", "SQLITE_IOERR_DATA"):
@@ -438,9 +450,7 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         return _empty_result(
             _integrity_repair(
                 "checkpoint_permission_denied",
-                (
-                    "The checkpoint store is not readable. Repair its permissions before resuming."
-                ),
+                ("The checkpoint store is not readable. Repair its permissions before resuming."),
             )
         )
     if sqlite_code in _sqlite_codes("SQLITE_CORRUPT", "SQLITE_NOTADB"):
@@ -1044,6 +1054,94 @@ class AgentRuntime:
             )
         return self._model
 
+    async def inspect_hitl_checkpoint(
+        self, request: AgentActionRequest
+    ) -> HitlCheckpointInspection:
+        """Inspect current public graph state without invoking a model or tool."""
+        if not isinstance(request.resume, HitlResume):
+            raise TypeError("HITL checkpoint inspection requires a typed HitlResume")
+        absolute = _absolute_checkpoint_path(request.checkpoint_path)
+        if isinstance(absolute, AgentRunResult):
+            return HitlCheckpointInspection(
+                disposition="indeterminate",
+                detail="checkpoint path is not safely inspectable",
+            )
+        path_inspection = _inspect_checkpoint_path(absolute, require_exists=True)
+        if isinstance(path_inspection, AgentRunResult):
+            return HitlCheckpointInspection(
+                disposition="indeterminate",
+                detail="checkpoint file is absent or invalid",
+            )
+        checkpoint_path, _ = path_inspection
+        owner = _inspect_checkpoint_owner(checkpoint_path)
+        if isinstance(owner, AgentRunResult):
+            return HitlCheckpointInspection(
+                disposition="indeterminate",
+                detail="checkpoint ownership cannot be proven",
+            )
+        config: RunnableConfig = {
+            "configurable": {"thread_id": request.thread_id},
+            "recursion_limit": request.max_iterations * 2 + 6,
+        }
+        try:
+            async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+                control = await _preflight_checkpoint_database(checkpointer)
+                if control is not None:
+                    return HitlCheckpointInspection(
+                        disposition="indeterminate",
+                        detail="checkpoint database failed ABI preflight",
+                    )
+                agent = create_agent(
+                    model=self._get_model(),
+                    tools=[to_langchain_tool(tool) for tool in request.tools],
+                    system_prompt=request.system_prompt,
+                    response_format=ActionOutcomeEnvelope,
+                    checkpointer=checkpointer,
+                    name=request.agent_name,
+                    middleware=(
+                        HumanInTheLoopMiddleware(
+                            interrupt_on={
+                                name: {"allowed_decisions": ["approve", "reject"]}
+                                for name in request.approval_tools
+                            }
+                        ),
+                    ),
+                )
+                snapshot = await agent.aget_state(config)
+        except Exception as exc:
+            return HitlCheckpointInspection(
+                disposition="indeterminate",
+                detail=f"checkpoint inspection failed: {type(exc).__name__}",
+            )
+        pending = _pending_hitl_interrupts(snapshot)
+        if pending is not None:
+            pending_ids = {item.interrupt_id for item in pending}
+            claimed_ids = {item.interrupt_id for item in request.resume.interrupts}
+            if pending_ids == claimed_ids:
+                return HitlCheckpointInspection(disposition="not_started")
+            return HitlCheckpointInspection(
+                disposition="outcome",
+                outcome=Paused(
+                    reason="hitl",
+                    message="Action paused for approval before a tool call.",
+                    pending_hitl_interrupts=_public_pending_hitl_interrupts(pending),
+                ),
+            )
+        values = snapshot.values
+        if isinstance(values, dict):
+            structured = values.get("structured_response")
+            if structured is not None:
+                try:
+                    envelope = ActionOutcomeEnvelope.model_validate(structured)
+                except (TypeError, ValidationError, ValueError):
+                    pass
+                else:
+                    return HitlCheckpointInspection(disposition="outcome", outcome=envelope.outcome)
+        return HitlCheckpointInspection(
+            disposition="indeterminate",
+            detail="checkpoint has neither a current interrupt nor a typed terminal outcome",
+        )
+
     async def run_action(self, request: AgentActionRequest) -> AgentRunResult:
         """Execute or resume an Action and return only ABI-owned frozen models."""
         resume_key = (
@@ -1086,8 +1184,7 @@ class AgentRuntime:
             self._events.event(
                 "agent.run.end",
                 event_id=(
-                    f"agent.run.end:{invocation_id}:{result.outcome.kind}:"
-                    f"{result.stopped_reason}"
+                    f"agent.run.end:{invocation_id}:{result.outcome.kind}:{result.stopped_reason}"
                 ),
                 agent=request.agent_name,
                 thread_id=request.thread_id,

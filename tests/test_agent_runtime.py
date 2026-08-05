@@ -109,9 +109,7 @@ class _HistoryAwareModel(BaseChatModel):
                 },
             }
         else:
-            envelope_args = _succeeded_envelope_payload(
-                evidence_refs=["prior_tool_result"]
-            )
+            envelope_args = _succeeded_envelope_payload(evidence_refs=["prior_tool_result"])
         message = AIMessage(
             content="",
             tool_calls=[
@@ -254,9 +252,7 @@ def _success_message(*, evidence: list[str] | None = None) -> AIMessage:
         tool_calls=[
             {
                 "name": "ActionOutcomeEnvelope",
-                "args": {
-                    **_succeeded_envelope_payload(evidence_refs=evidence)
-                },
+                "args": {**_succeeded_envelope_payload(evidence_refs=evidence)},
                 "id": "outcome-success",
                 "type": "tool_call",
             }
@@ -717,6 +713,59 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
     )
 
     assert resumed.outcome.kind == "succeeded"
+    assert executions == 1
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_hitl_checkpoint_inspection_never_blindly_reexecutes_approved_tool(
+    tmp_path: Path,
+) -> None:
+    """Catch CLAIMED recovery that invokes the graph instead of reading public state."""
+    model = _ApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions = 0
+
+    def deliver() -> str:
+        nonlocal executions
+        executions += 1
+        return "delivered"
+
+    tool = ToolBinding("deliver", "Deliver after approval.", _NoopInput, deliver)
+    first_request = _request(
+        tmp_path,
+        tools=(tool,),
+        side_effects=True,
+        approval_tools=("deliver",),
+    )
+    first = await runtime.run_action(first_request)
+    (pending,) = first.outcome.pending_hitl_interrupts
+    resume_request = _request(
+        tmp_path,
+        tools=(tool,),
+        side_effects=True,
+        approval_tools=("deliver",),
+        resume=runner.HitlResume(
+            interrupts=(
+                runner.HitlInterruptDecision(
+                    interrupt_id=pending.interrupt_id,
+                    decisions=(runner.HitlDecision(decision="approve"),),
+                ),
+            )
+        ),
+    )
+
+    before = await runtime.inspect_hitl_checkpoint(resume_request)
+    assert before.disposition == "not_started"
+    assert executions == 0
+
+    resumed = await runtime.run_action(resume_request)
+    after = await runtime.inspect_hitl_checkpoint(resume_request)
+
+    assert resumed.outcome.kind == "succeeded"
+    assert after.disposition == "outcome"
+    assert after.outcome == resumed.outcome
     assert executions == 1
     assert set(model.human_counts) == {1}
 

@@ -40,7 +40,7 @@ def run_trace(project_root: Path, *, out_dir: Path | None = None) -> TraceReport
     project = BookProject(Path(project_root).expanduser().resolve())
     if not project.exists():
         raise FileNotFoundError(
-            f"no project state at {project.state_path}. Run `abi make-book` first."
+            f"no durable run ledger at {project.run_db}. Run `abi make-book` first."
         )
     report = trace_project(project)
     if out_dir is not None:
@@ -61,7 +61,7 @@ def run_book_eval(
     project = BookProject(Path(project_root).expanduser().resolve())
     if not project.exists():
         raise FileNotFoundError(
-            f"no project state at {project.state_path}. Run `abi make-book` first."
+            f"no durable run ledger at {project.run_db}. Run `abi make-book` first."
         )
     report = eval_book(project, source_lang=source_lang, target_lang=target_lang)
     if out_dir is not None:

@@ -7,6 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
@@ -48,6 +49,9 @@ from abi.types.orchestration import (
     Succeeded,
 )
 from abi.types.tools import GateRuntimeMetadata, ReviewActionIdentity, ToolBinding
+
+if TYPE_CHECKING:
+    from abi.providers.agent_runtime.runner import AgentResume
 
 
 class ActionToolRef(FrozenModel):
@@ -98,77 +102,257 @@ _QUALITY_SKILLS = (
 )
 
 _BUILTINS = (
-    _Builtin("source.ingest", "Parse and clean the source book.", SourceIngestInput,
-             ActionKind.DETERMINISTIC, None, "source.manifest", "source.manifest",
-             (), (), ("source",), ("source", "metadata"), 0.0),
-    _Builtin("source.split", "Split source into explicit chapters.", SourceSplitInput,
-             ActionKind.DETERMINISTIC, "source.ingest", "source.toc", "source.toc",
-             (), (), ("source",), ("source", "chapters/src"), 0.0),
-    _Builtin("research.global", "Capture universal translation research.", ResearchInput,
-             ActionKind.AGENT, "source.split", "qa/benchmark", "qa/benchmark",
-             ("read_file", "write_file", "grep"), (), ("references",), ("qa/benchmark",), 0.20),
-    _Builtin("research.book", "Research this book and define its style profile.", ResearchInput,
-             ActionKind.AGENT, "source.split", "metadata/style_profile.md", "metadata/style_profile.md",
-             ("read_file", "write_file", "grep"), (), ("source", "references"), ("metadata",), 0.50),
-    _Builtin("translation.trial", "Run and judge representative translation trials.", EmptyInput,
-             ActionKind.AGENT, ("research.global", "research.book"), "qa/pretranslation", "qa/pretranslation",
-             ("read_file", "write_file", "grep"), _QUALITY_SKILLS,
-             ("source", "metadata", "skills"), ("qa/pretranslation", "metadata"), 0.80),
-    _Builtin("glossary.prepare", "Create the persistent glossary and style guide.", EmptyInput,
-             ActionKind.AGENT, "translation.trial", "glossary/terms.csv", "glossary/terms.csv",
-             ("read_file", "write_file", "grep"), (),
-             ("source", "metadata", "qa/pretranslation"), ("glossary",), 0.40),
-    _Builtin("chapter.translate", "Translate an explicit, independently writable chapter batch.",
-             ChapterBatchInput, ActionKind.AGENT, "glossary.prepare", "chapters/translated",
-             "chapters/translated", ("read_file", "write_file", "grep"), (),
-             ("chapters/src", "glossary"), ("chapters/translated",), 1.50),
-    _Builtin("chapter.control", "Run zero-issue full-chapter post-translation control.",
-             ChapterBatchInput, ActionKind.AGENT, "chapter.translate", "qa/chapter_controls",
-             "qa/chapter_controls", ("read_file", "write_file", "edit_file", "grep"),
-             _QUALITY_SKILLS, ("chapters/translated", "glossary", "skills"),
-             ("chapters/translated", "qa/chapter_controls"), 0.70),
-    _Builtin("chapter.review", "Review, gate, and promote explicit chapters.", ReviewBatchInput,
-             ActionKind.AGENT, "chapter.control", "chapters/final", "qa/gates",
-             ("read_file", "write_file", "grep"), _QUALITY_SKILLS,
-             ("chapters/src", "chapters/translated", "glossary", "skills"),
-             ("qa/fidelity", "qa/readability", "qa/imagery", "qa/terminology", "qa/gates", "chapters/final"),
-             1.00),
-    _Builtin("preproduction.spec", "Write the production specification.", EmptyInput,
-             ActionKind.AGENT, "chapter.review", "preproduction/stage1", "preproduction/stage1",
-             ("read_file", "write_file", "grep"), (),
-             ("references", "metadata", "chapters/final"),
-             ("preproduction/stage1", "frontmatter", "metadata"), 0.30),
-    _Builtin("preproduction.sample", "Build and review a representative sample EPUB.",
-             BuildEpubInput, ActionKind.AGENT, "preproduction.spec", "preproduction/stage2_sample",
-             "preproduction/stage2_sample", ("read_file", "write_file", "grep", "build_sample_epub", "epubcheck"),
-             (), ("chapters/final", "preproduction/stage1", "frontmatter", "metadata", "assets"),
-             ("preproduction/stage2_sample", "output"), 0.25),
-    _Builtin("epub.build", "Build and lint the full EPUB deterministically.", BuildEpubInput,
-             ActionKind.DETERMINISTIC, "preproduction.sample", "output/book.epub", "output/book.epub",
-             (), (), ("chapters/final", "frontmatter", "metadata", "assets"), ("output",), 0.0),
-    _Builtin("review.spotcheck", "Run isolated stratified random review.", SpotcheckInput,
-             ActionKind.COMPOSITE, "epub.build", "reviews/random_spotcheck", "reviews/random_spotcheck",
-             ("read_file", "grep", "select_random_review_passages",
-              "validate_random_spotcheck", "spawn_review_agent"), _QUALITY_SKILLS,
-             ("chapters/src", "chapters/final", "references", "skills", "output"),
-             ("reviews/random_spotcheck",), 2.00),
-    _Builtin("review.independent", "Run two independent final reviewers.", ReviewBatchInput,
-             ActionKind.COMPOSITE, "epub.build", "reviews/agent_a", "reviews/agent_b",
-             ("read_file", "write_file", "grep", "spawn_review_agent"), _QUALITY_SKILLS,
-             ("chapters/src", "chapters/final", "references", "skills", "output"),
-             ("reviews/agent_a", "reviews/agent_b", "reviews/revision_route.md"), 1.20),
-    _Builtin("release.prepare", "Create a versioned release artifact.", ReleaseInput,
-             ActionKind.DETERMINISTIC, ("review.spotcheck", "review.independent"), "output/release", "output/release",
-             (), (), ("output", "reviews/random_spotcheck", "metadata"),
-             ("output/release", "output/private_artifacts"), 0.0),
-    _Builtin("output.finalize", "Write the final evidence manifest.", EmptyInput,
-             ActionKind.AGENT, "release.prepare", "output/final_manifest.md", "output/final_manifest.md",
-             ("read_file", "write_file", "grep"), (),
-             ("output", "reviews", "metadata"), ("output/final_manifest.md",), 0.10),
-    _Builtin("retrospective.capture", "Capture reusable findings without committing state.", EmptyInput,
-             ActionKind.AGENT, "output.finalize", "retrospective", "retrospective",
-             ("read_file", "write_file", "grep"), _QUALITY_SKILLS,
-             ("qa", "reviews", "output", "skills"), ("retrospective",), 0.20),
+    _Builtin(
+        "source.ingest",
+        "Parse and clean the source book.",
+        SourceIngestInput,
+        ActionKind.DETERMINISTIC,
+        None,
+        "source.manifest",
+        "source.manifest",
+        (),
+        (),
+        ("source",),
+        ("source", "metadata"),
+        0.0,
+    ),
+    _Builtin(
+        "source.split",
+        "Split source into explicit chapters.",
+        SourceSplitInput,
+        ActionKind.DETERMINISTIC,
+        "source.ingest",
+        "source.toc",
+        "source.toc",
+        (),
+        (),
+        ("source",),
+        ("source", "chapters/src"),
+        0.0,
+    ),
+    _Builtin(
+        "research.global",
+        "Capture universal translation research.",
+        ResearchInput,
+        ActionKind.AGENT,
+        "source.split",
+        "qa/benchmark",
+        "qa/benchmark",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("references",),
+        ("qa/benchmark",),
+        0.20,
+    ),
+    _Builtin(
+        "research.book",
+        "Research this book and define its style profile.",
+        ResearchInput,
+        ActionKind.AGENT,
+        "source.split",
+        "metadata/style_profile.md",
+        "metadata/style_profile.md",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("source", "references"),
+        ("metadata",),
+        0.50,
+    ),
+    _Builtin(
+        "translation.trial",
+        "Run and judge representative translation trials.",
+        EmptyInput,
+        ActionKind.AGENT,
+        ("research.global", "research.book"),
+        "qa/pretranslation",
+        "qa/pretranslation",
+        ("read_file", "write_file", "grep"),
+        _QUALITY_SKILLS,
+        ("source", "metadata", "skills"),
+        ("qa/pretranslation", "metadata"),
+        0.80,
+    ),
+    _Builtin(
+        "glossary.prepare",
+        "Create the persistent glossary and style guide.",
+        EmptyInput,
+        ActionKind.AGENT,
+        "translation.trial",
+        "glossary/terms.csv",
+        "glossary/terms.csv",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("source", "metadata", "qa/pretranslation"),
+        ("glossary",),
+        0.40,
+    ),
+    _Builtin(
+        "chapter.translate",
+        "Translate an explicit, independently writable chapter batch.",
+        ChapterBatchInput,
+        ActionKind.AGENT,
+        "glossary.prepare",
+        "chapters/translated",
+        "chapters/translated",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("chapters/src", "glossary"),
+        ("chapters/translated",),
+        1.50,
+    ),
+    _Builtin(
+        "chapter.control",
+        "Run zero-issue full-chapter post-translation control.",
+        ChapterBatchInput,
+        ActionKind.AGENT,
+        "chapter.translate",
+        "qa/chapter_controls",
+        "qa/chapter_controls",
+        ("read_file", "write_file", "edit_file", "grep"),
+        _QUALITY_SKILLS,
+        ("chapters/translated", "glossary", "skills"),
+        ("chapters/translated", "qa/chapter_controls"),
+        0.70,
+    ),
+    _Builtin(
+        "chapter.review",
+        "Review, gate, and promote explicit chapters.",
+        ReviewBatchInput,
+        ActionKind.AGENT,
+        "chapter.control",
+        "chapters/final",
+        "qa/gates",
+        ("read_file", "write_file", "grep"),
+        _QUALITY_SKILLS,
+        ("chapters/src", "chapters/translated", "glossary", "skills"),
+        (
+            "qa/fidelity",
+            "qa/readability",
+            "qa/imagery",
+            "qa/terminology",
+            "qa/gates",
+            "chapters/final",
+        ),
+        1.00,
+    ),
+    _Builtin(
+        "preproduction.spec",
+        "Write the production specification.",
+        EmptyInput,
+        ActionKind.AGENT,
+        "chapter.review",
+        "preproduction/stage1",
+        "preproduction/stage1",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("references", "metadata", "chapters/final"),
+        ("preproduction/stage1", "frontmatter", "metadata"),
+        0.30,
+    ),
+    _Builtin(
+        "preproduction.sample",
+        "Build and review a representative sample EPUB.",
+        BuildEpubInput,
+        ActionKind.AGENT,
+        "preproduction.spec",
+        "preproduction/stage2_sample",
+        "preproduction/stage2_sample",
+        ("read_file", "write_file", "grep", "build_sample_epub", "epubcheck"),
+        (),
+        ("chapters/final", "preproduction/stage1", "frontmatter", "metadata", "assets"),
+        ("preproduction/stage2_sample", "output"),
+        0.25,
+    ),
+    _Builtin(
+        "epub.build",
+        "Build and lint the full EPUB deterministically.",
+        BuildEpubInput,
+        ActionKind.DETERMINISTIC,
+        "preproduction.sample",
+        "output/book.epub",
+        "output/book.epub",
+        (),
+        (),
+        ("chapters/final", "frontmatter", "metadata", "assets"),
+        ("output",),
+        0.0,
+    ),
+    _Builtin(
+        "review.spotcheck",
+        "Run isolated stratified random review.",
+        SpotcheckInput,
+        ActionKind.COMPOSITE,
+        "epub.build",
+        "reviews/random_spotcheck",
+        "reviews/random_spotcheck",
+        (
+            "read_file",
+            "grep",
+            "select_random_review_passages",
+            "validate_random_spotcheck",
+            "spawn_review_agent",
+        ),
+        _QUALITY_SKILLS,
+        ("chapters/src", "chapters/final", "references", "skills", "output"),
+        ("reviews/random_spotcheck",),
+        2.00,
+    ),
+    _Builtin(
+        "review.independent",
+        "Run two independent final reviewers.",
+        ReviewBatchInput,
+        ActionKind.COMPOSITE,
+        "epub.build",
+        "reviews/agent_a",
+        "reviews/agent_b",
+        ("read_file", "write_file", "grep", "spawn_review_agent"),
+        _QUALITY_SKILLS,
+        ("chapters/src", "chapters/final", "references", "skills", "output"),
+        ("reviews/agent_a", "reviews/agent_b", "reviews/revision_route.md"),
+        1.20,
+    ),
+    _Builtin(
+        "release.prepare",
+        "Create a versioned release artifact.",
+        ReleaseInput,
+        ActionKind.DETERMINISTIC,
+        ("review.spotcheck", "review.independent"),
+        "output/release",
+        "output/release",
+        (),
+        (),
+        ("output", "reviews/random_spotcheck", "metadata"),
+        ("output/release", "output/private_artifacts"),
+        0.0,
+    ),
+    _Builtin(
+        "output.finalize",
+        "Write the final evidence manifest.",
+        EmptyInput,
+        ActionKind.AGENT,
+        "release.prepare",
+        "output/final_manifest.md",
+        "output/final_manifest.md",
+        ("read_file", "write_file", "grep"),
+        (),
+        ("output", "reviews", "metadata"),
+        ("output/final_manifest.md",),
+        0.10,
+    ),
+    _Builtin(
+        "retrospective.capture",
+        "Capture reusable findings without committing state.",
+        EmptyInput,
+        ActionKind.AGENT,
+        "output.finalize",
+        "retrospective",
+        "retrospective",
+        ("read_file", "write_file", "grep"),
+        _QUALITY_SKILLS,
+        ("qa", "reviews", "output", "skills"),
+        ("retrospective",),
+        0.20,
+    ),
 )
 
 _BY_CAPABILITY = {item.capability: item for item in _BUILTINS}
@@ -199,9 +383,7 @@ def _predicate_for(
     return tuple(
         PredicateSpec(
             name="action.succeeded",
-            arguments=(
-                ActionArgument(name="capability", value_json=json.dumps(dependency)),
-            ),
+            arguments=(ActionArgument(name="capability", value_json=json.dumps(dependency)),),
         )
         for dependency in normalized
     )
@@ -230,7 +412,11 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
         if not isinstance(parameters, ChapterBatchInput):
             raise TypeError(f"{capability} requires ChapterBatchInput")
         read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
-        write_dirs = [path for path in write_dirs if not path.startswith("chapters/") and not path.startswith("qa/chapter_controls")]
+        write_dirs = [
+            path
+            for path in write_dirs
+            if not path.startswith("chapters/") and not path.startswith("qa/chapter_controls")
+        ]
         for chapter in parameters.chapters:
             read_files.append(f"chapters/src/{chapter}.md")
             if capability == "chapter.control":
@@ -249,9 +435,7 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
         read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
         write_dirs = []
         for chapter in parameters.chapters:
-            read_files.extend(
-                (f"chapters/src/{chapter}.md", f"chapters/translated/{chapter}.md")
-            )
+            read_files.extend((f"chapters/src/{chapter}.md", f"chapters/translated/{chapter}.md"))
             write_files.extend(
                 (
                     f"qa/fidelity/{chapter}.md",
@@ -389,6 +573,44 @@ class AgentActionExecutor:
     async def __call__(
         self, context: ActionExecutionContext, parameters: FrozenModel
     ) -> ActionOutcomeEnvelope:
+        result = await self._execute(context, parameters, resume=None, inspect_only=False)
+        return cast(ActionOutcomeEnvelope, result)
+
+    async def resume_hitl(
+        self,
+        context: ActionExecutionContext,
+        parameters: FrozenModel,
+        resume: object,
+    ) -> ActionOutcomeEnvelope:
+        """Resume this exact Action checkpoint through the Task 6 typed boundary."""
+        from abi.providers.agent_runtime import HitlResume
+
+        if not isinstance(resume, HitlResume):
+            raise TypeError("agent Action HITL continuation requires HitlResume")
+        result = await self._execute(context, parameters, resume=resume, inspect_only=False)
+        return cast(ActionOutcomeEnvelope, result)
+
+    async def inspect_hitl(
+        self,
+        context: ActionExecutionContext,
+        parameters: FrozenModel,
+        resume: object,
+    ) -> object:
+        """Inspect this exact Action checkpoint without executing it."""
+        from abi.providers.agent_runtime import HitlResume
+
+        if not isinstance(resume, HitlResume):
+            raise TypeError("agent Action HITL inspection requires HitlResume")
+        return await self._execute(context, parameters, resume=resume, inspect_only=True)
+
+    async def _execute(
+        self,
+        context: ActionExecutionContext,
+        parameters: FrozenModel,
+        *,
+        resume: AgentResume | None,
+        inspect_only: bool,
+    ) -> object:
         parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
         action_id = context.action_id or f"{self._capability}:{parameter_hash}"
         if self._tool_context is None or self._tool_context.project.root != context.project.root:
@@ -398,7 +620,7 @@ class AgentActionExecutor:
                 outcome=PermanentFailure(
                     error_code="action_runtime_not_bound",
                     message="Bind this catalog to the current ToolContext before dispatch.",
-                )
+                ),
             )
         envelope = build_action_envelope(self._capability, parameters)
         store = ArtifactStore(context.project, None)
@@ -450,23 +672,26 @@ class AgentActionExecutor:
                     reason_code="action_envelope_invalid",
                     defect_codes=("action_envelope_invalid",),
                     message=str(exc),
-                )
+                ),
             )
         from abi.providers.agent_runtime import AgentActionRequest
 
         try:
-            result = await self._tool_context.services.agent.run_action(
-                AgentActionRequest(
-                    system_prompt=self._prompts.system_prompt(self._capability, snapshot),
-                    user_prompt=user_prompt,
-                    tools=tools,
-                    agent_name=self._capability.replace(".", "_"),
-                    thread_id=f"{context.run_id}/{action_id}/{context.attempt}",
-                    checkpoint_path=context.project.graph_checkpoints,
-                    max_iterations=40,
-                    may_have_side_effects=bool(envelope.permissions.write_files or envelope.permissions.write_dirs),
-                )
+            request = AgentActionRequest(
+                system_prompt=self._prompts.system_prompt(self._capability, snapshot),
+                user_prompt=user_prompt,
+                tools=tools,
+                agent_name=self._capability.replace(".", "_"),
+                thread_id=f"{context.run_id}/{action_id}/{context.attempt}",
+                checkpoint_path=context.project.graph_checkpoints,
+                max_iterations=40,
+                may_have_side_effects=False,
+                resume=resume,
+                approval_tools=(tuple(tool.name for tool in tools) if resume is not None else ()),
             )
+            if inspect_only:
+                return await self._tool_context.services.agent.inspect_hitl_checkpoint(request)
+            result = await self._tool_context.services.agent.run_action(request)
             outcome: ActionOutcome
             if isinstance(result.outcome, Succeeded):
                 bundle = writer.artifact_bundle()
@@ -628,9 +853,7 @@ class DeterministicActionExecutor:
                     media_type="application/epub+zip",
                     evidence_role="epub",
                 )
-                epubcheck_result = run_epubcheck_readonly(
-                    writer.staged_path("output/book.epub")
-                )
+                epubcheck_result = run_epubcheck_readonly(writer.staged_path("output/book.epub"))
                 writer.write_bytes(
                     "output/epubcheck.json",
                     _gate_result_json(epubcheck_result),
@@ -704,9 +927,7 @@ class DeterministicActionExecutor:
             return ActionOutcomeEnvelope(
                 action_id=action_id,
                 attempt=context.attempt,
-                outcome=PermanentFailure(
-                    error_code="deterministic_action_error", message=str(exc)
-                )
+                outcome=PermanentFailure(error_code="deterministic_action_error", message=str(exc)),
             )
         finally:
             store.close()
@@ -739,6 +960,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
         validators=validators,
         tools=_declared_tools(),
         skill_refs=_QUALITY_SKILLS,
+        semantic_repair_mappings=(("term_drift", "glossary.prepare"),),
     )
     prompts = ActionPromptRegistry()
     for item in _BUILTINS:
@@ -763,7 +985,9 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
             validator=item.capability,
             resource_class="review" if item.kind == ActionKind.COMPOSITE else "default",
             estimated_cost_usd=item.estimated_cost,
-            may_have_side_effects=bool(item.write_set),
+            # Built-ins write only to attempt staging. This flag is reserved for
+            # uncertain external effects that require probe-before-retry authority.
+            may_have_side_effects=False,
         )
         executor = (
             DeterministicActionExecutor(item.capability, tool_context=tool_context)

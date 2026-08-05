@@ -1,6 +1,6 @@
 # 受约束的动态 Agent 编排
 
-> **状态：已批准，待实现。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
+> **状态：已批准，实施中。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
 >
 > **协议修订：已批准、具有约束力。** 2026-08-05；artifact bundle、attempt-scoped staging、
 > staging-aware validation、multi-intent commit 与 typed probe resolution 是对 Tasks 1/4/7/8/9
@@ -23,10 +23,14 @@
 > `REPAIR_REQUIRED` 是状态而非处置类别。只有 `repair_class=semantic` 可在 run=`RUNNING` 时自动 replan；
 > `repair_class=integrity` 或缺失/未知分类必须 fail closed 为 `BLOCKED` 并等待人工处理。
 >
-> 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
-> 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
-> [`agentic-pipeline.md`](./agentic-pipeline.md) 和
-> [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md) 为准。
+> **HITL continuation 修订：已批准、具有约束力。** 2026-08-06；初始 `Paused` outcome receipt
+> 永远不可改写。每次人工决定先把 public interrupt、ordered decisions 与初始 pause digest 原子绑定为
+> `CLAIMED`，再追加独立 continuation receipt；业务路由只通过 effective outcome 选择最新 continuation。
+> `CLAIMED` 崩溃恢复只能使用 Task 6 public checkpoint inspector 的三分支裁决，禁止盲目重入。
+>
+> 本文定义 ABI 当前宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
+> 取代固定阶段链。LangGraph 的具体分层与 checkpoint/HITL 恢复协议见
+> [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md)。
 >
 > 前置阅读：[`core-beliefs.md`](./core-beliefs.md)、
 > [`agentic-pipeline.md`](./agentic-pipeline.md)、
@@ -132,7 +136,7 @@ pipeline_state.status
 
 ```mermaid
 flowchart TB
-    ENTRY["CLI / API<br/>make-book · resume · inspect"] --> ORCH
+    ENTRY["CLI / API<br/>make-book · resume · inspect<br/>approve · unblock · cancel"] --> ORCH
 
     subgraph CONTROL["控制平面：受约束的 Durable Orchestrator"]
         ORCH["Dynamic Orchestrator"]
@@ -666,6 +670,30 @@ action review 与 ABI 支持的 `approve` / `reject`；provider 意外给出 `ed
 interrupt 与 parallel partial resume 都不会被历史写入误判。pause/success 的 `tool_calls` / `tool_log`
 只来自本次 invocation 的 actual-start tracker，不重算 checkpoint 历史。
 
+人工决定不改写该 `Paused` receipt。`approve` 先在一个 RunLedger 事务中精确校验 run/action/attempt、
+当前 effective `Paused`、public interrupt ID、ordered decisions/feedback，并把初始 pause digest 一并冻结到
+`interrupts` 的 `CLAIMED` 行。Task 6 以同一
+`thread_id={run_id}/{action_id}/{attempt}` 恢复后，RunLedger 追加
+`hitl_continuation_receipts(sequence=1..n)` 并把 claim 标记为 `RESOLVED`；原 receipt 保持 byte-for-byte
+不变。相同决定重放直接返回缓存 continuation，零次 checkpoint resume；不同决定 fail closed。
+Controller、Reconciler、Committer、retry 与 repair 都只通过 RunLedger 的 effective-outcome API 读取
+“初始 receipt 或最新 continuation”，因此 Succeeded 仍完整经过 Task 8 的 gate、全 intents、promotion、
+统一后验和 commit authority，failure/repair 也不会绕过既有路由。
+
+若进程在 `CLAIMED` 后崩溃，恢复只调用 Task 6 的 public checkpoint inspector，不读取 saver 私有表：
+
+```mermaid
+flowchart TD
+    C["durable CLAIMED<br/>pause digest + ordered decision"] --> I["inspect public StateSnapshot<br/>零模型调用 · 零工具调用"]
+    I --> O{"checkpoint disposition"}
+    O -- "typed outcome / next Paused" --> A["重建并追加 continuation receipt<br/>不 resume"]
+    O -- "definitively not started" --> R["允许首次 resume<br/>随后追加 receipt"]
+    O -- "started or unknown" --> B["integrity BLOCKED<br/>禁止盲目重入"]
+    A --> E["effective outcome"]
+    R --> E
+    E --> T["Task 8 Reconciler / Committer routing"]
+```
+
 Skills 按 Action 渐进加载。翻译 Action 仍只得到原文、5–8 条文体规则和命中术语；QA、EPUB 和
 release 规则不能混入翻译上下文。
 
@@ -682,6 +710,7 @@ plan_versions
 actions
 action_attempts
 attempt_outcome_receipts
+hitl_continuation_receipts
 artifacts
 artifact_bundles
 gate_evidence
@@ -702,6 +731,10 @@ event_outbox
 - actions 和 action_attempts 持久化 expected manifest JSON/digest、完整 retry policy JSON/fingerprint；attempt
   在 executor 启动前取得 immutable snapshot。
 - attempt outcome receipt 唯一绑定 action/attempt 和 canonical outcome/bundle/failure facts；它不是 PASS。
+- `interrupts` 唯一绑定 public interrupt、run/action/attempt/thread、初始 pause digest 与 ordered
+  decisions/feedback；状态只能 `CLAIMED → RESOLVED`。`hitl_continuation_receipts` 是按 attempt/sequence
+  追加的 typed outcome 链，不能 update/delete 初始 pause。effective outcome 是确定性查询规则，不是另一个
+  可写真相表。
 - gate receipt 与完整 promotion-intent 集在同一事务中创建；它不是 success，也不能在部分 intent 集上重放。
 - validator FAIL 不得写入 PASS `gate_receipts`。原始 canonical failed `GateDecision` 写入独立的
   `validator_failure_receipts`，与 repair fact/incident/outbox 同事务持久化，但永不创建 promotion
@@ -1183,7 +1216,7 @@ src/abi/
 ├── providers/
 │   ├── orchestration_runtime/       # LangGraph generic durable loop
 │   └── agent_runtime/               # LangChain v1 Action Harness
-└── cli/                             # run/resume/inspect/unblock/cancel
+└── cli/                             # make-book/resume/inspect/approve/unblock/cancel
 ```
 
 继续保持业务层不直接 import LangGraph/LangChain。`providers.orchestration_runtime` 暴露泛型的
