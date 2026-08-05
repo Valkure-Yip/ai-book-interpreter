@@ -12,7 +12,13 @@ from abi.actions.contracts import ActionDefinition, ActionValidator, ResolvedAct
 from abi.actions.predicates import PredicateCatalog, PredicateConfigurationError
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.types._base import FrozenModel
-from abi.types.orchestration import ActionArgument, ActionSpec, EligibleAction, RunSnapshot
+from abi.types.orchestration import (
+    ActionArgument,
+    ActionSpec,
+    EligibleAction,
+    ProbeActionInput,
+    RunSnapshot,
+)
 from abi.types.tools import ToolBinding
 
 
@@ -34,12 +40,25 @@ class ActionRegistry:
         validators: Mapping[str, ActionValidator],
         tools: Mapping[str, ToolBinding] | None = None,
         skill_refs: Collection[str] = (),
+        semantic_repair_mappings: Collection[tuple[str, str]] = (),
     ) -> None:
         self._predicates = predicates
         self._validators = dict(validators)
         self._tools = dict(tools or {})
         self._skill_refs = frozenset(skill_refs)
         self._definitions: dict[str, ActionDefinition] = {}
+        self._semantic_repairs: dict[str, str] = {}
+        for reason_code, capability in semantic_repair_mappings:
+            if reason_code in self._semantic_repairs:
+                raise RegistryConfigurationError(
+                    f"duplicate semantic repair reason {reason_code}; map each reason exactly once"
+                )
+            if re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", reason_code) is None:
+                raise RegistryConfigurationError(
+                    f"semantic repair reason {reason_code!r} is not a stable lowercase identifier; "
+                    "rename the mapping before startup"
+                )
+            self._semantic_repairs[reason_code] = capability
 
     def register(self, definition: ActionDefinition) -> None:
         capability = definition.spec.capability
@@ -60,6 +79,19 @@ class ActionRegistry:
 
     def contains(self, capability: str) -> bool:
         return capability in self._definitions
+
+    def semantic_repair_capability(self, reason_code: str) -> str:
+        """Return the one startup-validated automatic repair capability."""
+        try:
+            return self._semantic_repairs[reason_code]
+        except KeyError as exc:
+            raise RegistryConfigurationError(
+                f"unmapped semantic repair reason {reason_code}; register an explicit reason-to-capability "
+                "mapping or route the repair as integrity"
+            ) from exc
+
+    def has_semantic_repair(self, reason_code: str) -> bool:
+        return reason_code in self._semantic_repairs
 
     def specs(self) -> tuple[ActionSpec, ...]:
         """Return the immutable registered specs in stable capability order."""
@@ -83,6 +115,12 @@ class ActionRegistry:
                         f"probe capability {probe} for {definition.spec.capability} must be "
                         "read-only and side-effect-free; correct its ActionSpec before startup"
                     )
+                probe_definition = self._definitions[probe]
+                if probe_definition.input_model is not ProbeActionInput:
+                    raise RegistryConfigurationError(
+                        f"probe capability {probe} for {definition.spec.capability} must use "
+                        "ProbeActionInput so original action/attempt/operation identity is frozen"
+                    )
             for alternative in definition.spec.alternative_capabilities:
                 if alternative not in self._definitions:
                     raise RegistryConfigurationError(
@@ -94,6 +132,26 @@ class ActionRegistry:
                         f"alternative capability for {definition.spec.capability} cannot point "
                         "to itself; register a genuinely different capability"
                     )
+        for reason_code, capability in self._semantic_repairs.items():
+            repair_definition = self._definitions.get(capability)
+            if repair_definition is None:
+                raise RegistryConfigurationError(
+                    f"semantic repair target {capability} for {reason_code} is not registered; "
+                    "register the repair capability before startup"
+                )
+            if repair_definition.spec.may_have_side_effects:
+                raise RegistryConfigurationError(
+                    f"semantic repair target {capability} for {reason_code} must be side-effect-free; "
+                    "separate uncertain external effects from automatic repair"
+                )
+            if any(
+                item.spec.probe_capability == capability
+                for item in self._definitions.values()
+            ):
+                raise RegistryConfigurationError(
+                    f"semantic repair target {capability} for {reason_code} is a probe capability; "
+                    "register a separate artifact-producing repair capability"
+                )
 
     def eligible(self, snapshot: RunSnapshot) -> tuple[EligibleAction, ...]:
         eligible: list[EligibleAction] = []

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Literal, cast
 
 import pytest
 
 from abi.project.run_ledger import (
     ArtifactCommit,
     LedgerConflictError,
+    LedgerNotFoundError,
     LedgerTransitionError,
     RunLedger,
     RunSeed,
@@ -31,6 +33,7 @@ from abi.types.orchestration import (
     PlanPatch,
     ProposedAction,
     RepairRequired,
+    RepairSource,
     RetryableFailure,
     RetryPolicySpec,
     RunStatus,
@@ -175,6 +178,30 @@ def _gate_receipt(bundle: ArtifactBundle) -> GateReceiptPayload:
     )
 
 
+def _failed_gate(
+    bundle: ArtifactBundle,
+    *,
+    reason_code: str = "term_drift",
+    bundle_digest: str | None = None,
+    artifact_checksums: tuple[str, ...] = ("a" * 64, "b" * 64),
+    evidence_refs: tuple[str, ...] = ("report",),
+) -> GateDecision:
+    return GateDecision(
+        passed=False,
+        reason_code=reason_code,
+        message=f"validator rejected {reason_code}",
+        validator_id="report.build",
+        validator_version="1",
+        bundle_digest=(
+            bundle_digest
+            if bundle_digest is not None
+            else sha256_canonical_json(canonical_bundle_json(bundle))
+        ),
+        artifact_checksums=artifact_checksums,
+        evidence_refs=evidence_refs,
+    )
+
+
 @pytest.mark.asyncio
 async def test_attempt_snapshots_manifest_and_retry_policy_before_dispatch(tmp_path: Path) -> None:
     """Catch catalog drift changing effect or retry facts after executor dispatch."""
@@ -253,11 +280,159 @@ async def test_gate_receipt_and_complete_bundle_intents_are_one_idempotent_trans
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("mapped", "expected_class", "expected_source", "expected_reason", "expected_status"),
+    (
+        (True, "semantic", "validator", "term_drift", RunStatus.RUNNING),
+        (False, "integrity", "integrity_guard", "repair_class_unknown", RunStatus.BLOCKED),
+    ),
+)
+async def test_failed_validator_decision_routes_only_through_typed_repair_fact(
+    tmp_path: Path,
+    mapped: bool,
+    expected_class: str,
+    expected_source: str,
+    expected_reason: str,
+    expected_status: RunStatus,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        bundle = _bundle()
+        await ledger.record_attempt_outcome(_success_receipt(bundle))
+        decision = _failed_gate(bundle)
+
+        fact = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=decision.reason_code,
+            defect_codes=(decision.reason_code,),
+            evidence_refs=decision.evidence_refs,
+            message=decision.message,
+            semantic_reason_mapped=mapped,
+            validator_decision=decision,
+        )
+
+        assert (fact.repair_class, fact.repair_source, fact.reason_code) == (
+            expected_class,
+            expected_source,
+            expected_reason,
+        )
+        assert (await ledger.get_run("run-1")).status is expected_status
+        with pytest.raises(LedgerNotFoundError, match="gate receipt"):
+            await ledger.get_gate_receipt_and_intents("a1", 1)
+        assert await ledger.promotion_intents("run-1") == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ("bundle", "evidence", "checksum_cardinality"))
+async def test_failed_validator_decision_binding_mismatch_blocks_as_integrity(
+    tmp_path: Path, mismatch: str
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        bundle = _bundle()
+        await ledger.record_attempt_outcome(_success_receipt(bundle))
+        decision = _failed_gate(
+            bundle,
+            bundle_digest="f" * 64 if mismatch == "bundle" else None,
+            evidence_refs=("alien",) if mismatch == "evidence" else ("report",),
+            artifact_checksums=("a" * 64,)
+            if mismatch == "checksum_cardinality"
+            else ("a" * 64, "b" * 64),
+        )
+
+        fact = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=decision.reason_code,
+            defect_codes=(decision.reason_code,),
+            evidence_refs=decision.evidence_refs,
+            message=decision.message,
+            semantic_reason_mapped=True,
+            validator_decision=decision,
+        )
+
+        assert (fact.repair_class, fact.repair_source, fact.reason_code) == (
+            "integrity",
+            "integrity_guard",
+            "repair_class_unknown",
+        )
+        assert (await ledger.get_run("run-1")).status is RunStatus.BLOCKED
+        with pytest.raises(LedgerNotFoundError, match="gate receipt"):
+            await ledger.get_gate_receipt_and_intents("a1", 1)
+        assert await ledger.promotion_intents("run-1") == ()
+
+
+@pytest.mark.asyncio
+async def test_failed_validator_decision_exact_replay_is_idempotent_and_conflict_blocks(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        bundle = _bundle()
+        await ledger.record_attempt_outcome(_success_receipt(bundle))
+        decision = _failed_gate(bundle)
+        first = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=decision.reason_code,
+            defect_codes=(decision.reason_code,),
+            evidence_refs=decision.evidence_refs,
+            message=decision.message,
+            semantic_reason_mapped=True,
+            validator_decision=decision,
+        )
+        outbox_count = len(await ledger.undelivered_events("run-1"))
+        second = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=decision.reason_code,
+            defect_codes=(decision.reason_code,),
+            evidence_refs=decision.evidence_refs,
+            message=decision.message,
+            semantic_reason_mapped=True,
+            validator_decision=decision,
+        )
+        assert second == first
+        assert len(await ledger.undelivered_events("run-1")) == outbox_count
+
+        conflicting = decision.model_copy(update={"message": "different validator fact"})
+        await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=conflicting.reason_code,
+            defect_codes=(conflicting.reason_code,),
+            evidence_refs=conflicting.evidence_refs,
+            message=conflicting.message,
+            semantic_reason_mapped=True,
+            validator_decision=conflicting,
+        )
+        assert (await ledger.get_run("run-1")).status is RunStatus.BLOCKED
+        assert await ledger.has_open_incident("gate_binding_conflict")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("repair_class", "mapped", "expected_status"),
     (("semantic", True, RunStatus.RUNNING), ("integrity", False, RunStatus.BLOCKED)),
 )
 async def test_repair_fact_is_receipt_bound_and_never_creates_retry_attempt(
-    tmp_path: Path, repair_class: str, mapped: bool, expected_status: RunStatus
+    tmp_path: Path,
+    repair_class: Literal["semantic", "integrity"],
+    mapped: bool,
+    expected_status: RunStatus,
 ) -> None:
     """Catch semantic/integrity repair collapsing into one retry or replan route."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
@@ -328,7 +503,7 @@ async def test_unknown_repair_source_fails_closed_as_integrity(
             action_id="a1",
             attempt=1,
             repair_class="semantic",
-            repair_source="invented_source",  # type: ignore[arg-type]
+            repair_source=cast(RepairSource, "invented_source"),
             reason_code="term_drift",
             defect_codes=("term_drift",),
             evidence_refs=(),

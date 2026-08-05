@@ -1,9 +1,8 @@
-"""Macro orchestrator: walk the 28-state machine stage by stage to DONE.
+"""Macro orchestration entry points.
 
-This is the deterministic spine. It picks the next unfinished stage based on the
-persisted ``PipelineState``, runs it via :func:`abi.stages.run_stage` (an agent
-loop + gate), and advances. Resumable: re-running reloads state and continues
-from wherever the project left off.
+``DurableOrchestrationDriver`` is the dynamic ledger-backed control-plane driver.
+The legacy ``Orchestrator`` remains temporarily for the pre-Task-10 CLI adapter;
+it does not participate in the dynamic controller or its business truth.
 """
 
 from __future__ import annotations
@@ -11,14 +10,48 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from abi.orchestrator.controller import DynamicController
+from abi.project.run_ledger import RunLedger
 from abi.project.state import HAPPY_PATH, Status, happy_index
 from abi.prompts.stages import STAGE_SEQUENCE, StageSpec
 from abi.providers.llm.budget import BudgetExceeded
+from abi.providers.orchestration_runtime import DurableLoopRuntime
 from abi.stages.runner import StageOutcome, run_stage
 from abi.tools.belt import build_belt
 from abi.tools.context import ToolContext
+from abi.types.orchestration import RunResult
 
 _log = logging.getLogger(__name__)
+
+
+class DurableOrchestrationDriver:
+    """Drive the provider-generic loop through a typed business controller callback."""
+
+    def __init__(
+        self,
+        *,
+        ledger: RunLedger,
+        controller: DynamicController,
+        runtime: DurableLoopRuntime,
+    ) -> None:
+        self._ledger = ledger
+        self._controller = controller
+        self._runtime = runtime
+
+    async def run(self, run_id: str) -> RunResult:
+        await self._runtime.run(run_id=run_id, tick=self._controller.tick)
+        run = await self._ledger.get_run(run_id)
+        snapshot = await self._ledger.load_snapshot(run_id)
+        blocked_reason = (
+            snapshot.incidents[-1].message
+            if run.status.value == "BLOCKED" and snapshot.incidents
+            else None
+        )
+        return RunResult(
+            run_id=run_id,
+            status=run.status,
+            blocked_reason=blocked_reason,
+        )
 
 
 @dataclass
@@ -103,4 +136,9 @@ class Orchestrator:
         return result
 
 
-__all__ = ["HAPPY_PATH", "OrchestrationResult", "Orchestrator"]
+__all__ = [
+    "HAPPY_PATH",
+    "DurableOrchestrationDriver",
+    "OrchestrationResult",
+    "Orchestrator",
+]

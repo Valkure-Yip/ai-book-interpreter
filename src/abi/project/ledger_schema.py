@@ -112,6 +112,21 @@ CREATE TABLE IF NOT EXISTS gate_receipts (
     FOREIGN KEY (action_id, attempt) REFERENCES action_attempts(action_id, attempt)
 );
 
+CREATE TABLE IF NOT EXISTS validator_failure_receipts (
+    action_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    validator_id TEXT NOT NULL,
+    validator_version TEXT NOT NULL,
+    canonical_gate_decision_json TEXT NOT NULL,
+    gate_decision_digest TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    artifact_checksums_json TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (action_id, attempt),
+    FOREIGN KEY (action_id, attempt) REFERENCES action_attempts(action_id, attempt)
+);
+
 CREATE TABLE IF NOT EXISTS repair_facts (
     action_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,

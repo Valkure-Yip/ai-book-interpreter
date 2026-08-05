@@ -153,6 +153,63 @@ def test_validate_startup_rechecks_registered_definitions() -> None:
         registry.validate_startup()
 
 
+def test_semantic_repair_mapping_is_unique_registered_and_side_effect_safe() -> None:
+    """Catch ambiguous or unsafe repair reasons reaching automatic replanning."""
+    with pytest.raises(RegistryConfigurationError, match="duplicate semantic repair reason"):
+        ActionRegistry(
+            predicates=PredicateCatalog(),
+            validators={"source_manifest": _validate_unused},
+            semantic_repair_mappings=(
+                ("term_drift", "repair.glossary"),
+                ("term_drift", "repair.chapter"),
+            ),
+        )
+
+    missing = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+    )
+    missing.register(_definition())
+    with pytest.raises(
+        RegistryConfigurationError, match=r"repair\.glossary.*not registered"
+    ):
+        missing.validate_startup()
+
+    unsafe = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+    )
+    unsafe.register(_definition())
+    unsafe.register(
+        replace(
+            _definition("repair.glossary"),
+            spec=_definition("repair.glossary").spec.model_copy(
+                update={"may_have_side_effects": True}
+            ),
+        )
+    )
+    with pytest.raises(RegistryConfigurationError, match="side-effect-free"):
+        unsafe.validate_startup()
+
+
+def test_semantic_repair_lookup_fails_closed_when_unmapped() -> None:
+    """Catch an unknown validator or outcome reason defaulting to semantic repair."""
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+    )
+    registry.register(_definition())
+    registry.register(_definition("repair.glossary"))
+    registry.validate_startup()
+
+    assert registry.semantic_repair_capability("term_drift") == "repair.glossary"
+    with pytest.raises(RegistryConfigurationError, match="unmapped semantic repair reason"):
+        registry.semantic_repair_capability("unknown_reason")
+
+
 def test_eligible_evaluates_predicates_and_sorts_summaries() -> None:
     """Catch eligibility that ignores a declared hard predicate or has unstable ordering."""
     predicates = PredicateCatalog(

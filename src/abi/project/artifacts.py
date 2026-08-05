@@ -407,27 +407,7 @@ class ArtifactStore:
                 message="An empty expected manifest cannot prove an executor outcome.",
             )
             raise ArtifactConflictError("empty manifest outcome is not reconstructable")
-        namespace = self.staging_dir(action_id, attempt)
-        expected_paths = {item.canonical_relpath for item in manifest.entries}
-        observed: set[str] = set()
-        if namespace.exists():
-            for path in namespace.rglob("*"):
-                if path.is_symlink() or (path.exists() and not path.is_file() and not path.is_dir()):
-                    await ledger.mark_bundle_conflict(
-                        action_id, attempt, reason_code="artifact_bundle_conflict",
-                        message="Unsafe staged entry prevents receipt reconstruction.",
-                    )
-                    raise ArtifactConflictError("unsafe staging evidence")
-                if path.is_file():
-                    observed.add(path.relative_to(namespace).as_posix())
-        if observed != expected_paths:
-            await ledger.mark_bundle_conflict(
-                action_id,
-                attempt,
-                reason_code="artifact_bundle_conflict",
-                message="Staged leaf set differs from the durable expected manifest.",
-            )
-            raise ArtifactConflictError("staging evidence is incomplete or contains extras")
+        await self.require_exact_staging(action_id, attempt)
         entries = tuple(
             ArtifactBundleEntry(
                 staged_relpath=f"state/staging/{action_id}/{attempt}/{item.canonical_relpath}",
@@ -443,23 +423,90 @@ class ArtifactStore:
             artifact_bundle=bundle,
             evidence_refs=attempt_record.expected_evidence_refs,
         )
-        outcome_json = canonical_model_json(
-            ActionOutcomeEnvelope(
-                action_id=action_id, attempt=attempt, outcome=outcome
+        envelope = ActionOutcomeEnvelope(
+            action_id=action_id, attempt=attempt, outcome=outcome
+        )
+        outcome_json = canonical_model_json(envelope)
+        bundle_json = canonical_bundle_json(bundle)
+        return await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id=action_id,
+                attempt=attempt,
+                canonical_outcome_json=outcome_json,
+                outcome_digest=sha256_canonical_json(outcome_json),
+                canonical_bundle_json=bundle_json,
+                bundle_digest=sha256_canonical_json(bundle_json),
+                evidence_refs=outcome.evidence_refs,
             )
         )
-        bundle_json = canonical_bundle_json(bundle)
-        payload = AttemptOutcomeReceiptPayload(
-            action_id=action_id,
-            attempt=attempt,
-            canonical_outcome_json=outcome_json,
-            outcome_digest=sha256_canonical_json(outcome_json),
-            canonical_bundle_json=bundle_json,
-            bundle_digest=sha256_canonical_json(bundle_json),
-            evidence_refs=attempt_record.expected_evidence_refs,
-        )
-        await ledger.record_attempt_outcome(payload)
-        return payload
+
+    async def require_exact_staging(self, action_id: str, attempt: int) -> None:
+        """Reject missing, extra, linked, or non-regular attempt staging evidence."""
+        ledger = self._require_ledger()
+        attempt_record = await ledger.get_attempt(action_id, attempt)
+        manifest = attempt_record.expected_artifact_manifest
+        expected_paths = {item.canonical_relpath for item in manifest.entries}
+        expected_dirs: set[str] = set()
+        for expected in expected_paths:
+            parts = PurePath(expected).parts
+            expected_dirs.update(
+                PurePath(*parts[:index]).as_posix()
+                for index in range(1, len(parts))
+            )
+        try:
+            observed, observed_dirs = self._staging_inventory(
+                action_id, attempt
+            )
+        except (OSError, ValueError):
+            await ledger.mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="artifact_bundle_conflict",
+                message="Unsafe staged entry prevents exact staging validation.",
+            )
+            raise ArtifactConflictError("unsafe staging evidence") from None
+        if observed != expected_paths or observed_dirs != expected_dirs:
+            await ledger.mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="artifact_bundle_conflict",
+                message="Staged leaf/directory set differs from the durable expected manifest.",
+            )
+            raise ArtifactConflictError("staging evidence is incomplete or contains extras")
+
+    def _staging_inventory(
+        self, action_id: str, attempt: int
+    ) -> tuple[set[str], set[str]]:
+        """Enumerate one pinned attempt dir recursively without following aliases."""
+        root_fd = self._open_staging_attempt_dir(action_id, attempt, create=False)
+        files: set[str] = set()
+        directories: set[str] = set()
+
+        def visit(directory_fd: int, prefix: tuple[str, ...]) -> None:
+            for name in sorted(os.listdir(directory_fd)):
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                relparts = (*prefix, name)
+                relpath = PurePath(*relparts).as_posix()
+                if stat.S_ISREG(info.st_mode):
+                    files.add(relpath)
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    directories.add(relpath)
+                    child_fd = _open_directory_at(
+                        directory_fd, name, create=False
+                    )
+                    try:
+                        visit(child_fd, relparts)
+                    finally:
+                        os.close(child_fd)
+                    continue
+                raise ValueError("staging contains a link or non-regular leaf")
+
+        try:
+            visit(root_fd, ())
+        finally:
+            os.close(root_fd)
+        return files, directories
 
     async def _complete(
         self, intent: PromotionIntent, *, crash_after: str | None = None

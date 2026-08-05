@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections import Counter
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 class EventLogger:
@@ -20,17 +22,79 @@ class EventLogger:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Touch the file so consumers can tail immediately.
         self._path.touch(exist_ok=True)
+        self._seen_event_ids = self._load_seen_event_ids()
 
-    def event(self, name: str, **fields: Any) -> None:
+    def event(self, name: str, *, event_id: str | None = None, **fields: Any) -> None:
         record: dict[str, Any] = {
-            "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "ts": _utc_timestamp(timespec="milliseconds"),
             "run_id": self._run_id,
             "event": name,
             **fields,
         }
+        if event_id is not None:
+            self.append_record(event_id, record)
+            return
+        self._append_line(record)
+
+    def append_record(self, event_id: str, record: Mapping[str, object]) -> bool:
+        """Append one stable outbox/provider event once, including after restart."""
+        if not event_id:
+            raise ValueError(
+                "event_id must be stable and non-empty; derive it from the call or Action attempt"
+            )
+        with self._lock, self._path.open("a", encoding="utf-8") as f:
+            if event_id in self._seen_event_ids:
+                return False
+            materialized: dict[str, object] = {
+                "ts": _utc_timestamp(timespec="milliseconds"),
+                "run_id": self._run_id,
+                **record,
+                "event_id": event_id,
+            }
+            line = json.dumps(materialized, ensure_ascii=False, default=str)
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+            self._seen_event_ids.add(event_id)
+        return True
+
+    def _append_line(self, record: Mapping[str, object]) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str)
         with self._lock, self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+    def _load_seen_event_ids(self) -> set[str]:
+        seen: set[str] = set()
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise ValueError(
+                f"cannot read event projection {self._path}; repair its permissions before startup"
+            ) from exc
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"event projection contains invalid JSON on line {line_number}; repair or "
+                    "rebuild events.jsonl from the ledger outbox"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"event projection line {line_number} is not an object; rebuild events.jsonl "
+                    "from the ledger outbox"
+                )
+            event_id = parsed.get("event_id")
+            if event_id is not None and not isinstance(event_id, str):
+                raise ValueError(
+                    f"event projection line {line_number} has an invalid event_id; rebuild "
+                    "events.jsonl from the ledger outbox"
+                )
+            if event_id:
+                seen.add(event_id)
+        return seen
 
 
 class MetricsAggregator:
@@ -41,7 +105,7 @@ class MetricsAggregator:
         self._run_id = run_id
         self._book_id = book_id
         self._lock = threading.Lock()
-        self._started_at = datetime.utcnow()
+        self._started_at = datetime.now(UTC)
         self._tokens_in = 0
         self._tokens_out = 0
         self._tokens_cached = 0
@@ -91,12 +155,14 @@ class MetricsAggregator:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             return {
                 "run_id": self._run_id,
                 "book_id": self._book_id,
-                "started_at": self._started_at.isoformat(timespec="seconds") + "Z",
-                "updated_at": now.isoformat(timespec="seconds") + "Z",
+                "started_at": self._started_at.isoformat(timespec="seconds").replace(
+                    "+00:00", "Z"
+                ),
+                "updated_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
                 "duration_s": int((now - self._started_at).total_seconds()),
                 "llm_calls": self._llm_calls,
                 "tokens": {
@@ -120,3 +186,7 @@ class MetricsAggregator:
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(snap, f, ensure_ascii=False, indent=2)
         tmp.replace(self._path)
+
+
+def _utc_timestamp(*, timespec: Literal["seconds", "milliseconds"]) -> str:
+    return datetime.now(UTC).isoformat(timespec=timespec).replace("+00:00", "Z")

@@ -292,7 +292,9 @@ class LLMRouter:
         )
         self._events.event(
             "agent.call",
+            event_id=f"agent.call:{agent_name}:{prompt_hash}:{attempt}",
             agent=agent_name,
+            call_id=f"{agent_name}:{prompt_hash}:{attempt}",
             prompt_version=prompt_version,
             prompt_hash=prompt_hash,
             model=active_model,

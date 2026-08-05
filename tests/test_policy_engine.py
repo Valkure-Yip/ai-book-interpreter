@@ -13,11 +13,14 @@ from abi.types.orchestration import (
     ActionArgument,
     ActionKind,
     ActionSpec,
+    ActionStatus,
+    ActionView,
     EligibleAction,
     ExpectedArtifact,
     ExpectedArtifactManifest,
     GateDecision,
     GateEvidence,
+    IncidentView,
     PlanPatch,
     PredicateSpec,
     ProposedAction,
@@ -117,6 +120,119 @@ def _registry() -> ActionRegistry:
         )
     )
     return registry
+
+
+def _repair_registry() -> ActionRegistry:
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+    )
+    registry.register(_definition("repair.glossary"))
+    registry.register(_definition("work.other"))
+    registry.validate_startup()
+    return registry
+
+
+def _repair_snapshot(*, repair_class: str, reason_code: str) -> RunSnapshot:
+    return RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        plan_version=1,
+        actions=(
+            ActionView(
+                action_id="old",
+                capability="work.initial",
+                status=ActionStatus.REPAIR_REQUIRED,
+                repair_class=repair_class,
+                repair_source=(
+                    "action_outcome" if repair_class == "semantic" else "integrity_guard"
+                ),
+                reason_code=reason_code,
+            ),
+        ),
+        incidents=(
+            IncidentView(
+                incident_id="repair:old:1",
+                error_code=reason_code,
+                message="repair evidence",
+                action_id="old",
+                repair_class=repair_class,
+                repair_source=(
+                    "action_outcome" if repair_class == "semantic" else "integrity_guard"
+                ),
+                reason_code=reason_code,
+            ),
+        ),
+        eligible_actions=(
+            EligibleAction(
+                capability="repair.glossary",
+                description="repair",
+                input_schema="EmptyInput",
+                estimated_cost_usd=0,
+            ),
+            EligibleAction(
+                capability="work.other",
+                description="other",
+                input_schema="EmptyInput",
+                estimated_cost_usd=0,
+            ),
+        ),
+    )
+
+
+def test_policy_authorizes_only_registry_mapped_semantic_repair() -> None:
+    """Catch a semantic repair authorizing an unrelated replacement capability."""
+    policy = PolicyEngine(_repair_registry())
+    snapshot = _repair_snapshot(repair_class="semantic", reason_code="term_drift")
+
+    mapped = policy.authorize(
+        snapshot,
+        PlanPatch(
+            objective="repair terminology",
+            proposed_actions=(
+                ProposedAction(proposal_id="repair", capability="repair.glossary"),
+            ),
+            rationale="use the exact mapped repair",
+        ),
+        next_plan_version=2,
+    )
+    unrelated = policy.authorize(
+        snapshot,
+        PlanPatch(
+            objective="do unrelated work",
+            proposed_actions=(
+                ProposedAction(proposal_id="other", capability="work.other"),
+            ),
+            rationale="must not bypass the repair mapping",
+        ),
+        next_plan_version=2,
+    )
+
+    assert mapped.authorized
+    assert unrelated.reason_codes == ("semantic_repair_capability_mismatch",)
+
+
+def test_policy_blocks_every_plan_when_integrity_incident_is_open() -> None:
+    """Catch Planner authorization while durable integrity evidence is unresolved."""
+    policy = PolicyEngine(_repair_registry())
+    snapshot = _repair_snapshot(
+        repair_class="integrity", reason_code="artifact_identity_conflict"
+    )
+    decision = policy.authorize(
+        snapshot,
+        PlanPatch(
+            objective="attempt automatic repair",
+            proposed_actions=(
+                ProposedAction(proposal_id="repair", capability="repair.glossary"),
+            ),
+            rationale="must remain blocked",
+        ),
+        next_plan_version=2,
+    )
+
+    assert not decision.authorized
+    assert decision.reason_codes == ("integrity_incident_open",)
 
 
 def _snapshot(*, budget: float | None = 10.0) -> RunSnapshot:

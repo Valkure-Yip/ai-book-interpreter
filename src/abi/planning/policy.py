@@ -64,7 +64,38 @@ class PolicyEngine:
         self._check_conflicts(proposals, reasons)
         self._check_failure_signatures(snapshot, resolved.values(), reasons)
         self._check_terminal_release_policy(snapshot, resolved.values(), reasons)
+        self._check_repair_routes(snapshot, proposals, reasons)
         return reasons
+
+    def _check_repair_routes(
+        self,
+        snapshot: RunSnapshot,
+        proposals: tuple[ProposedAction, ...],
+        reasons: set[str],
+    ) -> None:
+        repair_incidents = tuple(
+            incident
+            for incident in snapshot.incidents
+            if incident.repair_class is not None
+        )
+        if any(incident.repair_class == "integrity" for incident in repair_incidents):
+            reasons.add("integrity_incident_open")
+            return
+        semantic_reasons = tuple(
+            incident.reason_code
+            for incident in repair_incidents
+            if incident.repair_class == "semantic" and incident.reason_code is not None
+        )
+        if not semantic_reasons:
+            return
+        mapped: set[str] = set()
+        for reason_code in semantic_reasons:
+            if not self._registry.has_semantic_repair(reason_code):
+                reasons.add("unmapped_semantic_repair")
+                continue
+            mapped.add(self._registry.semantic_repair_capability(reason_code))
+        if any(proposal.capability not in mapped for proposal in proposals):
+            reasons.add("semantic_repair_capability_mismatch")
 
     def _resolve_known_actions(
         self, proposals: tuple[ProposedAction, ...], reasons: set[str]

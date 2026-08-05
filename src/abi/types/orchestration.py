@@ -420,6 +420,15 @@ class ProbeResolution(FrozenModel):
     message: str
 
 
+class ProbeActionInput(FrozenModel):
+    """Frozen binding from one evidence-only probe to its original attempt."""
+
+    original_action_id: str = Field(min_length=1)
+    original_attempt: int = Field(ge=1)
+    operation_key: str = Field(min_length=1)
+    probe_capability: str = Field(min_length=1)
+
+
 class PendingHitlActionReview(FrozenModel):
     tool_name: str
     arguments_json: str

@@ -27,6 +27,7 @@ from abi.types.orchestration import (
     AuthorizedAction,
     ExpectedArtifactManifest,
     GateArtifactIdentity,
+    GateDecision,
     GateEvidence,
     GateReceiptPayload,
     IncidentView,
@@ -35,6 +36,8 @@ from abi.types.orchestration import (
     PermanentFailure,
     PlanPatch,
     PlanRejectionView,
+    ProbeActionInput,
+    ProbeResolution,
     RepairClass,
     RepairRequired,
     RepairSource,
@@ -45,6 +48,7 @@ from abi.types.orchestration import (
     Succeeded,
     canonical_manifest_json,
     canonical_model_json,
+    sha256_canonical_json,
 )
 
 
@@ -62,6 +66,10 @@ class LedgerConflictError(LedgerError):
 
 class LedgerNotFoundError(LedgerError):
     """Raised when an operation refers to no durable run or action."""
+
+
+class _ValidatorFailureReplayConflict(RuntimeError):
+    """Internal signal used to roll back before independent compensation."""
 
 
 class RunSeed(FrozenModel):
@@ -229,6 +237,21 @@ class GateReceiptRecord(GateReceiptPayload):
     recorded_at: datetime
 
 
+class ValidatorFailureReceiptRecord(FrozenModel):
+    """Immutable raw failed-validator fact; it can never authorize promotion."""
+
+    action_id: str
+    attempt: int = Field(ge=1)
+    validator_id: str
+    validator_version: str
+    canonical_gate_decision_json: str
+    gate_decision_digest: str
+    bundle_digest: str
+    artifact_checksums: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    recorded_at: datetime
+
+
 class RepairFactRecord(FrozenModel):
     action_id: str
     attempt: int = Field(ge=1)
@@ -377,6 +400,29 @@ class RunLedger:
                 now=now,
             )
         return rejection
+
+    async def pending_plan(self, run_id: str) -> PlanVersionRecord | None:
+        """Return the latest appended plan only while it has no durable disposition."""
+        await self.get_run(run_id)
+        row = await self._fetch_one(
+            "SELECT * FROM plan_versions WHERE run_id = ? ORDER BY version DESC LIMIT 1",
+            (run_id,),
+        )
+        if row is None:
+            return None
+        disposition = await self._fetch_one(
+            "SELECT 1 FROM actions WHERE run_id = ? AND plan_version = ? "
+            "UNION ALL SELECT 1 FROM plan_rejections WHERE run_id = ? AND plan_version = ? LIMIT 1",
+            (run_id, row["version"], run_id, row["version"]),
+        )
+        if disposition is not None:
+            return None
+        return PlanVersionRecord(
+            run_id=run_id,
+            version=row["version"],
+            patch=PlanPatch.model_validate_json(row["patch_json"]),
+            created_at=_parse_time(row["created_at"]),
+        )
 
     async def authorize_actions(
         self, run_id: str, actions: Sequence[AuthorizedAction]
@@ -861,6 +907,17 @@ class RunLedger:
             self._promotion_intent_from_row(item) for item in intents
         )
 
+    async def get_validator_failure_receipt(
+        self, action_id: str, attempt: int
+    ) -> ValidatorFailureReceiptRecord:
+        row = await self._fetch_one(
+            "SELECT * FROM validator_failure_receipts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        if row is None:
+            raise LedgerNotFoundError("validator failure receipt is absent")
+        return self._validator_failure_receipt_from_row(row)
+
     async def record_repair_required(
         self,
         *,
@@ -873,88 +930,201 @@ class RunLedger:
         evidence_refs: tuple[str, ...],
         message: str,
         semantic_reason_mapped: bool,
+        validator_decision: GateDecision | None = None,
     ) -> RepairFactRecord:
         """Record one receipt-bound semantic repair or integrity block transaction."""
         now = self._now()
-        async with self.transaction() as db:
-            action = await self._require_action(db, action_id)
-            await self._attempt_row(db, action_id, attempt)
-            cursor = await db.execute(
-                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
-                (action_id, attempt),
-            )
-            receipt = await cursor.fetchone()
-            if receipt is None:
-                raise LedgerTransitionError("repair fact requires the durable outcome receipt")
-            envelope = ActionOutcomeEnvelope.model_validate_json(
-                receipt["canonical_outcome_json"]
-            )
-            outcome = envelope.outcome
-            exact_receipt_fact = (
-                isinstance(outcome, RepairRequired)
-                and repair_class == outcome.repair_class
-                and repair_source == outcome.repair_source
-                and reason_code == outcome.reason_code
-                and defect_codes == outcome.defect_codes
-                and message == outcome.message
-            )
-            valid_semantic = (
-                exact_receipt_fact
-                and repair_class == "semantic"
-                and semantic_reason_mapped
-                and repair_source in {"action_outcome", "validator"}
-            )
-            valid_integrity = (
-                exact_receipt_fact
-                and repair_class == "integrity"
-            )
-            if valid_semantic or valid_integrity:
-                effective_class: RepairClass = repair_class
-                effective_source: RepairSource = repair_source
-                effective_reason = reason_code
-            else:
-                effective_class = "integrity"
-                effective_source = "integrity_guard"
-                effective_reason = "repair_class_unknown"
-            cursor = await db.execute(
-                "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
-            )
-            prior = await cursor.fetchone()
-            if prior is not None:
-                return self._repair_fact_from_row(prior)
-            await db.execute(
-                "INSERT INTO repair_facts (action_id, attempt, repair_class, repair_source, reason_code, "
-                "defect_codes_json, evidence_refs_json, message, outcome_digest, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    action_id, attempt, effective_class, effective_source, effective_reason,
-                    _dump_tuple(defect_codes), _dump_tuple(evidence_refs), message,
-                    receipt["outcome_digest"], now,
+        try:
+            async with self.transaction() as db:
+                action = await self._require_action(db, action_id)
+                await self._attempt_row(db, action_id, attempt)
+                cursor = await db.execute(
+                    "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                    (action_id, attempt),
+                )
+                receipt = await cursor.fetchone()
+                if receipt is None:
+                    raise LedgerTransitionError("repair fact requires the durable outcome receipt")
+                envelope = ActionOutcomeEnvelope.model_validate_json(
+                    receipt["canonical_outcome_json"]
+                )
+                outcome = envelope.outcome
+                raw_fact_digest = receipt["outcome_digest"]
+                exact_receipt_fact = (
+                    isinstance(outcome, RepairRequired)
+                    and validator_decision is None
+                    and repair_class == outcome.repair_class
+                    and repair_source == outcome.repair_source
+                    and reason_code == outcome.reason_code
+                    and defect_codes == outcome.defect_codes
+                    and message == outcome.message
+                )
+
+                if validator_decision is not None:
+                    decision_json = canonical_model_json(validator_decision)
+                    decision_digest = sha256_canonical_json(decision_json)
+                    cursor = await db.execute(
+                        "SELECT * FROM validator_failure_receipts "
+                        "WHERE action_id = ? AND attempt = ?",
+                        (action_id, attempt),
+                    )
+                    prior_failure = await cursor.fetchone()
+                    if prior_failure is not None:
+                        if prior_failure["canonical_gate_decision_json"] != decision_json:
+                            raise _ValidatorFailureReplayConflict
+                    else:
+                        await db.execute(
+                            "INSERT INTO validator_failure_receipts (action_id, attempt, "
+                            "validator_id, validator_version, canonical_gate_decision_json, "
+                            "gate_decision_digest, bundle_digest, artifact_checksums_json, "
+                            "evidence_refs_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                action_id,
+                                attempt,
+                                validator_decision.validator_id,
+                                validator_decision.validator_version,
+                                decision_json,
+                                decision_digest,
+                                validator_decision.bundle_digest,
+                                _dump_tuple(validator_decision.artifact_checksums),
+                                _dump_tuple(validator_decision.evidence_refs),
+                                now,
+                            ),
+                        )
+                    raw_fact_digest = decision_digest
+                    bundle_entry_count = -1
+                    if receipt["canonical_bundle_json"] is not None:
+                        raw_bundle = json.loads(receipt["canonical_bundle_json"])
+                        entries = raw_bundle.get("entries") if isinstance(raw_bundle, dict) else None
+                        if isinstance(entries, list):
+                            bundle_entry_count = len(entries)
+                    exact_receipt_fact = (
+                        isinstance(outcome, Succeeded)
+                        and not validator_decision.passed
+                        and repair_class == "semantic"
+                        and repair_source == "validator"
+                        and reason_code == validator_decision.reason_code
+                        and defect_codes == (validator_decision.reason_code,)
+                        and evidence_refs == validator_decision.evidence_refs
+                        and message == validator_decision.message
+                        and validator_decision.bundle_digest == receipt["bundle_digest"]
+                        and validator_decision.evidence_refs
+                        == tuple(json.loads(receipt["evidence_refs_json"]))
+                        and len(validator_decision.artifact_checksums)
+                        == bundle_entry_count
+                    )
+
+                valid_semantic = (
+                    exact_receipt_fact
+                    and repair_class == "semantic"
+                    and semantic_reason_mapped
+                    and repair_source in {"action_outcome", "validator"}
+                )
+                valid_integrity = exact_receipt_fact and repair_class == "integrity"
+                if valid_semantic or valid_integrity:
+                    effective_class: RepairClass = repair_class
+                    effective_source: RepairSource = repair_source
+                    effective_reason = reason_code
+                else:
+                    effective_class = "integrity"
+                    effective_source = "integrity_guard"
+                    effective_reason = "repair_class_unknown"
+                cursor = await db.execute(
+                    "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?",
+                    (action_id, attempt),
+                )
+                prior = await cursor.fetchone()
+                if prior is not None:
+                    return self._repair_fact_from_row(prior)
+                await db.execute(
+                    "INSERT INTO repair_facts (action_id, attempt, repair_class, repair_source, reason_code, "
+                    "defect_codes_json, evidence_refs_json, message, outcome_digest, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        action_id, attempt, effective_class, effective_source, effective_reason,
+                        _dump_tuple(defect_codes), _dump_tuple(evidence_refs), message,
+                        raw_fact_digest, now,
+                    ),
+                )
+                await db.execute(
+                    "UPDATE action_attempts SET status = ?, repair_class = ?, repair_source = ?, "
+                    "reason_code = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
+                    (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, now, action_id, attempt),
+                )
+                await db.execute(
+                    "UPDATE actions SET status = ?, repair_class = ?, repair_source = ?, reason_code = ? "
+                    "WHERE action_id = ?",
+                    (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, action_id),
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=action["run_id"],
+                    event_name="action.outcome",
+                    aggregate_id=action_id,
+                    payload_json=json.dumps(
+                        {
+                            "action_id": action_id,
+                            "attempt": attempt,
+                            "classification": "repair_required",
+                            "repair_class": effective_class,
+                            "repair_source": effective_source,
+                            "reason_code": effective_reason,
+                        },
+                        sort_keys=True,
+                    ),
+                    idempotency_key=f"action.outcome:{action_id}:{attempt}",
+                    now=now,
+                )
+                incident_id = f"repair:{action_id}:{attempt}"
+                await db.execute(
+                    "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, "
+                    "repair_class, repair_source, reason_code, status, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+                    (incident_id, action["run_id"], action_id, effective_reason, incident_id, message,
+                     effective_class, effective_source, effective_reason, now),
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=action["run_id"],
+                    event_name="incident.created",
+                    aggregate_id=action_id,
+                    payload_json=json.dumps(
+                        {
+                            "incident_id": incident_id,
+                            "action_id": action_id,
+                            "error_code": effective_reason,
+                        },
+                        sort_keys=True,
+                    ),
+                    idempotency_key=f"incident.created:{incident_id}",
+                    now=now,
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=action["run_id"],
+                    event_name="run.replanned",
+                    aggregate_id=action["run_id"],
+                    payload_json=json.dumps(
+                        {"action_id": action_id, "attempt": attempt}, sort_keys=True
+                    ),
+                    idempotency_key=f"run.replanned:{action_id}:{attempt}",
+                    now=now,
+                )
+                if effective_class == "integrity":
+                    await db.execute(
+                        "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                        (RunStatus.BLOCKED.value, now, action["run_id"]),
+                    )
+        except _ValidatorFailureReplayConflict:
+            await self.mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="gate_binding_conflict",
+                message=(
+                    "A different failed-validator decision was replayed for the same attempt; "
+                    "preserve the first receipt and inspect the conflicting evidence."
                 ),
             )
-            await db.execute(
-                "UPDATE action_attempts SET status = ?, repair_class = ?, repair_source = ?, "
-                "reason_code = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
-                (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, now, action_id, attempt),
-            )
-            await db.execute(
-                "UPDATE actions SET status = ?, repair_class = ?, repair_source = ?, reason_code = ? "
-                "WHERE action_id = ?",
-                (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, action_id),
-            )
-            incident_id = f"repair:{action_id}:{attempt}"
-            await db.execute(
-                "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, "
-                "repair_class, repair_source, reason_code, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
-                (incident_id, action["run_id"], action_id, effective_reason, incident_id, message,
-                 effective_class, effective_source, effective_reason, now),
-            )
-            if effective_class == "integrity":
-                await db.execute(
-                    "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
-                    (RunStatus.BLOCKED.value, now, action["run_id"]),
-                )
         row = await self._fetch_one(
             "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
         )
@@ -977,6 +1147,147 @@ class RunLedger:
                 db, action, attempt_row, reason_code, message
             )
         return await self.get_attempt(action_id, attempt)
+
+    async def complete_probe_pending(
+        self,
+        *,
+        probe_action_id: str,
+        probe_attempt: int,
+        original_action_id: str,
+        original_attempt: int,
+        operation_key: str,
+    ) -> ActionAttemptRecord:
+        """Evidence-only complete a probe while leaving original resolution to Task 9."""
+        now = self._now()
+        async with self.transaction() as db:
+            probe = await self._require_action(db, probe_action_id)
+            probe_attempt_row = await self._attempt_row(
+                db, probe_action_id, probe_attempt
+            )
+            original = await self._require_action(db, original_action_id)
+            original_attempt_row = await self._attempt_row(
+                db, original_action_id, original_attempt
+            )
+            if probe["run_id"] != original["run_id"]:
+                raise LedgerTransitionError("probe and original Action belong to different runs")
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (probe_action_id, probe_attempt),
+            )
+            probe_receipt = await cursor.fetchone()
+            if probe_receipt is None:
+                raise LedgerTransitionError("probe completion requires its durable resolution receipt")
+            probe_envelope = ActionOutcomeEnvelope.model_validate_json(
+                probe_receipt["canonical_outcome_json"]
+            )
+            if not isinstance(probe_envelope.outcome, ProbeResolution):
+                raise LedgerTransitionError("probe completion requires ProbeResolution")
+            binding = ProbeActionInput.model_validate_json(probe["parameters_json"])
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (original_action_id, original_attempt),
+            )
+            original_receipt = await cursor.fetchone()
+            if original_receipt is None:
+                raise LedgerTransitionError("probe binding requires original outcome receipt")
+            original_envelope = ActionOutcomeEnvelope.model_validate_json(
+                original_receipt["canonical_outcome_json"]
+            )
+            exact_binding = (
+                isinstance(original_envelope.outcome, Indeterminate)
+                and binding.original_action_id == original_action_id
+                and binding.original_attempt == original_attempt
+                and binding.operation_key == operation_key
+                and probe_envelope.outcome.operation_key == operation_key
+                and original_envelope.outcome.operation_key == operation_key
+                and binding.probe_capability == probe["capability"]
+                and _action_status(original["status"], "actions.status")
+                is ActionStatus.INDETERMINATE
+                and _action_status(original_attempt_row["status"], "action_attempts.status")
+                is ActionStatus.INDETERMINATE
+            )
+            if not exact_binding:
+                raise LedgerTransitionError("probe resolution conflicts with original binding")
+            probe_status = _action_status(probe["status"], "actions.status")
+            attempt_status = _action_status(
+                probe_attempt_row["status"], "action_attempts.status"
+            )
+            if probe_status is ActionStatus.SUCCEEDED:
+                if attempt_status is not ActionStatus.SUCCEEDED:
+                    raise LedgerConflictError("probe Action/attempt success states disagree")
+                return self._attempt_from_row(probe_attempt_row)
+            if probe_status is not ActionStatus.RUNNING or attempt_status is not ActionStatus.RUNNING:
+                raise LedgerTransitionError("probe completion requires its RUNNING attempt")
+            reason_code = (
+                "probe_resolution_unknown"
+                if probe_envelope.outcome.disposition == "unknown"
+                else "probe_resolution_pending"
+            )
+            await db.execute(
+                "UPDATE action_attempts SET status = ?, finished_at = ? "
+                "WHERE action_id = ? AND attempt = ?",
+                (ActionStatus.SUCCEEDED.value, now, probe_action_id, probe_attempt),
+            )
+            await db.execute(
+                "UPDATE actions SET status = ?, committed_at = ? WHERE action_id = ?",
+                (ActionStatus.SUCCEEDED.value, now, probe_action_id),
+            )
+            await self._insert_outbox(
+                db,
+                run_id=probe["run_id"],
+                event_name="action.outcome",
+                aggregate_id=probe_action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": probe_action_id,
+                        "attempt": probe_attempt,
+                        "classification": "probe_resolution",
+                        "disposition": probe_envelope.outcome.disposition,
+                    },
+                    sort_keys=True,
+                ),
+                idempotency_key=f"action.outcome:{probe_action_id}:{probe_attempt}",
+                now=now,
+            )
+            await self._insert_outbox(
+                db,
+                run_id=probe["run_id"],
+                event_name="action.committed",
+                aggregate_id=probe_action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": probe_action_id,
+                        "attempt": probe_attempt,
+                        "evidence_only": True,
+                    },
+                    sort_keys=True,
+                ),
+                idempotency_key=f"action.committed:{probe_action_id}",
+                now=now,
+            )
+            subject = f"probe:{probe_action_id}:{probe_attempt}"
+            incident = await self._insert_incident(
+                db,
+                run_id=probe["run_id"],
+                error_code=reason_code,
+                message=(
+                    "Probe evidence is durable; Task 9 atomic original-attempt resolution "
+                    "must consume it before the run can continue."
+                ),
+                action_id=original_action_id,
+                subject=subject,
+                now=now,
+            )
+            await db.execute(
+                "UPDATE incidents SET repair_class = 'integrity', "
+                "repair_source = 'integrity_guard', reason_code = ? WHERE incident_id = ?",
+                (reason_code, incident.incident_id),
+            )
+            await db.execute(
+                "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                (RunStatus.BLOCKED.value, now, probe["run_id"]),
+            )
+        return await self.get_attempt(probe_action_id, probe_attempt)
 
     async def attempt_status(self, action_id: str, attempt: int) -> ActionStatus:
         return (await self.get_attempt(action_id, attempt)).status
@@ -1759,6 +2070,16 @@ class RunLedger:
         rows = await self._fetch_all("SELECT event_name FROM event_outbox ORDER BY rowid", ())
         return tuple(row["event_name"] for row in rows)
 
+    async def latest_event_sequence(self, run_id: str) -> int:
+        """Return the monotonic projection watermark for one run."""
+        await self.get_run(run_id)
+        row = await self._fetch_one(
+            "SELECT COALESCE(MAX(rowid), 0) FROM event_outbox WHERE run_id = ?",
+            (run_id,),
+        )
+        assert row is not None
+        return int(row[0])
+
     async def has_open_incident(self, error_code: str) -> bool:
         return await self._count("SELECT COUNT(*) FROM incidents WHERE error_code = ? AND status = 'OPEN'", (error_code,)) > 0
 
@@ -2193,6 +2514,23 @@ class RunLedger:
             gate_decision_digest=row["gate_decision_digest"],
             bundle_digest=row["bundle_digest"],
             artifacts=identities.items,
+            evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+            recorded_at=_parse_time(row["recorded_at"]),
+        )
+
+    @staticmethod
+    def _validator_failure_receipt_from_row(
+        row: aiosqlite.Row,
+    ) -> ValidatorFailureReceiptRecord:
+        return ValidatorFailureReceiptRecord(
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            validator_id=row["validator_id"],
+            validator_version=row["validator_version"],
+            canonical_gate_decision_json=row["canonical_gate_decision_json"],
+            gate_decision_digest=row["gate_decision_digest"],
+            bundle_digest=row["bundle_digest"],
+            artifact_checksums=tuple(json.loads(row["artifact_checksums_json"])),
             evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
             recorded_at=_parse_time(row["recorded_at"]),
         )

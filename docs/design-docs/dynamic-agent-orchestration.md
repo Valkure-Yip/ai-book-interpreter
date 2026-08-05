@@ -686,6 +686,7 @@ artifacts
 artifact_bundles
 gate_evidence
 gate_receipts
+validator_failure_receipts
 promotion_intents
 probe_resolutions
 incidents
@@ -702,6 +703,10 @@ event_outbox
   在 executor 启动前取得 immutable snapshot。
 - attempt outcome receipt 唯一绑定 action/attempt 和 canonical outcome/bundle/failure facts；它不是 PASS。
 - gate receipt 与完整 promotion-intent 集在同一事务中创建；它不是 success，也不能在部分 intent 集上重放。
+- validator FAIL 不得写入 PASS `gate_receipts`。原始 canonical failed `GateDecision` 写入独立的
+  `validator_failure_receipts`，与 repair fact/incident/outbox 同事务持久化，但永不创建 promotion
+  intent。完全相同的 failed decision 重放幂等；不同重放保留首个 receipt，回滚后以
+  `gate_binding_conflict` 独立补偿并阻断。
 - Gate 必须关联 evidence ID、validator version 和输入 artifact checksums。
 - Artifact 记录路径、hash、producer action、attempt 和 committed_at。
 - artifact bundle 记录 canonical JSON/digest、`action_id + attempt`；同一成功 attempt 只能有一个完全一致的
