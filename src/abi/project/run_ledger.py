@@ -110,6 +110,9 @@ class ActionRecord(FrozenModel):
     retry_policy: RetryPolicySpec
     retry_policy_fingerprint: str
     failure_signature: str | None = None
+    repair_class: RepairClass | None = None
+    repair_source: RepairSource | None = None
+    reason_code: str | None = None
     committed_at: datetime | None = None
 
 
@@ -130,6 +133,9 @@ class ActionAttemptRecord(FrozenModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     failure_signature: str | None = None
+    repair_class: RepairClass | None = None
+    repair_source: RepairSource | None = None
+    reason_code: str | None = None
 
 
 class ArtifactCommit(FrozenModel):
@@ -729,9 +735,10 @@ class RunLedger:
     ) -> tuple[GateReceiptRecord, tuple[PromotionIntent, ...]]:
         """Persist PASS plus the complete ordered intent set before canonical mutation."""
         now = self._now()
+        replay_conflict = False
         try:
             async with self.transaction() as db:
-                action = await self._require_action(db, payload.action_id)
+                await self._require_action(db, payload.action_id)
                 attempt = await self._attempt_row(db, payload.action_id, payload.attempt)
                 cursor = await db.execute(
                 "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
@@ -752,9 +759,7 @@ class RunLedger:
                         record.model_dump(exclude={"recorded_at"}) != payload.model_dump()
                         or not _intent_rows_match_payload(intents, payload, attempt)
                     ):
-                        await self._mark_bundle_conflict_tx(
-                            db, action, attempt, "partial_intent_set", "gate/intents replay conflicts"
-                        )
+                        replay_conflict = True
                         raise LedgerConflictError("gate receipt or complete intent set conflicts")
                     return record, tuple(self._promotion_intent_from_row(row) for row in intents)
                 expected = ExpectedArtifactManifest.model_validate_json(attempt["expected_manifest_json"])
@@ -819,6 +824,15 @@ class RunLedger:
                         now,
                     ),
                     )
+        except LedgerConflictError:
+            if replay_conflict:
+                await self.mark_bundle_conflict(
+                    payload.action_id,
+                    payload.attempt,
+                    reason_code="partial_intent_set",
+                    message="gate/intents replay conflicts",
+                )
+            raise
         except aiosqlite.IntegrityError as exc:
             await self.mark_bundle_conflict(
                 payload.action_id,
@@ -893,7 +907,6 @@ class RunLedger:
             valid_integrity = (
                 exact_receipt_fact
                 and repair_class == "integrity"
-                and repair_source == "integrity_guard"
             )
             if valid_semantic or valid_integrity:
                 effective_class: RepairClass = repair_class
@@ -2048,6 +2061,9 @@ class RunLedger:
             retry_policy=RetryPolicySpec.model_validate_json(row["retry_policy_json"]),
             retry_policy_fingerprint=row["retry_policy_fingerprint"],
             failure_signature=row["failure_signature"],
+            repair_class=row["repair_class"],
+            repair_source=row["repair_source"],
+            reason_code=row["reason_code"],
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
         )
 
@@ -2145,6 +2161,9 @@ class RunLedger:
             started_at=None if row["started_at"] is None else _parse_time(row["started_at"]),
             finished_at=None if row["finished_at"] is None else _parse_time(row["finished_at"]),
             failure_signature=row["failure_signature"],
+            repair_class=row["repair_class"],
+            repair_source=row["repair_source"],
+            reason_code=row["reason_code"],
         )
 
     @staticmethod

@@ -182,6 +182,7 @@ def expand_expected_artifacts(
         entries = (
             _artifact("reviews/agent_a/review.md", "text/markdown", "independent_review"),
             _artifact("reviews/agent_b/review.md", "text/markdown", "independent_review"),
+            _artifact("reviews/revision_route.md", "text/markdown", "revision_route"),
         )
     else:
         try:

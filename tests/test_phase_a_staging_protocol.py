@@ -13,6 +13,8 @@ from abi.actions.builtins.catalog import build_action_registry
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
     ChapterBatchInput,
+    ResearchInput,
+    ReviewBatchInput,
     SourceIngestInput,
     SourceSplitInput,
     SpotcheckInput,
@@ -91,6 +93,114 @@ def test_spotcheck_effects_are_frozen_from_durable_parameters() -> None:
         "reviews/random_spotcheck/round_007/samples/agent_b/samples.md",
         "reviews/random_spotcheck/round_007/validation_report.json",
     )
+
+
+def test_independent_review_effects_include_both_reviewers_and_revision_route() -> None:
+    parameters = ReviewBatchInput(
+        chapters=("001",), reviewers=("agent_a", "agent_b")
+    )
+
+    manifest = expand_expected_artifacts(
+        "review.independent", "independent-1", parameters
+    )
+
+    assert tuple(
+        (
+            item.canonical_relpath,
+            item.media_type,
+            item.evidence_role,
+            item.metadata,
+        )
+        for item in manifest.entries
+    ) == (
+        ("reviews/agent_a/review.md", "text/markdown", "independent_review", ()),
+        ("reviews/agent_b/review.md", "text/markdown", "independent_review", ()),
+        ("reviews/revision_route.md", "text/markdown", "revision_route", ()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_independent_review_success_writes_not_required_revision_route(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    for skill in (
+        "skills/expert-translation-quality/SKILL.md",
+        "skills/translation-quality-defect-families/SKILL.md",
+    ):
+        path = project.root / skill
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Review policy\n", encoding="utf-8")
+
+    def provider_success() -> Succeeded:
+        return Succeeded(
+            artifact_bundle=ArtifactBundle(
+                action_id="provider-result",
+                attempt=1,
+                entries=(
+                    ArtifactBundleEntry(
+                        staged_relpath="state/staging/provider-result/1/provider/result.json",
+                        canonical_relpath="provider/result.json",
+                        media_type="application/json",
+                        evidence_role="provider_result",
+                    ),
+                ),
+            )
+        )
+
+    class IndependentAgent:
+        async def run_action(self, request: object) -> object:
+            tools = {tool.name: tool.callable for tool in request.tools}  # type: ignore[attr-defined]
+            agent_name = request.agent_name  # type: ignore[attr-defined]
+            if agent_name == "review_independent":
+                assert "status: NOT_REQUIRED" in request.user_prompt  # type: ignore[attr-defined]
+                await tools["spawn_review_agent"](
+                    agent_label="agent_a", instructions="translation review"
+                )
+                await tools["spawn_review_agent"](
+                    agent_label="agent_b", instructions="EPUB review"
+                )
+                tools["write_file"](
+                    path="reviews/revision_route.md",
+                    content="status: NOT_REQUIRED\nresult: PASS\n",
+                )
+                return SimpleNamespace(outcome=provider_success())
+
+            reviewer = agent_name.removeprefix("review_")
+            tools["write_file"](
+                path=f"reviews/{reviewer}/review.md",
+                content=f"# {reviewer}\n\nresult: PASS\n",
+            )
+            return SimpleNamespace(outcome=provider_success())
+
+    tool_context = SimpleNamespace(
+        project=project,
+        services=SimpleNamespace(agent=IndependentAgent()),
+        config=None,
+        resolve=lambda relpath: (project.root / relpath).resolve(),
+    )
+    result = await build_action_registry(tool_context=tool_context).get(
+        "review.independent"
+    ).executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id="independent-1",
+            attempt=1,
+            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+        ),
+        ReviewBatchInput(reviewers=("agent_a", "agent_b")),
+    )
+
+    assert isinstance(result.outcome, Succeeded)
+    assert tuple(
+        item.canonical_relpath for item in result.outcome.artifact_bundle.entries
+    ) == (
+        "reviews/agent_a/review.md",
+        "reviews/agent_b/review.md",
+        "reviews/revision_route.md",
+    )
+    assert not (project.root / "reviews/revision_route.md").exists()
 
 
 @pytest.mark.asyncio
@@ -315,6 +425,37 @@ def test_committed_evidence_hash_and_bytes_come_from_same_open_file(
             "abi.actions.evidence.sha256_file", replace_after_hash, raising=False
         )
         assert view.read_bytes("deps/fact.txt") == b"original"
+    finally:
+        store.close()
+
+
+def test_staged_evidence_checksum_and_validator_reads_share_one_pinned_snapshot(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer("research-global", 1)
+        original = b"complete research evidence"
+        writer.write_bytes(
+            "qa/benchmark/global_research_ack.md",
+            original,
+            media_type="text/markdown",
+            evidence_role="research",
+        )
+        bundle = writer.artifact_bundle()
+        view = StagingEvidenceView.for_bundle(project, (), bundle)
+        staged = project.root / bundle.entries[0].staged_relpath
+        staged.unlink()
+        staged.write_bytes(b"")
+
+        decision = validate_evidence(
+            "research.global", view, ResearchInput(), bundle
+        )
+
+        assert view.artifact_checksums == (hashlib.sha256(original).hexdigest(),)
+        assert view.read_bytes("qa/benchmark/global_research_ack.md") == original
+        assert decision.passed is True
     finally:
         store.close()
 

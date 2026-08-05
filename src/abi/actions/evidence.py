@@ -35,8 +35,12 @@ class StagingEvidenceView:
         self._committed = {item.relpath: item for item in committed_artifacts}
         self.bundle = bundle
         self.bundle_digest = sha256_canonical_json(canonical_bundle_json(bundle))
+        self._staged_bytes = {
+            entry.canonical_relpath: self._read_project_file(entry.staged_relpath)
+            for entry in bundle.entries
+        }
         self.artifact_checksums = tuple(
-            hashlib.sha256(self._read_project_file(entry.staged_relpath)).hexdigest()
+            hashlib.sha256(self._staged_bytes[entry.canonical_relpath]).hexdigest()
             for entry in bundle.entries
         )
 
@@ -51,7 +55,9 @@ class StagingEvidenceView:
 
     def exists(self, canonical_relpath: str) -> bool:
         key = canonical_artifact_key(canonical_relpath)
-        relpath = self._staged.get(key, key if key in self._committed else None)
+        if key in self._staged_bytes:
+            return True
+        relpath = key if key in self._committed else None
         if relpath is None:
             return False
         try:
@@ -64,7 +70,7 @@ class StagingEvidenceView:
         key = canonical_artifact_key(canonical_relpath)
         staged = self._staged.get(key)
         if staged is not None:
-            content = self._read_project_file(staged)
+            content = self._staged_bytes[key]
         elif key in self._committed:
             content = self._read_project_file(key)
             if hashlib.sha256(content).hexdigest() != self._committed[key].sha256:

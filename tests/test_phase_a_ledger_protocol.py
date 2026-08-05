@@ -397,6 +397,81 @@ async def test_gate_replay_compares_full_ordered_intent_identity(tmp_path: Path)
         with pytest.raises(LedgerConflictError, match=r"intent|conflict"):
             await ledger.create_gate_receipt_and_bundle_intents(gate)
 
+        attempt = await ledger.get_attempt("a1", 1)
+        action = await ledger.get_action("a1")
+        run = await ledger.get_run("run-1")
+        assert attempt.status is ActionStatus.REPAIR_REQUIRED
+        assert attempt.repair_class == "integrity"
+        assert attempt.repair_source == "integrity_guard"
+        assert attempt.reason_code == "partial_intent_set"
+        assert action.status is ActionStatus.REPAIR_REQUIRED
+        assert action.repair_class == "integrity"
+        assert action.repair_source == "integrity_guard"
+        assert action.reason_code == "partial_intent_set"
+        assert run.status is RunStatus.BLOCKED
+        assert await ledger.has_open_incident("partial_intent_set")
+        durable_gate, durable_intents = await ledger.get_gate_receipt_and_intents(
+            "a1", 1
+        )
+        assert durable_gate.artifacts == gate.artifacts
+        assert tuple(item.intent_id for item in durable_intents) == tuple(
+            item.intent_id for item in intents
+        )
+        assert {item.status for item in durable_intents} == {"CONFLICT"}
+
+        with pytest.raises(LedgerConflictError, match=r"intent|conflict"):
+            await ledger.create_gate_receipt_and_bundle_intents(gate)
+        snapshot = await ledger.load_snapshot("run-1")
+        assert sum(
+            incident.error_code == "partial_intent_set"
+            for incident in snapshot.incidents
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_integrity_action_outcome_repair_preserves_typed_lineage(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        outcome = RepairRequired(
+            repair_class="integrity",
+            repair_source="action_outcome",
+            reason_code="artifact_bundle_conflict",
+            defect_codes=("artifact_bundle_conflict",),
+            message="block this run without semantic replanning",
+        )
+        encoded = canonical_model_json(
+            ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id="a1",
+                attempt=1,
+                canonical_outcome_json=encoded,
+                outcome_digest=sha256_canonical_json(encoded),
+            )
+        )
+
+        fact = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class=outcome.repair_class,
+            repair_source=outcome.repair_source,
+            reason_code=outcome.reason_code,
+            defect_codes=outcome.defect_codes,
+            evidence_refs=(),
+            message=outcome.message,
+            semantic_reason_mapped=False,
+        )
+
+        assert fact.repair_class == "integrity"
+        assert fact.repair_source == "action_outcome"
+        assert fact.reason_code == "artifact_bundle_conflict"
+        assert (await ledger.get_run("run-1")).status is RunStatus.BLOCKED
+        assert await ledger.attempt_numbers("a1") == (1,)
+
 
 @pytest.mark.asyncio
 async def test_finish_attempt_requires_receipt_and_repair_facts(tmp_path: Path) -> None:

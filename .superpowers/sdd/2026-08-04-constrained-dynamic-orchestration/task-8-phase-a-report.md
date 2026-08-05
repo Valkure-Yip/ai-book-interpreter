@@ -146,3 +146,53 @@ in the same file and are documented here as approved by the parent task.
 The deferred Phase B committer and controller tests still call the removed single-file promotion
 surface. Those dirty/untracked files are intentionally excluded from this fix commit and must be
 rewritten to use the gate-receipt plus complete-bundle-intent protocol in Phase B.
+
+## Review fix round 2/5 — durable replay compensation and pinned evidence snapshots
+
+### RED evidence
+
+The four scoped regressions were exercised together with real production APIs:
+
+`.venv/bin/python -m pytest -q
+tests/test_phase_a_ledger_protocol.py::test_gate_replay_compares_full_ordered_intent_identity
+tests/test_phase_a_ledger_protocol.py::test_integrity_action_outcome_repair_preserves_typed_lineage
+tests/test_phase_a_staging_protocol.py::test_staged_evidence_checksum_and_validator_reads_share_one_pinned_snapshot
+tests/test_phase_a_staging_protocol.py::test_independent_review_effects_include_both_reviewers_and_revision_route`
+
+Result before implementation: `4 failed`.
+
+- Replay compensation was rolled back with the transaction, leaving the attempt `RUNNING`.
+- A valid typed `integrity/action_outcome` repair was rewritten to `integrity_guard`.
+- Replacing a staged leaf after view construction bound artifact A's checksum to artifact B's
+  bytes during validator reads.
+- The independent-review manifest contained only the two reviewer reports and omitted the
+  revision route.
+
+A real independent `AgentActionExecutor` success-path test also failed before its prompt fix:
+the rendered prompt did not require `status: NOT_REQUIRED`, so a successful dual review could not
+produce the newly exact three-artifact bundle.
+
+### GREEN implementation and evidence
+
+- Gate replay mismatches first roll back the gate transaction, then durably commit an idempotent
+  bundle-conflict compensation in a separate transaction, and only then re-raise the conflict.
+  Repeated mismatched replay keeps the original gate and intent identities, marks every intent
+  `CONFLICT`, leaves one open incident, sets typed action/attempt repair lineage, and blocks the
+  run without ever committing a partial receipt/intent set.
+- `ActionRecord` and `ActionAttemptRecord` expose the durable typed repair class, source, and reason
+  fields used for restart/reconciliation checks.
+- `StagingEvidenceView` reads each staged artifact once through the pinned-root/no-follow file
+  descriptor path, caches those exact bytes, and derives both validator reads and checksums from
+  that immutable per-view snapshot. Symlink and non-regular-leaf checks remain fail-closed.
+- Exact typed integrity repairs preserve any known receipt-matching `RepairSource`, including
+  `action_outcome`; only unknown or field-divergent submissions normalize to
+  `integrity_guard/repair_class_unknown`.
+- `review.independent` now expands exactly to reviewer A, reviewer B, and
+  `reviews/revision_route.md`. Its real success prompt always requires a staged route containing
+  `status: NOT_REQUIRED` and `result: PASS`; the actual executor test calls both isolated reviewer
+  tools and returns the complete three-entry bundle without canonical writes.
+
+Focused Phase A ledger/staging/validator/built-in/promotion suites: `106 passed, 4 warnings`.
+Tasks 1/3/4 plus amended Task 7: `233 passed, 5 warnings`. All tracked/Phase-A tests excluding the
+two deferred Phase B files: `423 passed, 20 warnings`. Architecture linter, full Ruff, Python 3.12
+strict mypy over 26 Phase A source files, and `git diff --check`: PASS.

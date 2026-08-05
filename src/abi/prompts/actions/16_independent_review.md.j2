@@ -6,9 +6,11 @@ Spawn two independent reviewers over the finished book (separate from 16a):
 - `spawn_review_agent('agent_b', ...)`: EPUB engineering & typography review ->
   writes `reviews/agent_b/review.md` with scores and PASS/FAIL.
 
-If either FAILs, write `reviews/revision_route.md` routing the problem to the
-correct repair capability and return repair-required. Reviewers must not edit
-canonical translation or output artifacts. Do not explain-away findings.
+Always write `reviews/revision_route.md`. If both reviewers PASS, write
+`status: NOT_REQUIRED` and `result: PASS`. If either FAILs, route the problem to
+the correct repair capability in that file and return repair-required.
+Reviewers must not edit canonical translation or output artifacts. Do not
+explain-away findings.
 
 Exit condition: both reviews PASS. Stop for controller validation; do not modify
 gate or control state.

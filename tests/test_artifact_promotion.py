@@ -26,6 +26,7 @@ from abi.project.layout import BookProject
 from abi.project.run_ledger import LedgerConflictError, LedgerError, RunLedger, RunSeed
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
+    ActionStatus,
     ArtifactBundle,
     ArtifactBundleEntry,
     AttemptOutcomeReceiptPayload,
@@ -791,7 +792,12 @@ async def test_direct_ledger_intent_bypass_never_promotes_source_file(tmp_path: 
 
         assert source.read_text(encoding="utf-8") == "source"
         assert not (tmp_path / "chapters/final/source.md").exists()
-        assert await ledger.promotion_intents() == before
+        after = await ledger.promotion_intents()
+        assert tuple(item.intent_id for item in after) == tuple(
+            item.intent_id for item in before
+        )
+        assert {item.status for item in after} == {"CONFLICT"}
+        assert await ledger.attempt_status("translate-001", 1) is ActionStatus.REPAIR_REQUIRED
 
 
 def test_single_file_promotion_apis_are_not_public_protocols() -> None:
