@@ -31,6 +31,21 @@ class _ArtifactMetadataList(FrozenModel):
     items: tuple[ArtifactMetadata, ...]
 
 
+class _ActionChronologyPayload(FrozenModel):
+    """Typed identity fields for durable action chronology events."""
+
+    action_id: str
+    attempt: int
+    run_id: str
+    capability: str | None = None
+    plan_version: int | None = None
+    classification: str | None = None
+    repair_class: str | None = None
+    repair_source: str | None = None
+    reason_code: str | None = None
+    disposition: str | None = None
+
+
 class GateIntegrityItem(FrozenModel):
     gate: str
     produces: str
@@ -134,6 +149,19 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
     }
     integrity: list[GateIntegrityItem] = []
     policy_failures: list[str] = []
+    durable_integrity_failure = False
+    outbox_payloads: dict[int, _ActionChronologyPayload] = {}
+    for event in durable.outbox_events:
+        if event.event_name not in {"action.started", "action.outcome"}:
+            continue
+        try:
+            outbox_payloads[event.sequence] = (
+                _ActionChronologyPayload.model_validate_json(event.payload_json)
+            )
+        except ValueError:
+            policy_failures.append(
+                f"outbox event {event.sequence} is not canonical typed action chronology"
+            )
     parsed_outcomes: dict[tuple[str, int], ActionOutcomeEnvelope] = {}
     for key, outcome_receipt in outcomes.items():
         try:
@@ -154,6 +182,48 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             )
             continue
         parsed_outcomes[key] = parsed_envelope
+    parsed_effective_outcomes: dict[tuple[str, int], ActionOutcomeEnvelope] = {}
+    for key, effective_record in effective_outcomes.items():
+        try:
+            effective_envelope = ActionOutcomeEnvelope.model_validate_json(
+                effective_record.canonical_outcome_json
+            )
+        except ValueError:
+            effective_envelope = None
+        if (
+            effective_envelope is None
+            or effective_record.outcome_digest
+            != sha256_canonical_json(effective_record.canonical_outcome_json)
+            or effective_envelope.action_id != key[0]
+            or effective_envelope.attempt != key[1]
+        ):
+            durable_integrity_failure = True
+            policy_failures.append(
+                f"{key[0]} HITL effective outcome digest or envelope identity disagrees"
+            )
+            continue
+        parsed_effective_outcomes[key] = effective_envelope
+    parsed_hitl_continuations: dict[str, ActionOutcomeEnvelope] = {}
+    for continuation in durable.hitl_continuations:
+        try:
+            continuation_envelope = ActionOutcomeEnvelope.model_validate_json(
+                continuation.canonical_outcome_json
+            )
+        except ValueError:
+            continuation_envelope = None
+        if (
+            continuation_envelope is None
+            or continuation.outcome_digest
+            != sha256_canonical_json(continuation.canonical_outcome_json)
+            or continuation_envelope.action_id != continuation.action_id
+            or continuation_envelope.attempt != continuation.attempt
+        ):
+            durable_integrity_failure = True
+            policy_failures.append(
+                f"{continuation.action_id} HITL continuation digest or envelope identity disagrees"
+            )
+            continue
+        parsed_hitl_continuations[continuation.continuation_id] = continuation_envelope
     gate_receipts_by_attempt = {
         key: tuple(
             item
@@ -163,29 +233,14 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
         for key in {(item.action_id, item.attempt) for item in durable.gate_receipts}
     }
     effective_success_keys: set[tuple[str, int]] = set()
-    for key, success_attempt in attempts.items():
-        action = actions.get(key[0])
-        effective_record = effective_outcomes.get(key)
-        canonical_outcome_json = (
-            effective_record.canonical_outcome_json
-            if effective_record is not None
-            else outcomes[key].canonical_outcome_json
-            if key in outcomes
-            else None
+    for key in set(outcomes) | set(effective_outcomes):
+        effective_envelope = (
+            parsed_effective_outcomes.get(key)
+            if key in effective_outcomes
+            else parsed_outcomes.get(key)
         )
-        if canonical_outcome_json is None:
-            continue
-        try:
-            effective_envelope = ActionOutcomeEnvelope.model_validate_json(
-                canonical_outcome_json
-            )
-        except ValueError:
-            continue
-        if (
-            isinstance(effective_envelope.outcome, Succeeded)
-            and action is not None
-            and action.status is ActionStatus.SUCCEEDED
-            and success_attempt.status is ActionStatus.SUCCEEDED
+        if effective_envelope is not None and isinstance(
+            effective_envelope.outcome, Succeeded
         ):
             effective_success_keys.add(key)
     for key in effective_success_keys:
@@ -222,16 +277,11 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
         if gate_outcome_receipt is None:
             failures.append("attempt outcome receipt is missing")
         else:
-            try:
-                envelope = (
-                    ActionOutcomeEnvelope.model_validate_json(
-                        effective_outcome.canonical_outcome_json
-                    )
-                    if effective_outcome is not None
-                    else parsed_outcomes.get(key)
-                )
-            except ValueError:
-                envelope = None
+            envelope = (
+                parsed_effective_outcomes.get(key)
+                if effective_outcome is not None
+                else parsed_outcomes.get(key)
+            )
             if envelope is None or not isinstance(envelope.outcome, Succeeded):
                 failures.append("ordinary gate is not backed by a succeeded outcome receipt")
             else:
@@ -455,16 +505,17 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 event
                 for event in durable.outbox_events
                 if event.event_name == "action.started"
-                and json.loads(event.payload_json).get("action_id") == action_id
-                and json.loads(event.payload_json).get("attempt") == successor.attempt
+                and event.sequence in outbox_payloads
+                and outbox_payloads[event.sequence].action_id == action_id
+                and outbox_payloads[event.sequence].attempt == successor.attempt
             )
             outcome_events = tuple(
                 event
                 for event in durable.outbox_events
                 if event.event_name == "action.outcome"
-                and json.loads(event.payload_json).get("action_id") == action_id
-                and json.loads(event.payload_json).get("attempt")
-                == successor.retry_of_attempt
+                and event.sequence in outbox_payloads
+                and outbox_payloads[event.sequence].action_id == action_id
+                and outbox_payloads[event.sequence].attempt == successor.retry_of_attempt
             )
             successor_chronology = bool(
                 successor.status is ActionStatus.AUTHORIZED
@@ -483,7 +534,6 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 and predecessor.status is ActionStatus.RETRY_WAIT
                 and successor_chronology
                 and action is not None
-                and action.status is successor.status
                 and successor.expected_artifact_manifest
                 == predecessor.expected_artifact_manifest
                 and successor.expected_manifest_digest
@@ -557,7 +607,6 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 and action.repair_class == repair.repair_class
                 and action.repair_source == repair.repair_source
                 and action.reason_code == repair.reason_code
-                and durable.run.status is RunStatus.RUNNING
                 and len(superseding_plans) == 1
                 and superseding_plans[0].version == action.plan_version + 1
                 and len(direct_replacements) == 1
@@ -609,8 +658,7 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             and not matching_unblocks
         )
         unblocked_with_one_replacement = (
-            durable.run.status is RunStatus.RUNNING
-            and len(matching_unblocks) == 1
+            len(matching_unblocks) == 1
         )
         if not (
             action is not None
@@ -722,16 +770,11 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             )
 
     for outcome_key in outcomes:
-        try:
-            routed_envelope = (
-                ActionOutcomeEnvelope.model_validate_json(
-                    effective_outcomes[outcome_key].canonical_outcome_json
-                )
-                if outcome_key in effective_outcomes
-                else parsed_outcomes.get(outcome_key)
-            )
-        except ValueError:
-            routed_envelope = None
+        routed_envelope = (
+            parsed_effective_outcomes.get(outcome_key)
+            if outcome_key in effective_outcomes
+            else parsed_outcomes.get(outcome_key)
+        )
         if routed_envelope is None:
             continue
         routed_action = actions.get(outcome_key[0])
@@ -802,8 +845,13 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
             valid = bool(
                 valid
                 and continuations
+                and all(
+                    item.continuation_id in parsed_hitl_continuations
+                    for item in continuations
+                )
                 and sequences == tuple(range(1, len(continuations) + 1))
                 and effective is not None
+                and hitl_key in parsed_effective_outcomes
                 and effective.source == "hitl_continuation"
                 and effective.sequence == continuations[-1].sequence
                 and effective.outcome_digest == continuations[-1].outcome_digest
@@ -811,9 +859,7 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
                 == continuations[-1].canonical_outcome_json
             )
             if valid and effective is not None:
-                effective_envelope = ActionOutcomeEnvelope.model_validate_json(
-                    effective.canonical_outcome_json
-                )
+                effective_envelope = parsed_effective_outcomes[hitl_key]
                 if isinstance(effective_envelope.outcome, Succeeded):
                     valid = bool(
                         hitl_key
@@ -869,12 +915,10 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
     for event in durable.outbox_events:
         if event.event_name != "action.outcome":
             continue
-        try:
-            payload = json.loads(event.payload_json)
-            key = (str(payload["action_id"]), int(payload["attempt"]))
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            policy_failures.append("action outcome event has invalid typed identity")
+        payload = outbox_payloads.get(event.sequence)
+        if payload is None:
             continue
+        key = (payload.action_id, payload.attempt)
         event_receipt = outcomes.get(key)
         if event_receipt is None or event_receipt.recorded_at > event.created_at:
             policy_failures.append(
@@ -896,7 +940,9 @@ def trace_project(project: BookProject, *, facts: EvalRunFacts | None = None) ->
         is_done=run.status is RunStatus.COMPLETED,
         blocked_reason=blocked_reason,
         gate_integrity=integrity,
-        gate_integrity_ok=all(item.consistent for item in integrity),
+        gate_integrity_ok=(
+            all(item.consistent for item in integrity) and not durable_integrity_failure
+        ),
         reached_states_ok=True,
         reached_states_failures=[],
         path_conformance_ok=not policy_failures,

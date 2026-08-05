@@ -637,9 +637,37 @@ def test_l1_rejects_completed_ordinary_success_without_exactly_one_gate_chain(
     assert any("exactly one gate" in item for item in report.skipped_states)
 
 
+def test_l1_rejects_succeeded_receipt_with_non_succeeded_attempt_and_missing_gate(
+    tmp_path,
+) -> None:
+    """A succeeded receipt remains gate-authoritative even if a status projection drifts."""
+    root = tmp_path / "ordinary-gate-status-drift"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_committed_gate(proj))
+    facts = load_eval_run_facts(proj)
+    bad_attempt = facts.attempts[0].model_copy(update={"status": ActionStatus.RUNNING})
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "run": facts.run.model_copy(update={"status": RunStatus.COMPLETED}),
+                "attempts": (bad_attempt,),
+                "gate_receipts": (),
+                "promotion_intents": (),
+            }
+        ),
+    )
+
+    assert report.path_conformance_ok is False
+    assert report.verdict == "FAIL"
+    assert any("exactly one gate" in item for item in report.skipped_states)
+
+
 async def _seed_retry_lineage(proj: BookProject) -> None:
     action_id = "retry-action"
-    policy = RetryPolicySpec(max_attempts=2, retryable_codes=("provider_timeout",))
+    policy = RetryPolicySpec(max_attempts=3, retryable_codes=("provider_timeout",))
     authorized = _eval_authorized_action(
         action_id=action_id,
         proposal_id="retry-proposal",
@@ -848,7 +876,84 @@ def test_l1_accepts_valid_retry_successor_after_attempt_two_started(tmp_path) ->
 
     report = trace_project(proj)
 
-    assert report.path_conformance_ok is True
+    assert report.path_conformance_ok is True, report.skipped_states
+
+
+def test_l1_accepts_valid_multi_retry_history_after_attempt_three_authorized(
+    tmp_path,
+) -> None:
+    """Replay historical retry successors without equating each to current Action status."""
+    root = tmp_path / "retry-multiple"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_retry_lineage(proj))
+
+    async def add_second_retry() -> None:
+        failure = RetryableFailure(error_code="provider_timeout", message="retry again")
+        outcome_json = canonical_model_json(
+            ActionOutcomeEnvelope(
+                action_id="retry-action", attempt=2, outcome=failure
+            )
+        )
+        async with RunLedger.open(proj.run_db) as ledger:
+            await ledger.start_attempt("retry-action", attempt=2)
+            await ledger.record_attempt_outcome(
+                AttemptOutcomeReceiptPayload(
+                    action_id="retry-action",
+                    attempt=2,
+                    canonical_outcome_json=outcome_json,
+                    outcome_digest=sha256_canonical_json(outcome_json),
+                    error_code="provider_timeout",
+                )
+            )
+            await ledger.route_retry_from_receipt("retry-action", attempt=2)
+            await ledger.create_next_attempt("retry-action", previous_attempt=2)
+
+    asyncio.run(add_second_retry())
+
+    report = trace_project(proj)
+
+    assert report.path_conformance_ok is True, report.skipped_states
+
+
+def test_l1_accepts_semantic_repair_history_after_run_later_completed(tmp_path) -> None:
+    """A later terminal run projection must not rewrite valid repair history."""
+    root = tmp_path / "semantic-later-completed"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_repair_lineage(proj, repair_class="semantic"))
+    facts = load_eval_run_facts(proj)
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={"run": facts.run.model_copy(update={"status": RunStatus.COMPLETED})}
+        ),
+    )
+
+    assert report.path_conformance_ok is True, report.skipped_states
+
+
+def test_l1_rejects_malformed_retry_outbox_payload_without_raising(tmp_path) -> None:
+    """Malformed durable event JSON must fail closed instead of escaping trace evaluation."""
+    root = tmp_path / "retry-malformed-event"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    asyncio.run(_seed_retry_lineage(proj))
+    facts = load_eval_run_facts(proj)
+    events = tuple(
+        item.model_copy(update={"payload_json": "{"})
+        if item.event_name == "action.outcome"
+        else item
+        for item in facts.outbox_events
+    )
+
+    report = trace_project(
+        proj, facts=facts.model_copy(update={"outbox_events": events})
+    )
+
+    assert report.path_conformance_ok is False
+    assert any("outbox" in item and "canonical" in item for item in report.skipped_states)
 
 
 def test_l1_accepts_explicit_unblock_replacement_with_unrelated_downstream_action(
@@ -1756,6 +1861,74 @@ def test_l1_replays_gate_against_effective_hitl_continuation_success(tmp_path) -
     )
     assert report.gate_integrity_ok is True
     assert report.path_conformance_ok is True
+
+
+@pytest.mark.parametrize("tamper", ("digest", "envelope_identity"))
+def test_l1_rejects_effective_hitl_digest_or_envelope_identity_tamper(
+    tmp_path, tamper: str
+) -> None:
+    """Validate each continuation/effective receipt, not just equality between two rows."""
+    root = tmp_path / f"hitl-effective-{tamper}"
+    (root / "state").mkdir(parents=True)
+    proj = BookProject(root)
+    _, continuation, effective = asyncio.run(
+        _seed_hitl_continuation(proj, complete_success=True)
+    )
+    facts = load_eval_run_facts(proj)
+    if tamper == "digest":
+        bad_continuation = continuation.model_copy(update={"outcome_digest": "0" * 64})
+        bad_effective = effective.model_copy(update={"outcome_digest": "0" * 64})
+    else:
+        envelope = ActionOutcomeEnvelope.model_validate_json(
+            continuation.canonical_outcome_json
+        )
+        assert isinstance(envelope.outcome, Succeeded)
+        original_entry = envelope.outcome.artifact_bundle.entries[0]
+        changed_bundle = envelope.outcome.artifact_bundle.model_copy(
+            update={
+                "action_id": "different-action",
+                "entries": (
+                    original_entry.model_copy(
+                        update={
+                            "staged_relpath": (
+                                "state/staging/different-action/1/reports/hitl.json"
+                            )
+                        }
+                    ),
+                ),
+            }
+        )
+        bad_json = canonical_model_json(
+            envelope.model_copy(
+                update={
+                    "action_id": "different-action",
+                    "outcome": envelope.outcome.model_copy(
+                        update={"artifact_bundle": changed_bundle}
+                    ),
+                }
+            )
+        )
+        bad_digest = sha256_canonical_json(bad_json)
+        bad_continuation = continuation.model_copy(
+            update={"canonical_outcome_json": bad_json, "outcome_digest": bad_digest}
+        )
+        bad_effective = effective.model_copy(
+            update={"canonical_outcome_json": bad_json, "outcome_digest": bad_digest}
+        )
+
+    report = trace_project(
+        proj,
+        facts=facts.model_copy(
+            update={
+                "hitl_continuations": (bad_continuation,),
+                "effective_outcomes": (bad_effective,),
+            }
+        ),
+    )
+
+    assert report.gate_integrity_ok is False
+    assert report.path_conformance_ok is False
+    assert any("HITL" in item and "digest" in item for item in report.skipped_states)
 
 
 def test_l1_rejects_started_hitl_indeterminate_that_does_not_remain_blocked(tmp_path) -> None:
