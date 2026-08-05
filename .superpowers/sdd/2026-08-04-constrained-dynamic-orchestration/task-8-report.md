@@ -233,3 +233,32 @@ Verification after the fix:
   validator invocation forms each returned exit 1 with no matches. Production
   `logical_invocation_id` coverage shows the provider allocation/ID construction and the durable
   Planner caller.
+
+## Phase B review fix round 2/5 — exact probe-binding replay across newer snapshots
+
+### RED evidence
+
+`.venv/bin/pytest
+tests/test_dynamic_controller.py::test_probe_binding_replay_ignores_newer_speculative_plan_identity
+-q` produced `1 failed`. After plan 2/action 2 durably owned the exact
+`ProbeActionInput`, replaying that same binding from a newer policy snapshot supplied a valid but
+speculative plan 3/action 3. The ledger compared those speculative identities to the stored row,
+misclassified exact replay as `_ProbeBindingConflict`, durably blocked the run, and raised
+`LedgerConflictError`.
+
+### GREEN implementation and evidence
+
+- Existing-binding identity is now only the durable original-action/original-attempt lookup plus
+  stored operation key, probe capability, and the stored probe Action's capability/canonical
+  parameters. Once those facts match, `authorize_probe_action` returns the stored Action with
+  `created=False` before inspecting the loser's speculative patch/action/plan identity.
+- Different operation keys or probe capabilities for the same original attempt still use the
+  existing independent `probe_binding_conflict` integrity compensation and block fail-closed.
+- Direct exact replay, both conflict dimensions, and the eight-tick barrier pass together: `4
+  passed`. Exact replay leaves 2 plans, 2 Actions, 1 probe binding, no new attempt, incident, or
+  outbox row, and preserves the original Action as `INDETERMINATE` with the run `RUNNING`.
+- Full dynamic controller: `66 passed, 1` pre-existing IR `utcnow()` warning. Authoritative focused
+  six-file set: `153 passed, 1` pre-existing warning. Full pytest: `503 passed, 21` pre-existing
+  `utcnow()` warnings.
+- Architecture SDK boundary: exit 0. Full Ruff: PASS. Python 3.12 strict mypy over the two changed
+  production/test files: PASS. `git diff --check`: PASS.

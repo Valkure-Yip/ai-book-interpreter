@@ -33,7 +33,13 @@ from abi.planning.policy import PolicyEngine
 from abi.planning.scheduler import Scheduler
 from abi.project.artifacts import ArtifactConflictError, ArtifactStore
 from abi.project.layout import BookProject
-from abi.project.run_ledger import ActionRecord, LedgerNotFoundError, RunLedger, RunSeed
+from abi.project.run_ledger import (
+    ActionRecord,
+    LedgerConflictError,
+    LedgerNotFoundError,
+    RunLedger,
+    RunSeed,
+)
 from abi.providers.observability.events import EventLogger
 from abi.providers.orchestration_runtime import DurableLoopRuntime
 from abi.providers.orchestration_runtime import runtime as loop_runtime_module
@@ -259,6 +265,26 @@ def _patch(proposal_id: str, capability: str) -> PlanPatch:
             ProposedAction(proposal_id=proposal_id, capability=capability),
         ),
         rationale="advance using one registered capability",
+    )
+
+
+def _probe_patch(proposal_id: str, binding: ProbeActionInput) -> PlanPatch:
+    return PlanPatch(
+        objective=f"probe indeterminate operation {binding.operation_key}",
+        proposed_actions=(
+            ProposedAction(
+                proposal_id=proposal_id,
+                capability=binding.probe_capability,
+                arguments=tuple(
+                    ActionArgument(
+                        name=name,
+                        value_json=json.dumps(value, sort_keys=True),
+                    )
+                    for name, value in binding.model_dump().items()
+                ),
+            ),
+        ),
+        rationale="Inspect the exact durable external operation binding.",
     )
 
 
@@ -2056,6 +2082,207 @@ class _SecondBuildBarrier:
         if count == 2:
             await self._barrier.wait()
         return await self._delegate.build(run_id)
+
+
+@pytest.mark.asyncio
+async def test_probe_binding_replay_ignores_newer_speculative_plan_identity(
+    tmp_path: Path,
+) -> None:
+    operation_key = "publish:durable-binding-1"
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "release.publish",
+                (
+                    Indeterminate(
+                        operation_key=operation_key,
+                        error_code="provider_timeout",
+                        failure_signature=canonical_failure_signature(
+                            "release.publish", "{}", "provider_timeout"
+                        ),
+                        message="remote result unknown",
+                    ),
+                ),
+            ),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key=operation_key,
+                        disposition="unknown",
+                        evidence_refs=("provider:query-1",),
+                        message="remote result remains unknown",
+                    ),
+                ),
+            ),
+        ),
+        patches=(),
+        spec_options={"release.publish": {"probe_capability": "release.probe"}},
+        probe_capabilities=frozenset({"release.probe"}),
+    ) as rig:
+        original, snapshot = await _authorize_one(rig, "release.publish")
+        await rig.dispatcher.execute(
+            run_id=rig.run_id, action=original, snapshot=snapshot, attempt=1
+        )
+        await rig.reconciler.reconcile(rig.run_id)
+        binding = ProbeActionInput(
+            original_action_id=original.action_id,
+            original_attempt=1,
+            operation_key=operation_key,
+            probe_capability="release.probe",
+        )
+
+        plan2_context = await SnapshotBuilder(
+            ledger=rig.ledger, registry=rig.registry
+        ).build(rig.run_id)
+        patch2 = _probe_patch("probe-stored", binding)
+        decision2 = PolicyEngine(rig.registry).authorize(
+            plan2_context.policy_snapshot, patch2, next_plan_version=2
+        )
+        assert decision2.authorized and len(decision2.actions) == 1
+        stored, created = await rig.ledger.authorize_probe_action(
+            rig.run_id,
+            binding=binding,
+            patch=patch2,
+            action=decision2.actions[0],
+            expected_previous_plan_version=1,
+        )
+        assert created
+        assert stored.plan_version == 2
+
+        plan3_context = await SnapshotBuilder(
+            ledger=rig.ledger, registry=rig.registry
+        ).build(rig.run_id)
+        patch3 = _probe_patch("probe-speculative", binding)
+        decision3 = PolicyEngine(rig.registry).authorize(
+            plan3_context.policy_snapshot, patch3, next_plan_version=3
+        )
+        assert decision3.authorized and len(decision3.actions) == 1
+        before_outbox = await rig.ledger._count(
+            "SELECT COUNT(*) FROM event_outbox WHERE run_id = ?", (rig.run_id,)
+        )
+
+        replayed, replay_created = await rig.ledger.authorize_probe_action(
+            rig.run_id,
+            binding=binding,
+            patch=patch3,
+            action=decision3.actions[0],
+            expected_previous_plan_version=2,
+        )
+
+        assert replayed.action_id == stored.action_id
+        assert not replay_created
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
+        assert await rig.ledger._count("SELECT COUNT(*) FROM probe_bindings", ()) == 1
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM incidents WHERE run_id = ?", (rig.run_id,)
+        ) == 0
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM event_outbox WHERE run_id = ?", (rig.run_id,)
+        ) == before_outbox
+        assert await rig.ledger.action_status(original.action_id) is ActionStatus.INDETERMINATE
+        assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_field", ("operation_key", "probe_capability"))
+async def test_probe_binding_replay_blocks_conflicting_durable_binding(
+    tmp_path: Path,
+    conflict_field: str,
+) -> None:
+    operation_key = "publish:durable-binding-conflict"
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "release.publish",
+                (
+                    Indeterminate(
+                        operation_key=operation_key,
+                        error_code="provider_timeout",
+                        failure_signature=canonical_failure_signature(
+                            "release.publish", "{}", "provider_timeout"
+                        ),
+                        message="remote result unknown",
+                    ),
+                ),
+            ),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key=operation_key,
+                        disposition="unknown",
+                        evidence_refs=("provider:query-1",),
+                        message="remote result remains unknown",
+                    ),
+                ),
+            ),
+        ),
+        patches=(),
+        spec_options={"release.publish": {"probe_capability": "release.probe"}},
+        probe_capabilities=frozenset({"release.probe"}),
+    ) as rig:
+        original, snapshot = await _authorize_one(rig, "release.publish")
+        await rig.dispatcher.execute(
+            run_id=rig.run_id, action=original, snapshot=snapshot, attempt=1
+        )
+        await rig.reconciler.reconcile(rig.run_id)
+        binding = ProbeActionInput(
+            original_action_id=original.action_id,
+            original_attempt=1,
+            operation_key=operation_key,
+            probe_capability="release.probe",
+        )
+        context = await SnapshotBuilder(
+            ledger=rig.ledger, registry=rig.registry
+        ).build(rig.run_id)
+        patch = _probe_patch("probe-stored", binding)
+        decision = PolicyEngine(rig.registry).authorize(
+            context.policy_snapshot, patch, next_plan_version=2
+        )
+        assert decision.authorized and len(decision.actions) == 1
+        await rig.ledger.authorize_probe_action(
+            rig.run_id,
+            binding=binding,
+            patch=patch,
+            action=decision.actions[0],
+            expected_previous_plan_version=1,
+        )
+        conflicting = binding.model_copy(
+            update={
+                conflict_field: (
+                    "publish:different-operation"
+                    if conflict_field == "operation_key"
+                    else "release.different-probe"
+                )
+            }
+        )
+
+        with pytest.raises(LedgerConflictError, match="probe binding conflicts"):
+            await rig.ledger.authorize_probe_action(
+                rig.run_id,
+                binding=conflicting,
+                patch=patch,
+                action=decision.actions[0],
+                expected_previous_plan_version=2,
+            )
+
+        assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
+        assert await rig.ledger.action_status(original.action_id) is ActionStatus.REPAIR_REQUIRED
+        assert await rig.ledger.has_open_incident("probe_binding_conflict")
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM plan_versions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM actions WHERE run_id = ?", (rig.run_id,)
+        ) == 2
 
 
 @pytest.mark.asyncio

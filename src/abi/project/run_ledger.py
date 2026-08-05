@@ -515,6 +515,7 @@ class RunLedger:
         now = self._now()
         created = False
         binding_parameters_json = binding.model_dump_json()
+        durable_probe_action_id = action.action_id
         try:
             async with self.transaction() as db:
                 cursor = await db.execute(
@@ -527,8 +528,6 @@ class RunLedger:
                     exact = (
                         prior["operation_key"] == binding.operation_key
                         and prior["probe_capability"] == binding.probe_capability
-                        and prior["probe_action_id"] == action.action_id
-                        and prior["plan_version"] == action.plan_version
                     )
                     existing = await self._require_action(
                         db, prior["probe_action_id"]
@@ -536,11 +535,11 @@ class RunLedger:
                     exact = exact and (
                         existing["capability"] == binding.probe_capability
                         and existing["parameters_json"]
-                        == action.parameters_json
                         == binding_parameters_json
                     )
                     if not exact:
                         raise _ProbeBindingConflict
+                    durable_probe_action_id = prior["probe_action_id"]
                 else:
                     await self._require_running_run(db, run_id)
                     original = await self._require_action(
@@ -713,7 +712,7 @@ class RunLedger:
             raise LedgerConflictError(
                 "probe binding conflicts with durable facts"
             ) from exc
-        return await self.get_action(action.action_id), created
+        return await self.get_action(durable_probe_action_id), created
 
     async def get_action(self, action_id: str) -> ActionRecord:
         row = await self._fetch_one("SELECT * FROM actions WHERE action_id = ?", (action_id,))
