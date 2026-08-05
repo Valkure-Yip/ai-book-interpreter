@@ -449,7 +449,7 @@ LangGraph checkpoint
 | Action 执行前 | 重新派发 |
 | 执行中且没有工件 | 按 retry policy 重试 |
 | staging 已写但 promotion 仍为 `PENDING` | 按第 12 节的 create-only 协议验证并补完，或保留证据进入 `CONFLICT` |
-| promotion 已 `COMMITTED` 但进程尚未完成文件系统后验 | Reconciler 重做 inode/checksum/目录链检查；drift 时补偿为 `CONFLICT` |
+| promotion 已 `COMMITTED` 但进程尚未完成文件系统后验 | Reconciler 只重做 canonical inode/checksum/目录链检查；canonical drift 时补偿为 `CONFLICT`，staging 残留不参与裁决 |
 | ledger 已 commit 但 graph 未 checkpoint | Reconciler 发现已成功并跳过执行 |
 | gate FAIL | 保留证据并 replan 修复动作 |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
@@ -460,6 +460,17 @@ LangGraph checkpoint
 `action_id + plan_version + attempt + idempotency_key`，且副作用必须幂等或可对账。
 
 ## 12. 工件隔离与提交
+
+第一版平台按**单进程**运行，不提供跨进程 artifact writer 协调。进程内并发仍必须经过 ledger
+reservation 和本节的 create-only 协议；进程外写入被视为 drift，Reconciler 只能检测和补偿，不能
+把 POSIX 路径名声明为不可变。
+
+机器管理的 canonical relpath 使用跨 Linux/macOS 一致的便携小写命名空间：分隔符只能是 `/`，
+每个 component 只能匹配 `[a-z0-9._-]+`。唯一的词法边界验证器拒绝 uppercase、Unicode/casefold
+别名、空 component、`.`、`..`、绝对路径、反斜杠以及 `state/staging` 前缀；不做大小写折叠、
+Unicode normalization 或 dot 归一化，也不兼容旧路径。`ArtifactStore` 在 canonical 文件系统遍历前
+调用该验证器，`RunLedger` 在开启 reservation 事务前调用同一验证器，且只存储返回的 canonical
+key。因此 `chapters/...` 合法而 `CHAPTERS/...` 直接 fail closed，不能成为第二个物理别名。
 
 Action 不直接覆盖 canonical artifacts。每次 attempt 的 staging 命名空间为：
 
@@ -479,8 +490,8 @@ file，并在所有成功/异常路径关闭 fd；symlink 被拒绝，FIFO 不�
 
 validator PASS 后按以下顺序提升：
 
-1. 通过安全 staging fd 计算 checksum，规范化 staged/canonical 相对路径，并在 ledger 中唯一预留
-   canonical 路径，写入 `PENDING` promotion intent；
+1. 通过安全 staging fd 计算 checksum，验证 staged 路径并通过上述词法边界验证 canonical key，
+   然后在 ledger 中唯一预留该 canonical key，写入 `PENDING` promotion intent；
 2. 固定持有 canonical parent dirfd，复核项目根、目录链、staging checksum；
 3. canonical 名称若已存在，只读验证 regular-file/inode/checksum；相同 checksum 是幂等候选，不同
    checksum 立即进入 `CONFLICT`；
@@ -492,12 +503,19 @@ validator PASS 后按以下顺序提升：
 6. ledger commit 返回后再次检查 canonical fd checksum、名称/inode 和目录链。任何失败都立即在
    SQLite 中原子补偿 `COMMITTED → CONFLICT` 并创建 subject-scoped incident。
 
+权威边界随 durable 状态变化：`PENDING` 期间 staged 是 promotion 输入，所有现有 checksum、regular
+file、dirfd 与目录链检查继续生效；canonical 和 ledger 成功进入 `COMMITTED` 后，canonical + ledger
+立即成为唯一权威事实，staged 降级为非权威运行残留。COMMITTED reconcile 不再解析、打开或 hash
+staged 路径；staged 被修改、删除或清理不会产生 incident，也不会触发 `CONFLICT`。这条裁决只改变
+staged 的 post-commit 地位，不删除或弱化 canonical 的 commit-window 后验，以及重启后的
+checksum、名称/inode、pinned root 和目录链复核。
+
 第 5 步之前的最后一次文件系统检查与 SQLite 更新之间存在不可消除的窗口；本文**不宣称文件系统与
 SQLite 原子**。若进程在 ledger commit 后、第 6 步之前崩溃，durable 状态暂为 `COMMITTED`；启动
 Reconciler 必须重做后验，发现 identity/checksum/目录链 drift 时转为 `CONFLICT`，不能继续把该
 intent 当成成功。
 
-同一窗口也允许另一个连接把该 intent 补偿为 `CONFLICT`。由于协议不虚构文件系统与 SQLite 的
+同一窗口也允许同一进程内的另一个连接把该 intent 补偿为 `CONFLICT`。由于协议不虚构文件系统与 SQLite 的
 原子性，已经按先前 `PENDING` 快照进入 copy 的 worker 可能在获知补偿前创建或写入 canonical
 候选；它在 ledger commit 处必须被拒绝，将该拒绝转换为可聚合的 artifact conflict，并保留候选
 文件。任何**已经读取到** `CONFLICT` 的后续调用都不得再写入或删除。这里的终止语义不追溯撤销
@@ -519,14 +537,15 @@ Promotion intent 的合法状态与恢复语义为：
 | `PENDING` | canonical checksum 相同；staged 不存在或相同 | 完成受保护 commit，转 `COMMITTED` |
 | `PENDING` | staged/canonical 都不存在 | 保持 `PENDING`，幂等记录 `artifact_promotion_missing` |
 | `PENDING` | canonical 不同或 partial、staged checksum 不同、intent 路径不安全 | 原子转 `CONFLICT` 并记录对应 incident；不删文件 |
-| `COMMITTED` | canonical 名称/inode/checksum/目录链一致；staged 不存在或相同 | 保持 `COMMITTED` |
-| `COMMITTED` | canonical 缺失或 drift、staged 不同、identity/目录链复核失败 | 原子补偿为 `CONFLICT`；不得从 staging 重建 canonical |
+| `COMMITTED` | canonical 名称/inode/checksum/目录链一致；staged 为任意内容或不存在 | 保持 `COMMITTED`；staged 是非权威残留，不记录 incident |
+| `COMMITTED` | canonical 缺失或 drift、canonical identity/目录链复核失败 | 原子补偿为 `CONFLICT`；不得从 staging 重建 canonical |
 | `CONFLICT` | 任意 | 观察到该状态的调用不再 commit、写入或删除；返回已有冲突，同时继续对账后续 intents；已在途的旧 `PENDING` worker 只能保留候选并在 commit 处失败 |
 
 ledger 只允许验证后的 `PENDING → COMMITTED`、幂等 `COMMITTED → COMMITTED`，以及原子的
 `PENDING/COMMITTED → CONFLICT + incident`。重复补偿保持 `CONFLICT` 且不重复 incident；
 `CONFLICT → COMMITTED` 非法。`reconcile_all()` 处理全部 intents 后才汇总抛错，一个冲突不得阻断
-后续可恢复 intent。自动清理只有在未来另行设计 durable ownership/unlink 协议后才可加入。
+后续可恢复 intent。本 Task 不实现自动清理；COMMITTED 后外部或后续安全清理 staging 不影响
+promotion 状态，未来若加入自动 GC 仍须另行证明 no-follow ownership/unlink 安全。
 
 发布、上传等不可逆动作采用 `prepare → commit → reconcile` 协议并携带 idempotency key。
 

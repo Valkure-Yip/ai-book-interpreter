@@ -171,18 +171,41 @@ async def test_reconcile_records_a_missing_committed_canonical(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_reconcile_preserves_a_differing_staged_duplicate_after_commit(tmp_path: Path) -> None:
-    """Catch cleanup that deletes a staged artifact differing from a committed canonical file."""
-    async with prepared_store(tmp_path, content="translation") as (store, ledger, staged):
-        await store.promote(staged)
-        staged_duplicate = tmp_path / "state/staging/translate-001/1/001.md"
-        staged_duplicate.write_text("different", encoding="utf-8")
+@pytest.mark.parametrize("staged_change", ["modified", "deleted"])
+async def test_committed_reconcile_ignores_non_authoritative_staged_residue_after_restart(
+    tmp_path: Path, staged_change: str
+) -> None:
+    """Catch COMMITTED recovery treating disposable staging residue as authoritative evidence."""
+    project = BookProject(tmp_path)
+    staged_path = tmp_path / "state/staging/translate-001/1/001.md"
+    canonical = tmp_path / "chapters/final/001.md"
 
-        with pytest.raises(ArtifactConflictError, match="choose the canonical artifact"):
-            await store.reconcile_all()
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, intent):
+        await store.promote(intent)
+        if staged_change == "modified":
+            staged_path.write_text("non-authoritative residue", encoding="utf-8")
+        else:
+            staged_path.unlink()
 
-        assert staged_duplicate.read_text(encoding="utf-8") == "different"
-        assert await ledger.has_open_incident("artifact_checksum_conflict")
+        reconciled = await store.reconcile_all()
+
+        assert tuple(item.status for item in reconciled) == ("COMMITTED",)
+        assert await ledger.promotion_state(intent.intent_id) == "COMMITTED"
+        assert (await ledger.load_snapshot("run-1")).incidents == ()
+        assert canonical.read_text(encoding="utf-8") == "translation"
+        intent_id = intent.intent_id
+        store.close()
+
+    async with RunLedger.open(project.run_db) as restarted_ledger:
+        restarted_store = ArtifactStore(project, restarted_ledger)
+        try:
+            restarted = await restarted_store.reconcile_all()
+            assert tuple(item.status for item in restarted) == ("COMMITTED",)
+            assert await restarted_ledger.promotion_state(intent_id) == "COMMITTED"
+            assert (await restarted_ledger.load_snapshot("run-1")).incidents == ()
+            assert canonical.read_text(encoding="utf-8") == "translation"
+        finally:
+            restarted_store.close()
 
 
 @pytest.mark.asyncio
@@ -247,6 +270,32 @@ async def test_prepare_rejects_a_nonstaged_source_path(tmp_path: Path) -> None:
                 canonical_relpath="chapters/final/source.md",
                 media_type="text/markdown",
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canonical_relpath",
+    ["STATE/STAGING/escape.md", "CHAPTERS/FINAL/001.md"],
+)
+async def test_prepare_rejects_uppercase_canonical_before_intent_or_filesystem_mutation(
+    tmp_path: Path, canonical_relpath: str
+) -> None:
+    """Catch platform-dependent uppercase aliases reaching the ledger or canonical tree."""
+    async with prepared_store(tmp_path, content="translation") as (store, ledger, _):
+        before = await ledger.promotion_intents()
+        candidate = tmp_path / canonical_relpath
+
+        with pytest.raises(ValueError):
+            await store.prepare_promotion(
+                action_id="translate-001",
+                attempt=1,
+                staged_relpath="state/staging/translate-001/1/001.md",
+                canonical_relpath=canonical_relpath,
+                media_type="text/markdown",
+            )
+
+        assert await ledger.promotion_intents() == before
+        assert not candidate.exists()
 
 
 def test_staging_dir_rejects_symlinked_action_ancestor(tmp_path: Path) -> None:
@@ -369,8 +418,8 @@ def test_store_lifecycle_root_remap_fails_closed_before_staged_write(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_canonical_aliases_share_one_reservation_key(tmp_path: Path) -> None:
-    """Catch textual canonical aliases that reserve the same file twice."""
+async def test_canonical_dot_alias_is_rejected_before_reservation(tmp_path: Path) -> None:
+    """Catch dot components being normalized into a reserved canonical key."""
     async with prepared_store(tmp_path, content="first") as (store, ledger, staged):
         await ledger.authorize_actions(
             "run-1",
@@ -390,7 +439,8 @@ async def test_canonical_aliases_share_one_reservation_key(tmp_path: Path) -> No
             action_id="translate-002", attempt=1, relative_path="001.md", content=b"second"
         )
 
-        with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
+        before = await ledger.promotion_intents()
+        with pytest.raises(ValueError):
             await store.prepare_promotion(
                 action_id="translate-002",
                 attempt=1,
@@ -399,6 +449,7 @@ async def test_canonical_aliases_share_one_reservation_key(tmp_path: Path) -> No
                 media_type="text/markdown",
             )
 
+        assert await ledger.promotion_intents() == before
         assert staged.canonical_relpath == "chapters/final/001.md"
 
 
@@ -411,7 +462,7 @@ async def test_prepare_rejects_canonical_that_aliases_staging_source(tmp_path: P
                 action_id="translate-001",
                 attempt=1,
                 staged_relpath="state/staging/translate-001/1/001.md",
-                canonical_relpath="state/staging/translate-001/1/./001.md",
+                canonical_relpath="state/staging/translate-001/1/001.md",
                 media_type="text/markdown",
             )
 
@@ -466,7 +517,7 @@ async def test_two_ledger_connections_do_not_overwrite_competing_promotions(tmp_
                     action_id="translate-002",
                     attempt=1,
                     staged_relpath="state/staging/translate-002/1/001.md",
-                    canonical_relpath="chapters/final/./001.md",
+                    canonical_relpath="chapters/final/001.md",
                     media_type="text/markdown",
                 ),
                 return_exceptions=True,

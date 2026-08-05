@@ -370,6 +370,109 @@ async def test_unknown_persisted_action_status_has_repair_error(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canonical_relpath",
+    (
+        "STATE/STAGING/escape.json",
+        "CHAPTERS/FINAL/001.md",
+        "state/staging/escape.json",
+        "\u017ftate/staging/escape.json",
+        "state/\u017ftaging/escape.json",
+        "chapters/final/\u212a.json",
+        "chapters/./final.json",
+        "chapters/../final.json",
+        "chapters//final.json",
+        "chapters/final/",
+        r"chapters\final\001.md",
+        "/chapters/final/001.md",
+        "c:/chapters/final/001.md",
+    ),
+    ids=(
+        "uppercase-staging",
+        "uppercase-canonical",
+        "staging-prefix",
+        "unicode-casefold-state",
+        "unicode-casefold-staging",
+        "unicode-casefold-leaf",
+        "dot-component",
+        "dot-dot-component",
+        "empty-component",
+        "trailing-empty-component",
+        "backslash",
+        "posix-absolute",
+        "drive-absolute",
+    ),
+)
+async def test_ledger_rejects_nonportable_canonical_reservation_key_without_mutation(
+    tmp_path: Path, canonical_relpath: str
+) -> None:
+    """Catch platform aliases or unsafe syntax entering the canonical reservation index."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+
+        with pytest.raises(ValueError):
+            await ledger.create_promotion_intent(
+                action_id="a1",
+                attempt=1,
+                staged_relpath="state/staging/a1/1/source.json",
+                canonical_relpath=canonical_relpath,
+                checksum="abc",
+                media_type="application/json",
+            )
+
+        assert await ledger.promotion_intents() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canonical_relpath",
+    (
+        "chapters/final/001.md",
+        "qa/gates/chapter_001-final.v1.json",
+        ".abi/meta-1.json",
+    ),
+)
+async def test_portable_lowercase_canonical_keys_are_reserved_verbatim_and_uniquely(
+    tmp_path: Path, canonical_relpath: str
+) -> None:
+    """Catch a validated canonical key being normalized or reserved by two actions."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        first = await ledger.create_promotion_intent(
+            action_id="a1",
+            attempt=1,
+            staged_relpath="state/staging/a1/1/source.json",
+            canonical_relpath=canonical_relpath,
+            checksum="abc",
+            media_type="application/json",
+        )
+        replay = await ledger.create_promotion_intent(
+            action_id="a1",
+            attempt=1,
+            staged_relpath="state/staging/a1/1/source.json",
+            canonical_relpath=canonical_relpath,
+            checksum="abc",
+            media_type="application/json",
+        )
+        await ledger.authorize_actions("run-1", (_action("a2"),))
+        await ledger.start_attempt("a2")
+
+        with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
+            await ledger.create_promotion_intent(
+                action_id="a2",
+                attempt=1,
+                staged_relpath="state/staging/a2/1/source.json",
+                canonical_relpath=canonical_relpath,
+                checksum="different",
+                media_type="application/json",
+            )
+
+        assert replay.intent_id == first.intent_id
+        assert first.canonical_relpath == canonical_relpath
+        assert await ledger.promotion_intents() == (first,)
+
+
+@pytest.mark.asyncio
 async def test_conflict_is_a_valid_persisted_promotion_status(tmp_path: Path) -> None:
     """Catch valid compensated intents being rejected as corrupt ledger rows."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:

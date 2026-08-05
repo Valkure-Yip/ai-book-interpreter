@@ -14,6 +14,7 @@ from uuid import uuid4
 import aiosqlite
 from pydantic import Field
 
+from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.ledger_schema import SCHEMA_SQL
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
@@ -509,6 +510,7 @@ class RunLedger:
         media_type: str,
     ) -> PromotionIntent:
         """Record an immutable pending promotion before changing the filesystem."""
+        canonical_key = canonical_artifact_key(canonical_relpath)
         now = self._now()
         canonical_conflict = False
         async with self.transaction() as db:
@@ -517,19 +519,19 @@ class RunLedger:
             cursor = await db.execute(
                 "SELECT * FROM promotion_intents WHERE action_id = ? AND attempt = ? "
                 "AND staged_relpath = ? AND canonical_relpath = ?",
-                (action_id, attempt, staged_relpath, canonical_relpath),
+                (action_id, attempt, staged_relpath, canonical_key),
             )
             existing = await cursor.fetchone()
             if existing is not None:
                 if existing["checksum"] != checksum or existing["media_type"] != media_type:
                     raise LedgerConflictError(
-                        f"promotion for {canonical_relpath} disagrees with its recorded checksum; "
+                        f"promotion for {canonical_key} disagrees with its recorded checksum; "
                         "inspect and choose the canonical artifact before retrying"
                     )
                 return self._promotion_intent_from_row(existing)
             cursor = await db.execute(
                 "SELECT intent_id FROM promotion_intents WHERE canonical_relpath = ?",
-                (canonical_relpath,),
+                (canonical_key,),
             )
             canonical_intent = await cursor.fetchone()
             if canonical_intent is not None:
@@ -538,7 +540,7 @@ class RunLedger:
                     run_id=action["run_id"],
                     error_code="artifact_checksum_conflict",
                     message=(
-                        f"canonical artifact {canonical_relpath} already has promotion intent "
+                        f"canonical artifact {canonical_key} already has promotion intent "
                         f"{canonical_intent['intent_id']}; inspect and choose the canonical artifact"
                     ),
                     action_id=action_id,
@@ -556,7 +558,7 @@ class RunLedger:
                         action_id,
                         attempt,
                         staged_relpath,
-                        canonical_relpath,
+                        canonical_key,
                         checksum,
                         media_type,
                         "PENDING",
@@ -565,7 +567,7 @@ class RunLedger:
                 )
         if canonical_conflict:
             raise LedgerConflictError(
-                f"canonical artifact {canonical_relpath} already has a promotion intent; "
+                f"canonical artifact {canonical_key} already has a promotion intent; "
                 "inspect and choose the canonical artifact"
             )
         return PromotionIntent(
@@ -573,7 +575,7 @@ class RunLedger:
             action_id=action_id,
             attempt=attempt,
             staged_relpath=staged_relpath,
-            canonical_relpath=canonical_relpath,
+            canonical_relpath=canonical_key,
             checksum=checksum,
             media_type=media_type,
             status="PENDING",

@@ -607,6 +607,7 @@ git commit -m "feat: add transactional run ledger"
 
 **Files:**
 - Create: `src/abi/project/artifacts.py`
+- Create: `src/abi/project/artifact_paths.py`
 - Extend: `src/abi/project/run_ledger.py`
 - Modify: `src/abi/project/layout.py`
 - Test: `tests/test_artifact_promotion.py`
@@ -616,7 +617,8 @@ git commit -m "feat: add transactional run ledger"
 - Consumes: `RunLedger` and `ArtifactRef`.
 - Produces: create-only `ArtifactStore.write_staged_bytes()`, display-only `staging_dir()`,
   `prepare_promotion()`, `promote()`, `reconcile_intent()`, safe `sha256_file()`, and durable
-  `PENDING | COMMITTED | CONFLICT` promotion transitions.
+  `PENDING | COMMITTED | CONFLICT` promotion transitions. `canonical_artifact_key()` is the one
+  lexical boundary for portable canonical reservation keys.
 
 - [ ] **Step 1: Write crash, race, storage-failure, and conflict-state tests**
 
@@ -677,12 +679,21 @@ Add the companion FIFO test with a bounded worker join, forced teardown only for
 descriptor. Add partial-write then `ENOSPC` injection that asserts `canonical_write_incomplete`, a
 durable `CONFLICT`, preserved partial/staged bytes, and absence of `artifact_intent_invalid`.
 
+Add portable-key tests that reject uppercase (`STATE/STAGING`, `CHAPTERS/FINAL`), Unicode and
+casefold aliases, empty/dot components, backslashes, absolute paths, and the lowercase
+`state/staging` prefix before intent or filesystem mutation. Legal lowercase examples must be
+stored verbatim and reserve one unique key. Add restart tests proving that, after a valid
+`COMMITTED` transition, changed, deleted, or externally cleaned staging residue causes neither
+compensation nor an incident while the canonical facts remain valid. Retain the canonical
+commit-window and post-commit drift tests unchanged.
+
 - [ ] **Step 2: Run focused tests and confirm failure**
 
 Run: `.venv/bin/pytest tests/test_artifact_promotion.py tests/test_run_ledger.py -v`
 
 Expected: the new tests fail because `CONFLICT` parsing/compensation, post-commit repair,
-`canonical_write_incomplete`, and no-follow/nonblocking public hashing are absent.
+`canonical_write_incomplete`, no-follow/nonblocking public hashing, portable canonical-key
+validation, and the COMMITTED staging-authority boundary are absent.
 
 - [ ] **Step 3: Implement the durable promotion state machine**
 
@@ -701,7 +712,14 @@ states fail closed during repository-owned parsing.
 | `CONFLICT` | repeated same compensation | unchanged `CONFLICT`, no duplicate incident |
 | `CONFLICT` | commit | reject; never report success |
 
-- [ ] **Step 4: Implement pinned, create-only staging and checksum I/O**
+- [ ] **Step 4: Implement portable canonical keys, pinned staging, and checksum I/O**
+
+Machine-managed canonical relpaths use `/` separators and components matching only
+`[a-z0-9._-]+`. The shared lexical validator rejects uppercase, Unicode, empty, `.`, `..`, absolute
+paths, backslashes, and the `state/staging` prefix without normalization. ArtifactStore invokes it
+before canonical filesystem traversal; RunLedger invokes the same function before opening a
+transaction and stores only its returned key. No old-path compatibility or casefold migration is
+provided.
 
 Pin the project root descriptor and its device/inode for the `ArtifactStore` lifetime. Traverse all
 staging and canonical directories relative to pinned dirfds with `O_DIRECTORY | O_NOFOLLOW`, and
@@ -714,13 +732,22 @@ every success and failure path; symlinks are rejected and FIFOs never block.
 
 - [ ] **Step 5: Implement create-only canonical promotion**
 
-Persist the normalized `PENDING` intent before canonical mutation. Hold the canonical-parent dirfd
+Persist the lexically validated `PENDING` intent before canonical mutation. Hold the
+canonical-parent dirfd
 through the whole operation. If the canonical name already exists, open it read-only without
 following links and commit only when its checksum matches. If absent, open the final canonical name
 exactly once with `O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK`, copy verified staged bytes through
 the returned fd, fsync and hash that fd, and prove that the name still identifies the same inode and
 the parent still belongs to the pinned durable chain. Then commit the ledger intent and repeat the
 inode/checksum/directory-chain checks.
+
+The platform is single-process. While an intent is `PENDING`, staged bytes are authoritative
+promotion input and must pass every existing precommit check. Once canonical creation, durability,
+identity checks, and the ledger transition have succeeded, `COMMITTED` makes canonical plus ledger
+the only authoritative facts; staging immediately becomes non-authoritative runtime residue.
+COMMITTED reconciliation therefore never parses or hashes staged paths, and staged deletion,
+cleanup, or drift creates no conflict or incident. This boundary does not remove or weaken any
+canonical commit-window or post-commit checksum, inode, name, root, or directory-chain check.
 
 The last filesystem precheck and the SQLite update are deliberately **not** described as atomic.
 Any identity, checksum, or directory-chain failure after SQLite commit immediately compensates
@@ -749,8 +776,8 @@ canonical plus staged source; never misclassify that failure as `artifact_intent
 | `PENDING` | canonical checksum matches; staged absent or matches | guarded commit to `COMMITTED` |
 | `PENDING` | neither artifact exists | remain `PENDING`; idempotent `artifact_promotion_missing` incident |
 | `PENDING` | canonical differs/is partial, staged differs, or intent path is unsafe | atomically enter `CONFLICT`; retain every artifact |
-| `COMMITTED` | canonical name/inode/checksum/dirchain match; staged absent or matches | remain `COMMITTED` |
-| `COMMITTED` | canonical missing/drifted, staged differs, or any identity/dirchain check fails | atomically compensate to `CONFLICT`; never recreate canonical |
+| `COMMITTED` | canonical name/inode/checksum/dirchain match; staged has any contents or is absent | remain `COMMITTED`; staged is non-authoritative residue |
+| `COMMITTED` | canonical missing/drifted, or any canonical identity/dirchain check fails | atomically compensate to `CONFLICT`; never recreate canonical |
 | `CONFLICT` | any evidence | a caller that observes it never commits, rewrites, or deletes; an already in-flight stale `PENDING` worker preserves its candidate and fails commit; surface the incident and continue later intents |
 
 `reconcile_all()` processes every intent before raising an aggregate conflict. Repeated

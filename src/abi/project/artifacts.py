@@ -12,6 +12,7 @@ from pathlib import Path, PurePath
 from typing import NoReturn
 from weakref import finalize
 
+from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.layout import BookProject
 from abi.project.run_ledger import LedgerTransitionError, PromotionIntent, RunLedger
 
@@ -69,7 +70,7 @@ def sha256_file(path: Path) -> str:
 
 
 class ArtifactStore:
-    """Promote immutable copies using live no-follow descriptors throughout."""
+    """Promote PENDING staging input, then reconcile COMMITTED canonical facts only."""
 
     def __init__(
         self, project: BookProject, ledger: RunLedger | None, *, test_hook: TestHook | None = None
@@ -133,9 +134,9 @@ class ArtifactStore:
     ) -> PromotionIntent:
         """Persist a normalized, checksum-bearing intent before canonical mutation."""
         _require_secure_dirfd_support()
+        canonical_parts = self._canonical_parts(canonical_relpath)
         self._assert_root_anchor()
         staged_parts = self._staged_file_parts(action_id, attempt, staged_relpath)
-        canonical_parts = self._canonical_parts(canonical_relpath)
         checksum = self._staged_checksum(action_id, attempt, staged_parts)
         if checksum is None:
             raise FileNotFoundError(f"staged artifact {staged_relpath} does not exist")
@@ -188,9 +189,14 @@ class ArtifactStore:
                 f"promotion intent {intent.intent_id} is CONFLICT; inspect its incident and repair the artifact"
             )
         try:
-            self._assert_root_anchor()
-            staged_parts = self._staged_file_parts(intent.action_id, intent.attempt, intent.staged_relpath)
             canonical_parts = self._canonical_parts(intent.canonical_relpath)
+            self._assert_root_anchor()
+            # Staging is authoritative only until the durable COMMITTED transition.
+            staged_parts = (
+                self._staged_file_parts(intent.action_id, intent.attempt, intent.staged_relpath)
+                if intent.status == "PENDING"
+                else None
+            )
             canonical_parent_fd = self._open_project_parent(
                 canonical_parts, create=intent.status == "PENDING"
             )
@@ -209,6 +215,7 @@ class ArtifactStore:
                 return await self._commit_existing(
                     intent, staged_parts, canonical_parent_fd, canonical_parts[-1]
                 )
+            assert staged_parts is not None
             staged_checksum = await self._validated_staged_checksum(intent, staged_parts)
             if staged_checksum is None:
                 if _sha256_regular_at(canonical_parent_fd, canonical_parts[-1]) is None:
@@ -294,7 +301,7 @@ class ArtifactStore:
     async def _commit_existing(
         self,
         intent: PromotionIntent,
-        staged_parts: tuple[str, ...],
+        staged_parts: tuple[str, ...] | None,
         canonical_parent_fd: int,
         canonical_name: str,
         *,
@@ -313,9 +320,13 @@ class ArtifactStore:
             self._assert_directory_binding(canonical_parent_fd, _parent_parts(intent.canonical_relpath))
             if not _named_inode_matches(canonical_parent_fd, canonical_name, canonical_stat):
                 await self._raise_checksum_conflict(intent, "canonical artifact name was replaced")
-            staged_checksum = await self._validated_staged_checksum(intent, staged_parts)
-            if staged_checksum is not None and staged_checksum != intent.checksum:
-                await self._raise_checksum_conflict(intent, "staged artifact has a different checksum")
+            if intent.status == "PENDING":
+                assert staged_parts is not None
+                staged_checksum = await self._validated_staged_checksum(intent, staged_parts)
+                if staged_checksum is not None and staged_checksum != intent.checksum:
+                    await self._raise_checksum_conflict(
+                        intent, "staged artifact has a different checksum"
+                    )
             try:
                 os.fsync(canonical_parent_fd)
             except OSError as exc:
@@ -415,10 +426,7 @@ class ArtifactStore:
         return Path("state", "staging", action_id, str(attempt), *parts).as_posix()
 
     def _canonical_parts(self, canonical_relpath: str) -> tuple[str, ...]:
-        parts = _safe_relative_parts(canonical_relpath)
-        if parts[:2] == ("state", "staging"):
-            raise ValueError("canonical artifact must be outside the staging root")
-        return parts
+        return tuple(canonical_artifact_key(canonical_relpath).split("/"))
 
     def _staged_checksum(self, action_id: str, attempt: int, parts: tuple[str, ...]) -> str | None:
         fd = self._open_staged_file(action_id, attempt, parts)
@@ -578,7 +586,7 @@ def _is_safe_component(value: str) -> bool:
 
 
 def _parent_parts(value: str) -> tuple[str, ...]:
-    return _safe_relative_parts(value)[:-1]
+    return tuple(canonical_artifact_key(value).split("/"))[:-1]
 
 
 def _open_directory_at(parent_fd: int, component: str, *, create: bool) -> int:
