@@ -42,7 +42,7 @@ from abi.types.orchestration import (
     RetryPolicySpec,
     Succeeded,
 )
-from abi.types.tools import ReviewActionIdentity, ToolBinding
+from abi.types.tools import GateRuntimeMetadata, ReviewActionIdentity, ToolBinding
 
 
 class ActionToolRef(FrozenModel):
@@ -403,6 +403,10 @@ class AgentActionExecutor:
                 attempt=context.attempt,
             ),
             capability=self._capability,
+            runtime_metadata=GateRuntimeMetadata(
+                target_language=context.target_lang,
+                publication_mode=context.publication_mode,
+            ),
         )
         try:
             tools = belt.resolve(tuple(tool.name for tool in envelope.tools))
@@ -484,7 +488,16 @@ class DeterministicActionExecutor:
                 from abi.epub.epubcheck import run_epubcheck
                 from abi.epub.lint import publication_lint
 
-                checks = (publication_lint(context.project), asset_manifest_check(context.project))
+                checks = (
+                    publication_lint(
+                        context.project,
+                        runtime_metadata=GateRuntimeMetadata(
+                            target_language=context.target_lang,
+                            publication_mode=context.publication_mode,
+                        ),
+                    ),
+                    asset_manifest_check(context.project),
+                )
                 failed = next((result for result in checks if not result.ok), None)
                 if failed is None:
                     failed = build_epub(context.project)
@@ -502,7 +515,14 @@ class DeterministicActionExecutor:
 
                 if not isinstance(parameters, ReleaseInput):
                     raise TypeError("release.prepare requires ReleaseInput")
-                result = create_release(context.project, version=parameters.version)
+                result = create_release(
+                    context.project,
+                    version=parameters.version,
+                    runtime_metadata=GateRuntimeMetadata(
+                        target_language=context.target_lang,
+                        publication_mode=context.publication_mode,
+                    ),
+                )
                 if not result.ok:
                     return ActionOutcomeEnvelope(
                         outcome=RepairRequired(

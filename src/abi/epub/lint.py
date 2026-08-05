@@ -14,6 +14,7 @@ import yaml
 
 from abi.epub.result import GateResult
 from abi.project.layout import BookProject
+from abi.types.tools import GateRuntimeMetadata
 
 _ABS_PATH_RE = re.compile(r"(file://|[A-Za-z]:\\\\|[A-Za-z]:/|/Users/|/home/|/mnt/)")
 _REPLACEMENT_CHARS = ("\ufffd", "\x00")
@@ -41,17 +42,25 @@ def _check_text(rel: str, text: str, *, cjk_target: bool, errors: list[str], war
             warnings.append(f"{rel}: heavy semicolon use for a CJK target")
 
 
-def publication_lint(project: BookProject) -> GateResult:
+def publication_lint(
+    project: BookProject,
+    *,
+    runtime_metadata: GateRuntimeMetadata | None = None,
+) -> GateResult:
     errors: list[str] = []
     warnings: list[str] = []
 
-    meta = {}
+    meta: dict[str, object] = {}
     if project.book_yaml.exists():
         try:
-            meta = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
+            loaded = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
+            if not isinstance(loaded, dict):
+                raise TypeError("top-level metadata must be a mapping")
+            meta = {str(key): value for key, value in loaded.items()}
         except Exception as exc:
             errors.append(f"metadata/book.yaml: invalid YAML ({exc})")
-    lang = str((meta or {}).get("language") or project.load_state().target_lang)
+    configured_language = runtime_metadata.target_language if runtime_metadata else ""
+    lang = str((meta or {}).get("language") or configured_language)
     cjk_target = lang.startswith(("zh", "ja", "ko"))
 
     for required in ("title", "language"):

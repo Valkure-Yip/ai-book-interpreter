@@ -12,7 +12,7 @@ from abi.tools.gates import make_gate_tools
 from abi.tools.permissions import ActionPathPermissions
 from abi.tools.subagent import make_subagent_tools
 from abi.types.orchestration import RunSnapshot
-from abi.types.tools import ReviewActionIdentity, ToolBinding
+from abi.types.tools import GateRuntimeMetadata, ReviewActionIdentity, ToolBinding
 
 
 @dataclass
@@ -57,6 +57,7 @@ def build_belt(
     gate_permissions: ActionPathPermissions | None = None,
     action_identity: ReviewActionIdentity | None = None,
     capability: str | None = None,
+    runtime_metadata: GateRuntimeMetadata | None = None,
 ) -> ToolBelt:
     return ToolBelt(
         fs=make_fs_tools(ctx, permissions=permissions),
@@ -65,7 +66,11 @@ def build_belt(
             get_run_snapshot=get_run_snapshot,
             permissions=permissions,
         ),
-        gates=make_gate_tools(ctx, permissions=gate_permissions or permissions),
+        gates=make_gate_tools(
+            ctx,
+            permissions=gate_permissions or permissions,
+            runtime_metadata=runtime_metadata,
+        ),
         subagent=make_subagent_tools(
             ctx,
             permissions=permissions,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from abi.project.layout import BookProject
 from abi.tools.fs import make_fs_tools
 from abi.tools.gates import make_gate_tools
 from abi.tools.permissions import ActionPathPermissions
+from abi.types.tools import GateRuntimeMetadata
 
 
 def _context(root: Path) -> SimpleNamespace:
@@ -128,3 +130,166 @@ def test_gate_handler_checks_all_read_roots_before_calling_lower_layer(
     with pytest.raises(PermissionError, match="metadata"):
         tool.callable()
     assert called is False
+
+
+def test_publication_lint_gate_uses_typed_metadata_without_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = BookProject(tmp_path)
+    project.book_yaml.parent.mkdir(parents=True)
+    project.book_yaml.write_text("title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8")
+    project.chapters_final.mkdir(parents=True)
+    (project.chapters_final / "001.md").write_text("# 第一章\n\n正文。\n", encoding="utf-8")
+    (project.root / "frontmatter").mkdir()
+
+    def forbidden_state_access(self: BookProject) -> object:
+        raise AssertionError("Action gate must not read pipeline_state.json")
+
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    permissions = ActionPathPermissions(
+        read_dirs=("frontmatter", "chapters/final", "metadata"),
+        write_files=("output/publication_lint.json",),
+    )
+    context = SimpleNamespace(project=project, resolve=lambda path: project.root / path)
+    tool = next(
+        item
+        for item in make_gate_tools(
+            context,
+            permissions=permissions,
+            runtime_metadata=GateRuntimeMetadata(
+                target_language="zh-Hans", publication_mode="public_domain"
+            ),
+        )
+        if item.name == "publication_lint"
+    )
+
+    assert tool.callable().startswith("PASS:")
+
+
+def _release_gate_project(tmp_path: Path) -> BookProject:
+    project = BookProject(tmp_path)
+    project.book_epub.parent.mkdir(parents=True)
+    project.book_epub.write_bytes(b"epub")
+    project.book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.book_yaml.write_text("title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8")
+    report = project.random_spotcheck_dir / "round_001/validation_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text('{"status":"PASS"}', encoding="utf-8")
+    return project
+
+
+def test_release_gate_uses_typed_mode_without_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _release_gate_project(tmp_path)
+
+    def forbidden_state_access(self: BookProject) -> object:
+        raise AssertionError("Action release must not read pipeline_state.json")
+
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    permissions = ActionPathPermissions(
+        read_files=("output/book.epub",),
+        read_dirs=("reviews/random_spotcheck", "metadata"),
+        write_dirs=("output/release",),
+    )
+    context = SimpleNamespace(project=project, resolve=lambda path: project.root / path)
+    tool = next(
+        item
+        for item in make_gate_tools(
+            context,
+            permissions=permissions,
+            runtime_metadata=GateRuntimeMetadata(
+                target_language="zh-Hans", publication_mode="public_domain"
+            ),
+        )
+        if item.name == "create_release"
+    )
+
+    assert tool.callable(version="v0.0.1").startswith("PASS:")
+    assert tuple(project.release_dir.glob("*_v0.0.1.epub"))
+
+
+@pytest.mark.parametrize(
+    "missing_root",
+    ("output/book.epub", "reviews/random_spotcheck", "metadata", "output/release"),
+)
+def test_release_gate_checks_every_read_and_destination_root_before_lower_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_root: str,
+) -> None:
+    project = _release_gate_project(tmp_path)
+    called = False
+
+    def forbidden_lower_layer(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("release lower layer must not run without every root")
+
+    monkeypatch.setattr("abi.release.create.create_release", forbidden_lower_layer)
+    read_files = () if missing_root == "output/book.epub" else ("output/book.epub",)
+    read_dirs = tuple(
+        root
+        for root in ("reviews/random_spotcheck", "metadata")
+        if root != missing_root
+    )
+    write_dirs = () if missing_root == "output/release" else ("output/release",)
+    permissions = ActionPathPermissions(
+        read_files=read_files,
+        read_dirs=read_dirs,
+        write_dirs=write_dirs,
+    )
+    context = SimpleNamespace(project=project, resolve=lambda path: project.root / path)
+    tool = next(
+        item
+        for item in make_gate_tools(
+            context,
+            permissions=permissions,
+            runtime_metadata=GateRuntimeMetadata(
+                target_language="zh-Hans", publication_mode="public_domain"
+            ),
+        )
+        if item.name == "create_release"
+    )
+
+    with pytest.raises(PermissionError, match=missing_root):
+        tool.callable(version="v0.0.1")
+    assert called is False
+
+
+def test_release_gate_legacy_fallback_authorizes_the_inferred_private_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _release_gate_project(tmp_path)
+    project.private_use_declaration.write_text("private", encoding="utf-8")
+    called = False
+
+    def forbidden_lower_layer(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("lower layer must not cross the authorized release mode")
+
+    monkeypatch.setattr("abi.release.create.create_release", forbidden_lower_layer)
+    permissions = ActionPathPermissions(
+        read_files=("output/book.epub",),
+        read_dirs=("reviews/random_spotcheck", "metadata"),
+        write_dirs=("output/release",),
+    )
+    context = SimpleNamespace(project=project, resolve=lambda path: project.root / path)
+    tool = next(
+        item
+        for item in make_gate_tools(context, permissions=permissions)
+        if item.name == "create_release"
+    )
+
+    with pytest.raises(PermissionError, match="output/private_artifacts"):
+        tool.callable(version="v0.0.1")
+    assert called is False
+
+
+def test_action_gate_lower_layers_do_not_reference_legacy_state() -> None:
+    from abi.epub.lint import publication_lint
+    from abi.release.create import create_release
+
+    assert "load_state" not in inspect.getsource(publication_lint)
+    assert "load_state" not in inspect.getsource(create_release)

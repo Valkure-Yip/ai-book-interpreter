@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from abi.epub.result import GateResult
 from abi.project.layout import BookProject
 from abi.types._base import FrozenModel
+from abi.types.tools import GateRuntimeMetadata
 
 _FS_ILLEGAL = re.compile(r'[\\/:*?"<>|]+')
 _VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
@@ -51,9 +52,13 @@ class _ReleaseState(FrozenModel):
     releases: tuple[_ReleaseRecord, ...]
 
 
-def _mode_for(project: BookProject) -> _Mode:
-    st = project.load_state()
-    if st.publication_mode == "private_use":
+def _mode_for(project: BookProject, runtime_metadata: GateRuntimeMetadata | None) -> _Mode:
+    publication_mode = (
+        runtime_metadata.publication_mode
+        if runtime_metadata is not None
+        else "private_use" if project.private_use_declaration.exists() else "public_domain"
+    )
+    if publication_mode == "private_use":
         return _Mode(
             private=True,
             dir_path=project.private_artifacts_dir,
@@ -113,14 +118,20 @@ def _next_version(state_path: Path, given: str | None) -> str:
             for v in versions:
                 m = _VERSION_RE.search(v)
                 if m:
-                    best = max(best, tuple(int(x) for x in m.groups()))
+                    candidate = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    best = max(best, candidate)
             return f"v{best[0]}.{best[1]}.{best[2] + 1}"
         except Exception:
             pass
     return "v0.0.1"
 
 
-def create_release(project: BookProject, *, version: str | None = None) -> GateResult:
+def create_release(
+    project: BookProject,
+    *,
+    version: str | None = None,
+    runtime_metadata: GateRuntimeMetadata | None = None,
+) -> GateResult:
     if not project.book_epub.exists():
         return GateResult(False, "output/book.epub missing — build the EPUB first")
     if not _spotcheck_passed(project):
@@ -130,7 +141,7 @@ def create_release(project: BookProject, *, version: str | None = None) -> GateR
             "Run stage 16a until validate_random_spotcheck PASSes.",
         )
 
-    mode = _mode_for(project)
+    mode = _mode_for(project, runtime_metadata)
     mode.dir_path.mkdir(parents=True, exist_ok=True)
     state_path = mode.dir_path / mode.state_name
     ver = _next_version(state_path, version)

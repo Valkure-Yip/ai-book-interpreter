@@ -12,7 +12,7 @@ from pydantic import Field
 from abi.tools.context import ToolContext
 from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
-from abi.types.tools import ToolBinding
+from abi.types.tools import GateRuntimeMetadata, ToolBinding
 
 
 class EmptyInput(FrozenModel):
@@ -47,6 +47,7 @@ def make_gate_tools(
     ctx: ToolContext,
     *,
     permissions: ActionPathPermissions | None = None,
+    runtime_metadata: GateRuntimeMetadata | None = None,
 ) -> list[ToolBinding]:
     project = ctx.project
 
@@ -75,7 +76,7 @@ def make_gate_tools(
         require_write("output/publication_lint.json")
         from abi.epub.lint import publication_lint as _lint
 
-        res = _lint(project)
+        res = _lint(project, runtime_metadata=runtime_metadata)
         return res.summary()
 
     def asset_manifest_check() -> str:
@@ -160,16 +161,21 @@ def make_gate_tools(
         Refuses unless the latest random spot-check validation PASSed.
         """
         require_reads("output/book.epub", "reviews/random_spotcheck", "metadata")
-        if permissions is not None and not (
-            permissions.can_write("output/release")
-            or permissions.can_write("output/private_artifacts")
-        ):
-            raise PermissionError(
-                "this Action is not allowed to create a release; declare its output directory"
-            )
+        private_mode = (
+            runtime_metadata.publication_mode == "private_use"
+            if runtime_metadata is not None
+            else project.private_use_declaration.exists()
+        )
+        release_root = "output/private_artifacts" if private_mode else "output/release"
+        require_read(release_root)
+        require_write(release_root)
         from abi.release.create import create_release as _create
 
-        res = _create(project, version=version or None)
+        res = _create(
+            project,
+            version=version or None,
+            runtime_metadata=runtime_metadata,
+        )
         return res.summary()
 
     return [

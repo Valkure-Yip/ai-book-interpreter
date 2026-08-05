@@ -13,7 +13,12 @@ from abi.actions.builtins.catalog import (
     build_action_envelope,
     build_action_registry,
 )
-from abi.actions.builtins.inputs import ChapterBatchInput, EmptyInput, SourceIngestInput
+from abi.actions.builtins.inputs import (
+    ChapterBatchInput,
+    EmptyInput,
+    ReleaseInput,
+    SourceIngestInput,
+)
 from abi.actions.contracts import ActionDefinition, ActionExecutionContext
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry, RegistryConfigurationError
@@ -165,6 +170,47 @@ async def test_source_action_executes_the_typed_source_path(tmp_path: Path) -> N
 
     assert isinstance(result.outcome, Succeeded)
     assert "Alternate source." in project.source_clean.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_release_action_passes_typed_mode_without_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = BookProject(tmp_path)
+    project.book_epub.parent.mkdir(parents=True)
+    project.book_epub.write_bytes(b"epub")
+    project.book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.book_yaml.write_text("title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8")
+    report = project.random_spotcheck_dir / "round_001/validation_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text('{"status":"PASS"}', encoding="utf-8")
+
+    def forbidden_state_access(self: BookProject) -> object:
+        raise AssertionError("release.prepare must not read pipeline_state.json")
+
+    monkeypatch.setattr(BookProject, "load_state", forbidden_state_access)
+    tool_context = SimpleNamespace(
+        project=project,
+        config=None,
+        services=SimpleNamespace(),
+        resolve=lambda relpath: (project.root / relpath).resolve(),
+    )
+    registry = build_action_registry(tool_context=tool_context)  # type: ignore[arg-type]
+
+    result = await registry.get("release.prepare").executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            action_id="release-1",
+            target_lang="zh-Hans",
+            publication_mode="public_domain",
+        ),
+        ReleaseInput(version="v0.0.1"),
+    )
+
+    assert isinstance(result.outcome, Succeeded)
+    assert tuple(project.release_dir.glob("*_v0.0.1.epub"))
 
 
 def test_action_prompt_registry_selects_by_capability_and_rejects_unknown() -> None:
