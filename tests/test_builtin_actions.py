@@ -9,6 +9,7 @@ import pytest
 
 from abi.actions.builtins.catalog import (
     AgentActionExecutor,
+    _prompt_snapshot,
     build_action_envelope,
     build_action_registry,
 )
@@ -202,12 +203,56 @@ def test_translation_prompt_requires_source_and_five_to_eight_style_rules() -> N
     assert "source => target" in rendered
     assert "Translate every" not in rendered
     assert "glob chapters" not in rendered
+    system = prompts.system_prompt("chapter.translate", valid)
+    assert "Source paragraph." in system
+    assert all(rule in system for rule in valid.style_rules)
+    assert "source => target" in system
+    assert "EPUB" not in system
+    assert "release" not in system.lower()
+    assert "quality gate" not in system.lower()
+    assert "skills/" not in system
     with pytest.raises(ValueError, match="5-8 style rules"):
         prompts.render(
             "chapter.translate",
             parameters,
             valid.model_copy(update={"style_rules": ("one", "two", "three", "four")}),
         )
+
+
+def test_prompt_snapshot_never_reads_legacy_pipeline_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = BookProject(tmp_path)
+    project.chapters_src.mkdir(parents=True)
+    (project.chapters_src / "001.md").write_text("Source paragraph.", encoding="utf-8")
+    project.style_guide.parent.mkdir(parents=True)
+    project.style_guide.write_text(
+        "\n".join(f"- rule {number}" for number in range(1, 6)), encoding="utf-8"
+    )
+
+    def forbidden_state_access() -> object:
+        raise AssertionError("Action prompts must not read pipeline_state.json")
+
+    monkeypatch.setattr(BookProject, "load_state", lambda self: forbidden_state_access())
+    context = ActionExecutionContext(
+        project=project,
+        run_id="run-1",
+        snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+        source_lang="en",
+        target_lang="zh-Hans",
+        book_slug="fixture",
+    )
+
+    prompt = _prompt_snapshot(
+        context,
+        ChapterBatchInput(chapters=("001",)),
+        capability="chapter.translate",
+    )
+
+    assert prompt.source_lang == "en"
+    assert prompt.target_lang == "zh-Hans"
+    assert prompt.book_slug == "fixture"
+    assert prompt.source_text == "## 001\nSource paragraph."
 
 
 @pytest.mark.parametrize(

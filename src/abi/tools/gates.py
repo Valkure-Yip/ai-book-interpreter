@@ -62,11 +62,16 @@ def make_gate_tools(
                 f"this Action is not allowed to write {path!r}; declare it in write_set"
             )
 
+    def require_reads(*paths: str) -> None:
+        for path in paths:
+            require_read(path)
+
     def publication_lint() -> str:
         """Run the publication-text lint over frontmatter/chapters/final/metadata.
 
         Writes output/publication_lint.json. Returns PASS or FAIL + hard errors.
         """
+        require_reads("frontmatter", "chapters/final", "metadata")
         require_write("output/publication_lint.json")
         from abi.epub.lint import publication_lint as _lint
 
@@ -78,6 +83,7 @@ def make_gate_tools(
 
         Writes output/asset_manifest_check.json. Returns PASS or FAIL.
         """
+        require_reads("frontmatter", "chapters/final", "assets")
         require_write("output/asset_manifest_check.json")
         from abi.epub.assets import asset_manifest_check as _check
 
@@ -89,6 +95,7 @@ def make_gate_tools(
 
         chapter_slugs: comma-separated NNN_slug stems; empty = first chapter.
         """
+        require_reads("chapters/final", "frontmatter", "metadata", "assets")
         require_write("preproduction/stage2_sample/sample_book.epub")
         from abi.epub.build import build_sample_epub as _build
 
@@ -98,6 +105,7 @@ def make_gate_tools(
 
     def build_epub() -> str:
         """Build the full EPUB from chapters/final/ into output/book.epub."""
+        require_reads("chapters/final", "frontmatter", "metadata", "assets")
         require_write("output/book.epub")
         from abi.epub.build import build_epub as _build
 
@@ -121,6 +129,7 @@ def make_gate_tools(
         Creates reviews/random_spotcheck/round_XXX/ with seed, manifest, strata,
         and per-agent sample lists. Returns the new round directory.
         """
+        require_reads("chapters/final")
         require_write("reviews/random_spotcheck")
         from abi.qa.sampler import select_random_review_passages as _select
 
@@ -138,6 +147,7 @@ def make_gate_tools(
         Enforces release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
         Writes validation_report.json. Returns PASS or FAIL.
         """
+        require_reads("reviews/random_spotcheck")
         require_write("reviews/random_spotcheck")
         from abi.qa.validator import validate_random_spotcheck as _validate
 
@@ -149,6 +159,7 @@ def make_gate_tools(
 
         Refuses unless the latest random spot-check validation PASSed.
         """
+        require_reads("output/book.epub", "reviews/random_spotcheck", "metadata")
         if permissions is not None and not (
             permissions.can_write("output/release")
             or permissions.can_write("output/private_artifacts")

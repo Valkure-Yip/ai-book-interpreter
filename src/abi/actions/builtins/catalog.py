@@ -42,7 +42,7 @@ from abi.types.orchestration import (
     RetryPolicySpec,
     Succeeded,
 )
-from abi.types.tools import ToolBinding
+from abi.types.tools import ReviewActionIdentity, ToolBinding
 
 
 class ActionToolRef(FrozenModel):
@@ -58,6 +58,7 @@ class ActionEnvelope(FrozenModel):
     parameters: FrozenModel
     tools: tuple[ActionToolRef, ...]
     permissions: ActionPathPermissions
+    gate_permissions: ActionPathPermissions | None = None
     skill_refs: tuple[str, ...]
 
 
@@ -142,7 +143,7 @@ _BUILTINS = (
              (), (), ("chapters/final", "frontmatter", "metadata", "assets"), ("output",), 0.0),
     _Builtin("review.spotcheck", "Run isolated stratified random review.", ReviewBatchInput,
              ActionKind.COMPOSITE, "epub.build", "reviews/random_spotcheck", "reviews/random_spotcheck",
-             ("read_file", "write_file", "grep", "select_random_review_passages",
+             ("read_file", "grep", "select_random_review_passages",
               "validate_random_spotcheck", "spawn_review_agent"), _QUALITY_SKILLS,
              ("chapters/src", "chapters/final", "references", "skills", "output"),
              ("reviews/random_spotcheck",), 2.00),
@@ -241,14 +242,23 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
         if not isinstance(parameters, ReviewBatchInput):
             raise TypeError("chapter.review requires ReviewBatchInput")
         read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
-        write_dirs = [path for path in write_dirs if path not in {"chapters/final", "qa/gates"}]
+        write_dirs = []
         for chapter in parameters.chapters:
             read_files.extend(
                 (f"chapters/src/{chapter}.md", f"chapters/translated/{chapter}.md")
             )
             write_files.extend(
-                (f"qa/gates/{chapter}.gate.md", f"chapters/final/{chapter}.md")
+                (
+                    f"qa/fidelity/{chapter}.md",
+                    f"qa/readability/{chapter}.md",
+                    f"qa/imagery/{chapter}.imagery.md",
+                    f"qa/terminology/{chapter}.md",
+                    f"qa/gates/{chapter}.gate.md",
+                    f"chapters/final/{chapter}.md",
+                )
             )
+    elif capability == "review.spotcheck":
+        write_dirs = []
 
     return ActionPathPermissions(
         read_files=tuple(read_files),
@@ -269,29 +279,36 @@ def build_action_envelope(capability: str, parameters: FrozenModel) -> ActionEnv
         raise TypeError(
             f"{capability} requires {item.input_model.__name__}; parse parameters before execution"
         )
+    permissions = _permissions_for(capability, parameters)
+    gate_permissions = None
+    if capability == "review.spotcheck":
+        gate_permissions = permissions.model_copy(
+            update={"write_dirs": ("reviews/random_spotcheck",)}
+        )
     return ActionEnvelope(
         capability=capability,
         parameters=parameters,
         tools=tuple(ActionToolRef(name=name) for name in item.tools),
-        permissions=_permissions_for(capability, parameters),
+        permissions=permissions,
+        gate_permissions=gate_permissions,
         skill_refs=item.skills,
     )
 
 
 def _prompt_snapshot(
-    project: BookProject,
+    context: ActionExecutionContext,
     parameters: FrozenModel,
     *,
     capability: str,
 ) -> ActionPromptSnapshot:
-    state = project.load_state() if project.exists() else None
+    project = context.project
     values = {
-        "source_lang": getattr(state, "source_lang", "source"),
-        "target_lang": getattr(state, "target_lang", "target"),
-        "source_target": getattr(state, "source_target", "source-target"),
-        "publication_mode": getattr(state, "publication_mode", "public_domain"),
-        "book_slug": getattr(state, "book_slug", "book"),
-        "profile": getattr(state, "profile", None),
+        "source_lang": context.source_lang,
+        "target_lang": context.target_lang,
+        "source_target": context.source_target,
+        "publication_mode": context.publication_mode,
+        "book_slug": context.book_slug,
+        "profile": context.profile,
     }
     if capability != "chapter.translate" or not isinstance(parameters, ChapterBatchInput):
         return ActionPromptSnapshot(**values)
@@ -373,15 +390,24 @@ class AgentActionExecutor:
                 )
             )
         envelope = build_action_envelope(self._capability, parameters)
+        parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
+        action_id = context.action_id or f"{self._capability}:{parameter_hash}"
         belt = build_belt(
             self._tool_context,
             get_run_snapshot=lambda: context.snapshot,
             permissions=envelope.permissions,
+            gate_permissions=envelope.gate_permissions,
+            action_identity=ReviewActionIdentity(
+                run_id=context.run_id,
+                action_id=action_id,
+                attempt=context.attempt,
+            ),
+            capability=self._capability,
         )
         try:
             tools = belt.resolve(tuple(tool.name for tool in envelope.tools))
             snapshot = _prompt_snapshot(
-                context.project,
+                context,
                 parameters,
                 capability=self._capability,
             )
@@ -398,10 +424,9 @@ class AgentActionExecutor:
             )
         from abi.providers.agent_runtime import AgentActionRequest
 
-        parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
         result = await self._tool_context.services.agent.run_action(
             AgentActionRequest(
-                system_prompt=self._prompts.system_prompt(snapshot),
+                system_prompt=self._prompts.system_prompt(self._capability, snapshot),
                 user_prompt=user_prompt,
                 tools=tools,
                 agent_name=self._capability.replace(".", "_"),

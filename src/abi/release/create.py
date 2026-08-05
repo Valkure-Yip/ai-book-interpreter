@@ -15,9 +15,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
+from pydantic import ValidationError
 
 from abi.epub.result import GateResult
 from abi.project.layout import BookProject
+from abi.types._base import FrozenModel
 
 _FS_ILLEGAL = re.compile(r'[\\/:*?"<>|]+')
 _VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
@@ -32,6 +34,21 @@ class _Mode:
     index_name: str
     epub_suffix: str
     producer: str
+
+
+class _ReleaseRecord(FrozenModel):
+    version: str
+    epub: str
+    created_at: str
+    status: str
+
+
+class _ReleaseState(FrozenModel):
+    book: str
+    producer: str
+    latest_status: str
+    latest_version: str
+    releases: tuple[_ReleaseRecord, ...]
 
 
 def _mode_for(project: BookProject) -> _Mode:
@@ -166,3 +183,43 @@ def create_release(project: BookProject, *, version: str | None = None) -> GateR
         details={"version": ver, "artifact": project.rel(epub_dest),
                  "private": mode.private},
     )
+
+
+def validate_created_release(project: BookProject, *, version: str) -> GateResult:
+    """Bind release evidence to the exact controller-requested version and artifact."""
+    normalized = version if version.startswith("v") else f"v{version}"
+    for directory, state_name in (
+        (project.release_dir, "release_state.json"),
+        (project.private_artifacts_dir, "private_artifact_state.json"),
+    ):
+        state_path = directory / state_name
+        if not state_path.exists():
+            continue
+        try:
+            state = _ReleaseState.model_validate_json(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValidationError):
+            continue
+        matches = tuple(
+            record
+            for record in state.releases
+            if record.version == normalized
+        )
+        if (
+            state.latest_status != "PASS"
+            or state.latest_version != normalized
+            or not matches
+            or state.releases[-1].version != normalized
+            or state.releases[-1].status != "PASS"
+        ):
+            continue
+        artifact_name = state.releases[-1].epub
+        if Path(artifact_name).name != artifact_name:
+            continue
+        artifact = directory / artifact_name
+        if artifact.is_file():
+            return GateResult(
+                True,
+                f"release {normalized} is bound to {project.rel(artifact)}",
+                details={"version": normalized, "artifact": project.rel(artifact)},
+            )
+    return GateResult(False, f"requested release {normalized} has no matching PASS artifact")

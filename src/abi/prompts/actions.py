@@ -57,7 +57,17 @@ class ActionPromptRegistry:
             lstrip_blocks=True,
         )
 
-    def system_prompt(self, snapshot: ActionPromptSnapshot) -> str:
+    def system_prompt(self, capability: str, snapshot: ActionPromptSnapshot) -> str:
+        if capability == "chapter.translate":
+            rules = "\n".join(f"- {rule}" for rule in snapshot.style_rules)
+            terms = "\n".join(f"- {term}" for term in snapshot.matched_terms) or "- (none)"
+            return (
+                f"Translate the authorized source from {snapshot.source_lang} to "
+                f"{snapshot.target_lang}. Return translation text only.\n\n"
+                f"Source:\n{snapshot.source_text}\n\n"
+                f"Style rules ({len(snapshot.style_rules)}):\n{rules}\n\n"
+                f"Matched terms:\n{terms}\n"
+            )
         return self._env.get_template("_system.md.j2").render(**snapshot.model_dump())
 
     def render(

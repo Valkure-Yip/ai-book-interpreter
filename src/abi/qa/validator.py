@@ -65,14 +65,23 @@ def _latest_round(project: BookProject):
 
 def _round_quality_passed(round_dir) -> bool:
     """Whether a prior round met the quality bar (independent of the consecutive
-    rounds requirement, to avoid a chicken-and-egg where no round can ever pass)."""
-    report = round_dir / "validation_report.json"
-    if not report.exists():
+    rounds requirement, recomputed from reviewer-owned summaries rather than a
+    potentially forged validation report."""
+    summaries = sorted((round_dir / "reviews").glob("*summary*.json"))
+    if len(summaries) < 2:
         return False
-    try:
-        return bool(json.loads(report.read_text(encoding="utf-8")).get("this_round_pass", False))
-    except Exception:
-        return False
+    evals: list[_AgentEval] = []
+    for summary in summaries:
+        try:
+            data = json.loads(summary.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        evals.append(_eval_agent(summary.stem, data))
+    return (
+        len(evals) >= 2
+        and all(item.ok for item in evals)
+        and min(item.confidence for item in evals) >= CONFIDENCE_FLOOR
+    )
 
 
 def validate_random_spotcheck(project: BookProject, *, require_pass: bool = True) -> GateResult:

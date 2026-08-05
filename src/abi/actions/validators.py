@@ -50,21 +50,6 @@ class _SpotcheckReport(FrozenModel):
     reasons: tuple[str, ...]
 
 
-class _ReleaseRecord(FrozenModel):
-    version: str
-    epub: str
-    created_at: str
-    status: str
-
-
-class _ReleaseState(FrozenModel):
-    book: str
-    producer: str
-    latest_status: str
-    latest_version: str
-    releases: tuple[_ReleaseRecord, ...]
-
-
 _ZERO_ISSUE_FIELDS = {
     "scope": "FULL_CHAPTER",
     "issues_found": "0",
@@ -329,6 +314,11 @@ def _validate_review_spotcheck(
 ) -> GateDecision:
     if invalid := _require_type("review.spotcheck", parameters, ReviewBatchInput):
         return invalid
+    from abi.qa.validator import validate_random_spotcheck
+
+    deterministic = validate_random_spotcheck(project, require_pass=True)
+    if not deterministic.ok:
+        return _fail("spotcheck_not_passed", deterministic.summary())
     rounds = tuple(sorted(project.random_spotcheck_dir.glob("round_*")))
     if not rounds:
         return _fail("spotcheck_round_missing", "At least one random spot-check round is required.")
@@ -336,7 +326,14 @@ def _validate_review_spotcheck(
     report = _read_model(report_path, _SpotcheckReport)
     if not isinstance(report, _SpotcheckReport):
         return _fail("spotcheck_report_invalid", "Latest validation_report.json is missing or invalid.")
-    if report.status.upper() != "PASS" or report.release_confidence < 0.80:
+    if (
+        report.status.upper() != "PASS"
+        or report.release_confidence < 0.80
+        or not report.this_round_pass
+        or report.current_run_pass_rounds_count < report.current_run_pass_rounds_required
+        or len(report.agents) < 2
+        or not all(agent.ok for agent in report.agents)
+    ):
         return _fail("spotcheck_not_passed", "Latest spot-check must PASS at confidence >= 0.80.")
     return _ok(project.rel(report_path))
 
@@ -361,14 +358,16 @@ def _validate_review_independent(
 def _validate_release_prepare(project: BookProject, parameters: FrozenModel) -> GateDecision:
     if invalid := _require_type("release.prepare", parameters, ReleaseInput):
         return invalid
-    for path in (
-        project.release_dir / "release_state.json",
-        project.private_artifacts_dir / "private_artifact_state.json",
-    ):
-        report = _read_model(path, _ReleaseState)
-        if isinstance(report, _ReleaseState) and report.latest_status.upper() == "PASS":
-            return _ok(project.rel(path))
-    return _fail("release_not_passed", "A release or private artifact PASS state is required.")
+    assert isinstance(parameters, ReleaseInput)
+    from abi.release.create import validate_created_release
+
+    result = validate_created_release(project, version=parameters.version)
+    if not result.ok:
+        return _fail("release_not_passed", result.summary())
+    artifact = result.details.get("artifact")
+    return _ok(str(artifact)) if isinstance(artifact, str) else _fail(
+        "release_not_passed", "Release validation did not identify an artifact."
+    )
 
 
 def _validate_output_finalize(project: BookProject, parameters: FrozenModel) -> GateDecision:

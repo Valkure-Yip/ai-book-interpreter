@@ -97,7 +97,7 @@ def test_epub_validator_accepts_existing_gate_report_shape(tmp_path: Path) -> No
     assert result.passed is True
 
 
-def test_spotcheck_validator_accepts_existing_report_shape(tmp_path: Path) -> None:
+def test_spotcheck_validator_rejects_agent_forged_pass_report(tmp_path: Path) -> None:
     project = scaffold_without_ledger(tmp_path)
     report = project.random_spotcheck_dir / "round_001/validation_report.json"
     report.parent.mkdir(parents=True)
@@ -119,7 +119,70 @@ def test_spotcheck_validator_accepts_existing_report_shape(tmp_path: Path) -> No
 
     result = validate_evidence("review.spotcheck", project, ReviewBatchInput())
 
+    assert result.passed is False
+    assert result.reason_code == "spotcheck_not_passed"
+
+
+def _write_passing_summary(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "average_score": 95,
+                "lowest_score": 93,
+                "open_p0_p1_p2": 0,
+                "confidence": 0.91,
+                "samples": [{"unit_id": "001:p1", "score": 93}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_spotcheck_validator_recomputes_two_rounds_from_agent_summaries(
+    tmp_path: Path,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    for round_name in ("round_001", "round_002"):
+        for label in ("agent_a", "agent_b"):
+            _write_passing_summary(
+                project.random_spotcheck_dir
+                / round_name
+                / "reviews"
+                / f"{label}_summary.json"
+            )
+    # Materialize the first deterministic report, then validate the latest round.
+    from abi.qa.validator import validate_random_spotcheck
+
+    second = project.random_spotcheck_dir / "round_002"
+    second.rename(project.random_spotcheck_dir / "pending_round_002")
+    assert validate_random_spotcheck(project).ok is False
+    (project.random_spotcheck_dir / "pending_round_002").rename(second)
+
+    result = validate_evidence("review.spotcheck", project, ReviewBatchInput())
+
     assert result.passed is True
+
+
+def test_spotcheck_validator_does_not_count_forged_prior_round(tmp_path: Path) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    forged = project.random_spotcheck_dir / "round_001/validation_report.json"
+    forged.parent.mkdir(parents=True)
+    forged.write_text(
+        json.dumps({"this_round_pass": True, "status": "PASS"}), encoding="utf-8"
+    )
+    for label in ("agent_a", "agent_b"):
+        _write_passing_summary(
+            project.random_spotcheck_dir
+            / "round_002"
+            / "reviews"
+            / f"{label}_summary.json"
+        )
+
+    result = validate_evidence("review.spotcheck", project, ReviewBatchInput())
+
+    assert result.passed is False
+    assert result.reason_code == "spotcheck_not_passed"
 
 
 def test_release_validator_accepts_existing_state_shape(tmp_path: Path) -> None:
@@ -146,6 +209,42 @@ def test_release_validator_accepts_existing_state_shape(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    result = validate_evidence("release.prepare", project, ReleaseInput())
+    (project.release_dir / "fixture_v0.0.1.epub").write_bytes(b"released")
+    result = validate_evidence("release.prepare", project, ReleaseInput(version="v0.0.1"))
 
     assert result.passed is True
+
+
+def test_release_validator_rejects_old_pass_when_requested_version_is_missing(
+    tmp_path: Path,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    state = project.release_dir / "release_state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps(
+            {
+                "book": "fixture",
+                "producer": "ABI",
+                "latest_status": "PASS",
+                "latest_version": "v0.0.1",
+                "releases": [
+                    {
+                        "version": "v0.0.1",
+                        "epub": "fixture_v0.0.1.epub",
+                        "created_at": "2026-08-05T00:00:00+00:00",
+                        "status": "PASS",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project.release_dir / "fixture_v0.0.1.epub").write_bytes(b"old")
+
+    result = validate_evidence(
+        "release.prepare", project, ReleaseInput(version="v0.0.2")
+    )
+
+    assert result.passed is False
+    assert result.reason_code == "release_not_passed"

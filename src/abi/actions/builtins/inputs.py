@@ -81,32 +81,17 @@ class ReviewBatchInput(FrozenModel):
 
 
 class BuildEpubInput(FrozenModel):
-    """Optional chapter subset and canonical output for an EPUB build."""
-
-    chapter_slugs: tuple[str, ...] = ()
-    output_relpath: str = "output/book.epub"
-
-    @field_validator("chapter_slugs")
-    @classmethod
-    def _portable_unique_chapters(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        return ChapterBatchInput._portable_unique_chapters(value) if value else value
-
-    @field_validator("output_relpath")
-    @classmethod
-    def _portable_output_path(cls, value: str) -> str:
-        return canonical_artifact_key(value)
+    """Fixed ABI EPUB build; paths and chapter selection are controller-owned."""
 
 
 class ReleaseInput(FrozenModel):
-    """Optional semantic release version chosen by policy."""
+    """Semantic release version chosen by controller policy."""
 
-    version: str | None = None
+    version: str
 
     @field_validator("version")
     @classmethod
-    def _portable_version(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def _portable_version(cls, value: str) -> str:
         if re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", value) is None:
             raise ValueError("version must use semantic form vN.N.N")
-        return value
+        return value if value.startswith("v") else f"v{value}"

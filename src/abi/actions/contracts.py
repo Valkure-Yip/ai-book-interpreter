@@ -22,6 +22,14 @@ class ActionExecutionContext:
     project: BookProject
     run_id: str
     snapshot: RunSnapshot
+    action_id: str = ""
+    attempt: int = 1
+    source_lang: str = "source"
+    target_lang: str = "target"
+    source_target: str = "source-target"
+    publication_mode: str = "public_domain"
+    book_slug: str = "book"
+    profile: str | None = None
 
 
 class ActionExecutor(Protocol):

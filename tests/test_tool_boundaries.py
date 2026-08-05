@@ -12,12 +12,14 @@ import pytest
 from pydantic import ValidationError
 
 from abi.providers.agent_runtime.tooling import to_langchain_tool
+from abi.providers.llm.budget import BudgetGate
 from abi.tools.belt import build_belt
 from abi.tools.content import make_content_tools
+from abi.tools.permissions import ActionPathPermissions
 from abi.tools.subagent import make_subagent_tools
 from abi.types._base import FrozenModel
 from abi.types.orchestration import RunSnapshot, RunStatus, Succeeded
-from abi.types.tools import ToolBinding
+from abi.types.tools import ReviewActionIdentity, ToolBinding
 
 
 class _Project:
@@ -149,7 +151,7 @@ async def test_actual_start_hook_runs_after_schema_validation_for_all_callable_s
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_uses_fresh_threads_unless_explicitly_resumed(
+async def test_review_subagent_uses_abi_owned_stable_distinct_threads(
     tmp_path: Path,
 ) -> None:
     requests: list[object] = []
@@ -163,20 +165,119 @@ async def test_review_subagent_uses_fresh_threads_unless_explicitly_resumed(
 
     context = _context(tmp_path)
     context.services = SimpleNamespace(agent=RecordingAgent())
-    spawn = make_subagent_tools(context)[0].callable  # type: ignore[arg-type]
+    spawn = make_subagent_tools(
+        context,
+        permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
+        action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1"),
+        capability="review.independent",
+    )[0].callable  # type: ignore[arg-type]
 
     first = json.loads(await spawn(agent_label="agent_a", instructions="review round one"))
-    second = json.loads(await spawn(agent_label="agent_a", instructions="review round two"))
-    resumed = json.loads(
-        await spawn(
-            agent_label="agent_a",
-            instructions="continue round one",
-            resume_thread_id=first["thread_id"],
-        )
-    )
+    second = json.loads(await spawn(agent_label="agent_b", instructions="review round two"))
 
     assert first["thread_id"] != second["thread_id"]
-    assert resumed["thread_id"] == first["thread_id"]
+    assert first["thread_id"] == "review:run-1:review-1:agent_a"
+    assert second["thread_id"] == "review:run-1:review-1:agent_b"
     assert requests[0].resume is None  # type: ignore[union-attr]
     assert requests[1].resume is None  # type: ignore[union-attr]
-    assert requests[2].resume.kind == "checkpoint"  # type: ignore[union-attr]
+    with pytest.raises(TypeError, match="resume_thread_id"):
+        await spawn(
+            agent_label="agent_a",
+            instructions="attempt fake resume",
+            resume_thread_id="attacker-controlled",
+        )
+
+
+@pytest.mark.asyncio
+async def test_review_subagent_retry_keeps_thread_and_requests_checkpoint_resume(
+    tmp_path: Path,
+) -> None:
+    requests: list[object] = []
+
+    class RecordingAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            return SimpleNamespace(outcome=Succeeded(staging_relpath="reviews/agent_a/review.md"))
+
+    context = _context(tmp_path)
+    context.services = SimpleNamespace(agent=RecordingAgent())
+    spawn = make_subagent_tools(
+        context,
+        permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
+        action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1", attempt=2),
+        capability="review.independent",
+    )[0].callable  # type: ignore[arg-type]
+
+    payload = json.loads(await spawn(agent_label="agent_a", instructions="continue"))
+
+    assert payload["thread_id"] == "review:run-1:review-1:agent_a"
+    assert requests[0].resume.kind == "checkpoint"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
+    tmp_path: Path,
+) -> None:
+    requests: list[object] = []
+
+    class RecordingAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            return SimpleNamespace(outcome=Succeeded(staging_relpath="review"))
+
+    context = _context(tmp_path)
+    context.services = SimpleNamespace(agent=RecordingAgent())
+    context.project.random_spotcheck_dir = tmp_path / "reviews/random_spotcheck"
+    samples = tmp_path / "reviews/random_spotcheck/round_001/samples/agent_a"
+    samples.mkdir(parents=True)
+    (samples / "samples.md").write_text("sample", encoding="utf-8")
+    (samples / "samples.json").write_text("[]", encoding="utf-8")
+    permissions = ActionPathPermissions(read_dirs=("reviews",), write_dirs=())
+    spawn = make_subagent_tools(
+        context,
+        permissions=permissions,
+        action_identity=ReviewActionIdentity(run_id="run-1", action_id="spotcheck-1"),
+        capability="review.spotcheck",
+    )[0].callable  # type: ignore[arg-type]
+
+    await spawn(agent_label="agent_a", instructions="review")
+    write_file = next(tool for tool in requests[0].tools if tool.name == "write_file")  # type: ignore[union-attr]
+    write_file.callable(
+        path="reviews/random_spotcheck/round_001/reviews/agent_a_summary.json",
+        content="{}",
+    )
+    with pytest.raises(PermissionError, match="not allowed to write"):
+        write_file.callable(
+            path="reviews/random_spotcheck/round_001/validation_report.json",
+            content='{"status":"PASS"}',
+        )
+
+
+@pytest.mark.asyncio
+async def test_composite_reviewers_share_the_run_budget_gate(tmp_path: Path) -> None:
+    budget = BudgetGate(None)
+    observed_budget_ids: list[int] = []
+
+    class BudgetAwareAgent:
+        def __init__(self) -> None:
+            self.budget = budget
+
+        async def run_action(self, request: object) -> object:
+            observed_budget_ids.append(id(self.budget))
+            return SimpleNamespace(outcome=Succeeded(staging_relpath="review"))
+
+    context = _context(tmp_path)
+    agent = BudgetAwareAgent()
+    context.services = SimpleNamespace(agent=agent, budget=budget)
+    spawn = make_subagent_tools(
+        context,
+        permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
+        action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1"),
+        capability="review.independent",
+    )[0].callable  # type: ignore[arg-type]
+
+    first = json.loads(await spawn(agent_label="agent_a", instructions="review"))
+    second = json.loads(await spawn(agent_label="agent_b", instructions="review"))
+
+    assert first["thread_id"] != second["thread_id"]
+    assert observed_budget_ids == [id(context.services.budget), id(context.services.budget)]
