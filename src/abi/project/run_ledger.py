@@ -25,6 +25,7 @@ from abi.types.orchestration import (
     GateEvidence,
     IncidentView,
     PlanPatch,
+    PlanRejectionView,
     RunSnapshot,
     RunStatus,
 )
@@ -238,6 +239,41 @@ class RunLedger:
                 (run_id, version, patch.objective, patch.rationale, patch.model_dump_json(), now),
             )
         return PlanVersionRecord(run_id=run_id, version=version, patch=patch, created_at=_parse_time(now))
+
+    async def record_plan_rejection(
+        self, run_id: str, *, plan_version: int, reason_codes: tuple[str, ...]
+    ) -> PlanRejectionView:
+        """Append deterministic policy feedback for the next bounded Planner context."""
+        if plan_version < 1:
+            raise LedgerTransitionError(
+                "plan rejection needs a positive plan version; record feedback for an appended plan"
+            )
+        if not reason_codes:
+            raise LedgerTransitionError(
+                "plan rejection needs at least one reason; record the deterministic policy reason code"
+            )
+        if len(set(reason_codes)) != len(reason_codes):
+            raise LedgerTransitionError(
+                "plan rejection reason codes repeat; deduplicate the stable policy reasons before recording"
+            )
+        rejection = PlanRejectionView(plan_version=plan_version, reason_codes=reason_codes)
+        now = self._now()
+        async with self.transaction() as db:
+            await self._require_run(db, run_id)
+            cursor = await db.execute(
+                "SELECT 1 FROM plan_versions WHERE run_id = ? AND version = ?",
+                (run_id, plan_version),
+            )
+            if await cursor.fetchone() is None:
+                raise LedgerTransitionError(
+                    f"run {run_id} has no durable plan {plan_version}; append the plan before recording its rejection"
+                )
+            await db.execute(
+                "INSERT INTO plan_rejections (rejection_id, run_id, plan_version, reason_codes_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(uuid4()), run_id, plan_version, _dump_tuple(reason_codes), now),
+            )
+        return rejection
 
     async def authorize_actions(
         self, run_id: str, actions: Sequence[AuthorizedAction]
@@ -726,7 +762,9 @@ class RunLedger:
             )
         return await self.get_run(run_id)
 
-    async def load_snapshot(self, run_id: str) -> RunSnapshot:
+    async def load_snapshot(self, run_id: str, *, rejection_limit: int | None = 20) -> RunSnapshot:
+        if rejection_limit is not None and rejection_limit < 0:
+            raise ValueError("rejection_limit must be non-negative; configure a valid snapshot sample count")
         run = await self.get_run(run_id)
         actions = await self._fetch_all(
             "SELECT * FROM actions WHERE run_id = ? ORDER BY action_id", (run_id,)
@@ -745,6 +783,15 @@ class RunLedger:
             "SELECT * FROM incidents WHERE run_id = ? AND status = 'OPEN' ORDER BY created_at, incident_id",
             (run_id,),
         )
+        rejection_sql = (
+            "SELECT plan_version, reason_codes_json FROM plan_rejections WHERE run_id = ? "
+            "ORDER BY created_at DESC, rejection_id DESC"
+        )
+        rejection_params: tuple[object, ...] = (run_id,)
+        if rejection_limit is not None:
+            rejection_sql += " LIMIT ?"
+            rejection_params = (run_id, rejection_limit)
+        rejections = await self._fetch_all(rejection_sql, rejection_params)
         spent_row = await self._fetch_one(
             "SELECT COALESCE(SUM(amount_usd), 0) AS spent FROM budget_entries WHERE run_id = ?", (run_id,)
         )
@@ -790,6 +837,13 @@ class RunLedger:
                     action_id=row["action_id"],
                 )
                 for row in incidents
+            ),
+            plan_rejections=tuple(
+                PlanRejectionView(
+                    plan_version=row["plan_version"],
+                    reason_codes=tuple(json.loads(row["reason_codes_json"])),
+                )
+                for row in rejections
             ),
             remaining_budget_usd=remaining,
             failure_signatures=tuple(

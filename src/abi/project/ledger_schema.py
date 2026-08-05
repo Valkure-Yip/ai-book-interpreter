@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS plan_versions (
     UNIQUE (run_id, version)
 );
 
+CREATE TABLE IF NOT EXISTS plan_rejections (
+    rejection_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    plan_version INTEGER NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id, plan_version) REFERENCES plan_versions(run_id, version)
+);
+
 CREATE TABLE IF NOT EXISTS actions (
     action_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id),

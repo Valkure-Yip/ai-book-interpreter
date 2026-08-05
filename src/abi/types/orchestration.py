@@ -121,6 +121,13 @@ class IncidentView(FrozenModel):
     action_id: str | None = None
 
 
+class PlanRejectionView(FrozenModel):
+    """One persisted policy rejection returned as Planner repair feedback."""
+
+    plan_version: int = Field(ge=1)
+    reason_codes: tuple[str, ...] = Field(min_length=1)
+
+
 class ActionView(FrozenModel):
     action_id: str
     capability: str
@@ -143,6 +150,7 @@ class RunSnapshot(FrozenModel):
     artifacts: tuple[ArtifactRef, ...] = ()
     gate_evidence: tuple[GateEvidence, ...] = ()
     incidents: tuple[IncidentView, ...] = ()
+    plan_rejections: tuple[PlanRejectionView, ...] = ()
     eligible_actions: tuple[EligibleAction, ...] = ()
     remaining_budget_usd: float | None = Field(default=None, ge=0)
     failure_signatures: tuple[str, ...] = ()

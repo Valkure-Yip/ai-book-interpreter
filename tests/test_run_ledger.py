@@ -118,6 +118,65 @@ async def test_commit_success_is_exactly_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plan_rejection_round_trips_into_the_durable_snapshot(tmp_path: Path) -> None:
+    """Catch rejected plan reasons disappearing before the next Planner invocation."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        run_id = await ledger.create_run(_run_seed())
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="ingest source",
+                proposed_actions=(
+                    ProposedAction(proposal_id="proposal-1", capability="source.ingest"),
+                ),
+                rationale="seed plan for the rejection record",
+            ),
+        )
+
+        rejection = await ledger.record_plan_rejection(
+            run_id, plan_version=1, reason_codes=("invalid_horizon", "budget_exceeded")
+        )
+        snapshot = await ledger.load_snapshot(run_id)
+
+    assert rejection.plan_version == 1
+    assert rejection.reason_codes == ("invalid_horizon", "budget_exceeded")
+    assert snapshot.plan_rejections == (rejection,)
+
+
+@pytest.mark.asyncio
+async def test_plan_rejection_requires_a_persisted_plan_and_unique_reasons(tmp_path: Path) -> None:
+    """Catch invalid rejection input leaving a durable Planner feedback record behind."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        run_id = await ledger.create_run(_run_seed())
+
+        with pytest.raises(LedgerTransitionError, match="no durable plan"):
+            await ledger.record_plan_rejection(
+                run_id, plan_version=1, reason_codes=("invalid_horizon",)
+            )
+        with pytest.raises(LedgerTransitionError, match="at least one reason"):
+            await ledger.record_plan_rejection(run_id, plan_version=1, reason_codes=())
+
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="ingest source",
+                proposed_actions=(
+                    ProposedAction(proposal_id="proposal-1", capability="source.ingest"),
+                ),
+                rationale="seed plan for validation",
+            ),
+        )
+        with pytest.raises(LedgerTransitionError, match="deduplicate"):
+            await ledger.record_plan_rejection(
+                run_id,
+                plan_version=1,
+                reason_codes=("invalid_horizon", "invalid_horizon"),
+            )
+
+        assert (await ledger.load_snapshot(run_id)).plan_rejections == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "relpath",
     (
