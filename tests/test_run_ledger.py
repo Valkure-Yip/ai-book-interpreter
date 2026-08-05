@@ -12,17 +12,32 @@ from abi.project.run_ledger import (
     LedgerConflictError,
     LedgerError,
     LedgerTransitionError,
+    PromotionIntent,
     RunLedger,
     RunSeed,
     SuccessCommit,
 )
 from abi.types.orchestration import (
     ActionStatus,
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    AttemptOutcomeReceiptPayload,
     AuthorizedAction,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
+    GateArtifactIdentity,
+    GateDecision,
     GateEvidence,
+    GateReceiptPayload,
     PlanPatch,
     ProposedAction,
+    RetryPolicySpec,
     RunStatus,
+    Succeeded,
+    canonical_bundle_json,
+    canonical_manifest_json,
+    canonical_model_json,
+    sha256_canonical_json,
 )
 
 
@@ -30,18 +45,42 @@ def _run_seed() -> RunSeed:
     return RunSeed(run_id="run-1", budget_usd=5.0)
 
 
-def _action(action_id: str = "a1") -> AuthorizedAction:
+def _action(
+    action_id: str = "a1", *, canonical_relpath: str | None = None
+) -> AuthorizedAction:
+    canonical_relpath = canonical_relpath or f"source/{action_id}.json"
+    manifest = ExpectedArtifactManifest(
+        action_id=action_id,
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath=canonical_relpath,
+                media_type="application/json",
+                evidence_role="source_manifest",
+            ),
+        ),
+    )
+    retry = RetryPolicySpec(max_attempts=1)
     return AuthorizedAction(
         action_id=action_id,
         proposal_id="proposal-1",
         plan_version=1,
         capability="source.ingest",
         parameters_json='{"source_relpath":"source/raw.txt"}',
+        write_set=("source",),
         idempotency_key=f"action:{action_id}",
+        expected_artifact_manifest=manifest,
+        expected_artifact_manifest_digest=sha256_canonical_json(
+            canonical_manifest_json(manifest)
+        ),
+        expected_evidence_refs=("source_manifest",),
+        retry_policy=retry,
+        retry_policy_fingerprint=sha256_canonical_json(canonical_model_json(retry)),
     )
 
 
-async def _seed_authorized_action(ledger: RunLedger, action_id: str = "a1") -> None:
+async def _seed_authorized_action(
+    ledger: RunLedger, action_id: str = "a1", *, canonical_relpath: str | None = None
+) -> None:
     run_id = await ledger.create_run(_run_seed())
     await ledger.append_plan(
         run_id,
@@ -51,21 +90,89 @@ async def _seed_authorized_action(ledger: RunLedger, action_id: str = "a1") -> N
             rationale="first durable plan",
         ),
     )
-    await ledger.authorize_actions(run_id, (_action(action_id),))
+    await ledger.authorize_actions(
+        run_id, (_action(action_id, canonical_relpath=canonical_relpath),)
+    )
     await ledger.start_attempt(action_id)
 
 
 async def _seed_promotion_intent(ledger: RunLedger) -> str:
     await _seed_authorized_action(ledger)
-    intent = await ledger.create_promotion_intent(
-        action_id="a1",
+    return (
+        await _record_gate_intent(
+            ledger,
+            action_id="a1",
+            canonical_relpath="source/a1.json",
+            checksum="a" * 64,
+        )
+    ).intent_id
+
+
+async def _record_gate_intent(
+    ledger: RunLedger,
+    *,
+    action_id: str,
+    canonical_relpath: str,
+    checksum: str,
+) -> PromotionIntent:
+    bundle = ArtifactBundle(
+        action_id=action_id,
         attempt=1,
-        staged_relpath="state/staging/a1/1/source.json",
-        canonical_relpath="source/a1.json",
-        checksum="abc",
-        media_type="application/json",
+        entries=(
+            ArtifactBundleEntry(
+                staged_relpath=f"state/staging/{action_id}/1/{canonical_relpath}",
+                canonical_relpath=canonical_relpath,
+                media_type="application/json",
+                evidence_role="source_manifest",
+            ),
+        ),
     )
-    return intent.intent_id
+    outcome = Succeeded(artifact_bundle=bundle, evidence_refs=("source_manifest",))
+    outcome_json = canonical_model_json(outcome)
+    bundle_json = canonical_bundle_json(bundle)
+    bundle_digest = sha256_canonical_json(bundle_json)
+    await ledger.record_attempt_outcome(
+        AttemptOutcomeReceiptPayload(
+            action_id=action_id,
+            attempt=1,
+            canonical_outcome_json=outcome_json,
+            outcome_digest=sha256_canonical_json(outcome_json),
+            canonical_bundle_json=bundle_json,
+            bundle_digest=bundle_digest,
+            evidence_refs=("source_manifest",),
+        )
+    )
+    decision = GateDecision(
+        passed=True,
+        reason_code="evidence_valid",
+        message="valid",
+        validator_id="source.ingest",
+        validator_version="1",
+        bundle_digest=bundle_digest,
+        artifact_checksums=(checksum,),
+        evidence_refs=("source_manifest",),
+    )
+    decision_json = canonical_model_json(decision)
+    _, intents = await ledger.create_gate_receipt_and_bundle_intents(
+        GateReceiptPayload(
+            action_id=action_id,
+            attempt=1,
+            validator_id="source.ingest",
+            validator_version="1",
+            canonical_gate_decision_json=decision_json,
+            gate_decision_digest=sha256_canonical_json(decision_json),
+            bundle_digest=bundle_digest,
+            artifacts=(
+                GateArtifactIdentity(
+                    staged_relpath=f"state/staging/{action_id}/1/{canonical_relpath}",
+                    canonical_relpath=canonical_relpath,
+                    checksum=checksum,
+                ),
+            ),
+            evidence_refs=("source_manifest",),
+        )
+    )
+    return intents[0]
 
 
 def _success_commit(
@@ -680,13 +787,10 @@ async def test_ledger_rejects_nonportable_canonical_reservation_key_without_muta
         await _seed_authorized_action(ledger)
 
         with pytest.raises(ValueError):
-            await ledger.create_promotion_intent(
-                action_id="a1",
-                attempt=1,
-                staged_relpath="state/staging/a1/1/source.json",
+            ExpectedArtifact(
                 canonical_relpath=canonical_relpath,
-                checksum="abc",
                 media_type="application/json",
+                evidence_role="source_manifest",
             )
 
         assert await ledger.promotion_intents() == ()
@@ -706,34 +810,30 @@ async def test_portable_lowercase_canonical_keys_are_reserved_verbatim_and_uniqu
 ) -> None:
     """Catch a validated canonical key being normalized or reserved by two actions."""
     async with RunLedger.open(tmp_path / "run.db") as ledger:
-        await _seed_authorized_action(ledger)
-        first = await ledger.create_promotion_intent(
+        await _seed_authorized_action(ledger, canonical_relpath=canonical_relpath)
+        first = await _record_gate_intent(
+            ledger,
             action_id="a1",
-            attempt=1,
-            staged_relpath="state/staging/a1/1/source.json",
             canonical_relpath=canonical_relpath,
-            checksum="abc",
-            media_type="application/json",
+            checksum="a" * 64,
         )
-        replay = await ledger.create_promotion_intent(
+        replay = await _record_gate_intent(
+            ledger,
             action_id="a1",
-            attempt=1,
-            staged_relpath="state/staging/a1/1/source.json",
             canonical_relpath=canonical_relpath,
-            checksum="abc",
-            media_type="application/json",
+            checksum="a" * 64,
         )
-        await ledger.authorize_actions("run-1", (_action("a2"),))
+        await ledger.authorize_actions(
+            "run-1", (_action("a2", canonical_relpath=canonical_relpath),)
+        )
         await ledger.start_attempt("a2")
 
         with pytest.raises(LedgerConflictError, match="choose the canonical artifact"):
-            await ledger.create_promotion_intent(
+            await _record_gate_intent(
+                ledger,
                 action_id="a2",
-                attempt=1,
-                staged_relpath="state/staging/a2/1/source.json",
                 canonical_relpath=canonical_relpath,
-                checksum="different",
-                media_type="application/json",
+                checksum="b" * 64,
             )
 
         assert replay.intent_id == first.intent_id
@@ -858,12 +958,12 @@ async def test_attempt_outcomes_follow_legal_action_transitions(tmp_path: Path) 
         await _seed_authorized_action(ledger)
 
         finished = await ledger.finish_attempt(
-            "a1", attempt=1, status=ActionStatus.REPAIR_REQUIRED, failure_signature="terms"
+            "a1", attempt=1, status=ActionStatus.PERMANENT_FAILED, failure_signature="terms"
         )
 
-        assert finished.status is ActionStatus.REPAIR_REQUIRED
+        assert finished.status is ActionStatus.PERMANENT_FAILED
         snapshot = await ledger.load_snapshot("run-1")
-        assert snapshot.actions[0].status is ActionStatus.REPAIR_REQUIRED
+        assert snapshot.actions[0].status is ActionStatus.PERMANENT_FAILED
         assert snapshot.failure_signatures == ("terms",)
 
 

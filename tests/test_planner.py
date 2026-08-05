@@ -21,14 +21,20 @@ from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     ActionSpec,
     ArtifactRef,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
     GateDecision,
     GateEvidence,
     PlanningContext,
     PlanPatch,
     PlanRejectionView,
     ProposedAction,
+    RetryPolicySpec,
     RunSnapshot,
     RunStatus,
+    canonical_manifest_json,
+    canonical_model_json,
+    sha256_canonical_json,
 )
 
 
@@ -44,6 +50,21 @@ async def _execute_unused(
 
 def _validate_unused(project: object, parameters: FrozenModel) -> GateDecision:
     return GateDecision(passed=True, reason_code="ok", message="valid")
+
+
+def _expand_unused(
+    capability: str, action_id: str, parameters: FrozenModel
+) -> ExpectedArtifactManifest:
+    return ExpectedArtifactManifest(
+        action_id=action_id,
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath="source/manifest.json",
+                media_type="application/json",
+                evidence_role="source_manifest",
+            ),
+        ),
+    )
 
 
 def _registry() -> ActionRegistry:
@@ -63,6 +84,7 @@ def _registry() -> ActionRegistry:
             input_model=EmptyInput,
             executor=_execute_unused,
             validator=_validate_unused,
+            effect_expander=_expand_unused,
         )
     )
     return registry
@@ -88,6 +110,7 @@ def _artifact_gated_registry() -> ActionRegistry:
             input_model=EmptyInput,
             executor=_execute_unused,
             validator=_validate_unused,
+            effect_expander=_expand_unused,
         )
     )
     return registry
@@ -105,6 +128,9 @@ async def _seed_committed_artifacts(ledger: RunLedger, body: str) -> None:
     )
     from abi.types.orchestration import AuthorizedAction
 
+    manifest = _expand_unused("source.ingest", "ingest-1", EmptyInput())
+    retry = RetryPolicySpec(max_attempts=1)
+
     await ledger.authorize_actions(
         "run-1",
         (
@@ -115,6 +141,14 @@ async def _seed_committed_artifacts(ledger: RunLedger, body: str) -> None:
                 capability="source.ingest",
                 parameters_json="{}",
                 idempotency_key="ingest-1",
+                expected_artifact_manifest=manifest,
+                expected_artifact_manifest_digest=sha256_canonical_json(
+                    canonical_manifest_json(manifest)
+                ),
+                retry_policy=retry,
+                retry_policy_fingerprint=sha256_canonical_json(
+                    canonical_model_json(retry)
+                ),
             ),
         ),
     )

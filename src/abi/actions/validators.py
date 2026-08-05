@@ -1,12 +1,11 @@
-"""Exhaustive, fail-closed evidence validators for registered capabilities."""
+"""Fail-closed deterministic validators over one attempt's evidence overlay."""
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Mapping
-from pathlib import Path
-
-from pydantic import Field, ValidationError
+from collections.abc import Callable, Mapping
+from typing import Any, cast
 
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
@@ -17,412 +16,442 @@ from abi.actions.builtins.inputs import (
     ReviewBatchInput,
     SourceIngestInput,
     SourceSplitInput,
+    SpotcheckInput,
 )
 from abi.actions.contracts import ActionValidator
-from abi.project.layout import BookProject
+from abi.actions.effects import expand_expected_artifacts
+from abi.actions.evidence import StagingEvidenceView
 from abi.types._base import FrozenModel
-from abi.types.orchestration import GateDecision
+from abi.types.orchestration import ArtifactBundle, GateDecision
+
+Validator = Callable[[StagingEvidenceView, FrozenModel, ArtifactBundle], GateDecision]
+_VERSION = "attempt-evidence-v1"
 
 
-class _GateReport(FrozenModel):
-    ok: bool
-    message: str
-    hard_errors: int = 0
-    errors: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
-    details: dict[str, object] = Field(default_factory=dict)
-
-
-class _SpotcheckAgent(FrozenModel):
-    label: str
-    ok: bool
-    confidence: float
-
-
-class _SpotcheckReport(FrozenModel):
-    round: str
-    status: str
-    release_confidence: float
-    this_round_pass: bool
-    current_run_pass_rounds_count: int
-    current_run_pass_rounds_required: int
-    agents: tuple[_SpotcheckAgent, ...]
-    reasons: tuple[str, ...]
-
-
-_ZERO_ISSUE_FIELDS = {
-    "scope": "FULL_CHAPTER",
-    "issues_found": "0",
-    "fixes_applied": "0",
-    "unresolved_blocking_issues": "0",
-    "latest_round_status": "PASS",
-    "allow_next_chapter": "true",
-}
-
-
-def _ok(*evidence_refs: str) -> GateDecision:
+def _decision(
+    view: StagingEvidenceView,
+    *,
+    passed: bool,
+    reason_code: str,
+    message: str,
+    validator_id: str,
+    evidence_refs: tuple[str, ...] = (),
+) -> GateDecision:
     return GateDecision(
-        passed=True,
-        reason_code="evidence_valid",
-        message="Deterministic evidence satisfies the capability contract.",
+        passed=passed,
+        reason_code=reason_code,
+        message=message,
+        validator_id=validator_id,
+        validator_version=_VERSION,
+        bundle_digest=view.bundle_digest,
+        artifact_checksums=view.artifact_checksums,
         evidence_refs=evidence_refs,
     )
 
 
-def _fail(reason_code: str, message: str) -> GateDecision:
-    return GateDecision(passed=False, reason_code=reason_code, message=message)
-
-
-def _wrong_parameters(capability: str, expected: type[FrozenModel]) -> GateDecision:
-    return _fail(
-        "invalid_validator_parameters",
-        f"{capability} evidence requires {expected.__name__}; parse the Action parameters first.",
-    )
-
-
-def _require_type(
+def _validate_expected(
     capability: str,
+    view: StagingEvidenceView,
     parameters: FrozenModel,
-    expected: type[FrozenModel],
+    bundle: ArtifactBundle,
 ) -> GateDecision | None:
-    if not isinstance(parameters, expected):
-        return _wrong_parameters(capability, expected)
     try:
-        expected.model_validate(parameters.model_dump())
-    except ValidationError:
-        return _wrong_parameters(capability, expected)
+        expected = expand_expected_artifacts(capability, bundle.action_id, parameters)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        return _decision(
+            view,
+            passed=False,
+            reason_code="invalid_validator_parameters",
+            message=f"{exc}; parse typed parameters and register exact effects.",
+            validator_id=capability,
+        )
+    actual = tuple(
+        (entry.canonical_relpath, entry.media_type, entry.evidence_role, entry.metadata)
+        for entry in bundle.entries
+    )
+    required = tuple(
+        (entry.canonical_relpath, entry.media_type, entry.evidence_role, entry.metadata)
+        for entry in expected.entries
+    )
+    if actual != required:
+        return _decision(
+            view,
+            passed=False,
+            reason_code="artifact_effect_mismatch",
+            message="Bundle entries do not exactly equal the parameter-expanded manifest.",
+            validator_id=capability,
+        )
+    missing = tuple(entry.canonical_relpath for entry in bundle.entries if not view.exists(entry.canonical_relpath))
+    if missing:
+        return _decision(
+            view,
+            passed=False,
+            reason_code="staged_evidence_missing",
+            message=f"Missing current attempt evidence: {', '.join(missing)}",
+            validator_id=capability,
+        )
     return None
 
 
-def _normalize_line(line: str) -> str:
-    line = re.sub(r"[*`]", "", line)
-    return re.sub(r"^\s*[#>\-]+\s*", "", line)
-
-
-def _field_values(text: str, field: str) -> tuple[str, ...]:
-    pattern = re.compile(rf"^\s*{field}\s*:\s*(.+?)\s*$", flags=re.IGNORECASE)
-    return tuple(
-        match.group(1).strip().strip('"').strip()
-        for line in text.splitlines()
-        if (match := pattern.match(_normalize_line(line))) is not None
-    )
-
-
-def _contains_pass(text: str, *, key: str = "result") -> bool:
-    values = _field_values(text, key)
-    return bool(values) and values[-1].upper() == "PASS"
-
-
-def _has_zero_issue_pass(text: str) -> bool:
-    return all(
-        (values := _field_values(text, field))
-        and values[-1].lower() == expected.lower()
-        for field, expected in _ZERO_ISSUE_FIELDS.items()
-    )
-
-
-def _read_model(path: Path, model: type[FrozenModel]) -> FrozenModel | None:
-    if not path.exists():
-        return None
-    try:
-        return model.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, ValidationError):
-        return None
-
-
-def _validate_source_ingest(
-    project: BookProject, parameters: FrozenModel
+def _generic(
+    capability: str,
+    view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
 ) -> GateDecision:
-    if invalid := _require_type("source.ingest", parameters, SourceIngestInput):
+    if invalid := _validate_expected(capability, view, parameters, bundle):
         return invalid
-    missing = tuple(
-        project.rel(path)
-        for path in (project.source_clean, project.source_manifest)
-        if not path.exists()
+    refs = tuple(entry.canonical_relpath for entry in bundle.entries)
+    return _decision(
+        view,
+        passed=True,
+        reason_code="evidence_valid",
+        message="Current attempt evidence exactly satisfies the registered manifest.",
+        validator_id=capability,
+        evidence_refs=refs,
     )
-    if missing:
-        return _fail("source_evidence_missing", f"Missing source evidence: {', '.join(missing)}")
-    return _ok(project.rel(project.source_clean), project.rel(project.source_manifest))
 
 
-def _validate_source_split(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("source.split", parameters, SourceSplitInput):
-        return invalid
-    chapters = tuple(sorted(project.chapters_src.glob("*.md")))
-    if not project.toc_json.exists() or not chapters:
-        return _fail(
-            "source_split_evidence_missing",
-            "source/toc.json and at least one chapters/src Markdown file are required.",
+def _source_ingest(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    if not isinstance(parameters, SourceIngestInput):
+        return _decision(
+            view, passed=False, reason_code="invalid_validator_parameters",
+            message="source.ingest requires SourceIngestInput.", validator_id="source.ingest"
         )
-    return _ok(project.rel(project.toc_json), *(project.rel(path) for path in chapters))
-
-
-def _validate_research_global(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("research.global", parameters, ResearchInput):
+    if invalid := _validate_expected("source.ingest", view, parameters, bundle):
         return invalid
-    evidence = project.root / "qa/benchmark/global_research_ack.md"
-    return _ok(project.rel(evidence)) if evidence.exists() else _fail(
-        "global_research_missing", "qa/benchmark/global_research_ack.md is required."
+    try:
+        manifest = json.loads(view.read_text("source/source_manifest.json"))
+        clean = view.read_text("source/source_text.txt")
+    except (UnicodeError, json.JSONDecodeError, OSError, ValueError) as exc:
+        return _decision(
+            view, passed=False, reason_code="source_evidence_invalid", message=str(exc),
+            validator_id="source.ingest"
+        )
+    if not clean.strip() or not isinstance(manifest, dict) or not manifest.get("sha256"):
+        return _decision(
+            view, passed=False, reason_code="source_evidence_invalid",
+            message="Clean source and a checksum-bearing manifest are required.",
+            validator_id="source.ingest"
+        )
+    return _decision(
+        view, passed=True, reason_code="evidence_valid", message="Source evidence is valid.",
+        validator_id="source.ingest",
+        evidence_refs=("source/source_manifest.json", "source/source_text.txt"),
     )
 
 
-def _validate_research_book(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("research.book", parameters, ResearchInput):
-        return invalid
-    missing = tuple(
-        project.rel(path)
-        for path in (project.book_research, project.style_profile)
-        if not path.exists()
-    )
-    return _fail("book_research_missing", f"Missing book research: {', '.join(missing)}") if missing else _ok(
-        project.rel(project.book_research), project.rel(project.style_profile)
-    )
-
-
-def _validate_translation_trial(
-    project: BookProject, parameters: FrozenModel
+def _chapter_translate(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
 ) -> GateDecision:
-    if invalid := _require_type("translation.trial", parameters, EmptyInput):
+    if not isinstance(parameters, ChapterBatchInput):
+        return _decision(
+            view, passed=False, reason_code="invalid_validator_parameters",
+            message="chapter.translate requires ChapterBatchInput.", validator_id="chapter.translate"
+        )
+    if invalid := _validate_expected("chapter.translate", view, parameters, bundle):
         return invalid
-    if not project.pretranslation_report.exists():
-        return _fail("pretranslation_report_missing", "Pretranslation report is required.")
-    if not _contains_pass(project.pretranslation_report.read_text(encoding="utf-8")):
-        return _fail("pretranslation_not_passed", "Pretranslation report must conclude result: PASS.")
-    return _ok(project.rel(project.pretranslation_report))
-
-
-def _validate_glossary_prepare(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("glossary.prepare", parameters, EmptyInput):
-        return invalid
-    if not project.terms_csv.exists() or not project.style_guide.exists():
-        return _fail("glossary_evidence_missing", "Glossary terms and style guide are required.")
-    rows = tuple(row for row in project.terms_csv.read_text(encoding="utf-8").splitlines() if row)
-    if len(rows) < 2:
-        return _fail("glossary_terms_empty", "glossary/terms.csv requires a header and term row.")
-    return _ok(project.rel(project.terms_csv), project.rel(project.style_guide))
-
-
-def _chapter_files(
-    project: BookProject,
-    parameters: ChapterBatchInput,
-    directory: Path,
-    suffix: str = ".md",
-) -> tuple[Path, ...]:
-    return tuple(directory / f"{chapter}{suffix}" for chapter in parameters.chapters)
-
-
-def _validate_chapter_translate(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("chapter.translate", parameters, ChapterBatchInput):
-        return invalid
-    assert isinstance(parameters, ChapterBatchInput)
-    paths = _chapter_files(project, parameters, project.chapters_translated)
-    missing = tuple(project.rel(path) for path in paths if not path.exists())
-    if missing:
-        return _fail("chapter_translation_missing", f"Missing requested translation: {', '.join(missing)}")
-    return _ok(*(project.rel(path) for path in paths))
-
-
-def _validate_chapter_control(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("chapter.control", parameters, ChapterBatchInput):
-        return invalid
-    assert isinstance(parameters, ChapterBatchInput)
     for chapter in parameters.chapters:
-        path = project.chapter_control(chapter)
-        if not path.exists() or not _has_zero_issue_pass(path.read_text(encoding="utf-8")):
-            return _fail(
-                "chapter_control_not_passed",
-                f"qa/chapter_controls/{chapter}.control.md must be a zero-issue PASS.",
+        path = f"chapters/translated/{chapter}.md"
+        if not view.exists(path) or not view.read_text(path).strip():
+            return _decision(
+                view, passed=False, reason_code="chapter_translation_missing",
+                message=f"Missing non-empty current attempt translation {path}.",
+                validator_id="chapter.translate"
             )
-    return _ok(*(project.rel(project.chapter_control(item)) for item in parameters.chapters))
+    return _decision(
+        view, passed=True, reason_code="evidence_valid", message="Translations are present.",
+        validator_id="chapter.translate",
+        evidence_refs=tuple(f"chapters/translated/{item}.md" for item in parameters.chapters),
+    )
 
 
-def _validate_chapter_review(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("chapter.review", parameters, ReviewBatchInput):
-        return invalid
-    assert isinstance(parameters, ReviewBatchInput)
-    if not parameters.chapters:
-        return _fail("chapter_review_scope_empty", "Chapter review requires explicit chapters.")
-    refs: list[str] = []
+def _chapter_control(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    result = _generic("chapter.control", view, parameters, bundle)
+    if not result.passed or not isinstance(parameters, ChapterBatchInput):
+        return result
     for chapter in parameters.chapters:
-        gate = project.chapter_gate(chapter)
-        final = project.chapters_final / f"{chapter}.md"
-        if not gate.exists() or not _contains_pass(gate.read_text(encoding="utf-8")):
-            return _fail("chapter_gate_not_passed", f"qa/gates/{chapter}.gate.md must PASS.")
-        if not final.exists():
-            return _fail("chapter_final_missing", f"chapters/final/{chapter}.md is required.")
-        refs.extend((project.rel(gate), project.rel(final)))
-    return _ok(*refs)
-
-
-def _validate_preproduction_spec(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("preproduction.spec", parameters, EmptyInput):
-        return invalid
-    return _ok(project.rel(project.production_spec)) if project.production_spec.exists() else _fail(
-        "production_spec_missing", "preproduction/stage1/production_spec.md is required."
-    )
-
-
-def _validate_preproduction_sample(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("preproduction.sample", parameters, BuildEpubInput):
-        return invalid
-    if not project.sample_review.exists() or not project.sample_epub.exists():
-        return _fail("sample_evidence_missing", "Sample EPUB and sample review are required.")
-    if not _contains_pass(
-        project.sample_review.read_text(encoding="utf-8"), key="sample_review_status"
-    ):
-        return _fail("sample_review_not_passed", "sample_review_status must be PASS.")
-    return _ok(project.rel(project.sample_epub), project.rel(project.sample_review))
-
-
-def _valid_gate_report(path: Path) -> bool:
-    report = _read_model(path, _GateReport)
-    return isinstance(report, _GateReport) and report.ok and report.hard_errors == 0
-
-
-def _validate_epub_build(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("epub.build", parameters, BuildEpubInput):
-        return invalid
-    if not project.book_epub.exists():
-        return _fail("epub_missing", "output/book.epub is required.")
-    for path, code in (
-        (project.publication_lint_report, "publication_lint_not_passed"),
-        (project.asset_manifest_report, "asset_manifest_not_passed"),
-        (project.epubcheck_log, "epubcheck_not_passed"),
-    ):
-        if not _valid_gate_report(path):
-            return _fail(code, f"{project.rel(path)} must contain a zero-error PASS report.")
-    return _ok(
-        project.rel(project.book_epub),
-        project.rel(project.publication_lint_report),
-        project.rel(project.asset_manifest_report),
-        project.rel(project.epubcheck_log),
-    )
-
-
-def _validate_review_spotcheck(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("review.spotcheck", parameters, ReviewBatchInput):
-        return invalid
-    from abi.qa.validator import validate_random_spotcheck
-
-    deterministic = validate_random_spotcheck(project, require_pass=True)
-    if not deterministic.ok:
-        return _fail("spotcheck_not_passed", deterministic.summary())
-    rounds = tuple(sorted(project.random_spotcheck_dir.glob("round_*")))
-    if not rounds:
-        return _fail("spotcheck_round_missing", "At least one random spot-check round is required.")
-    report_path = rounds[-1] / "validation_report.json"
-    report = _read_model(report_path, _SpotcheckReport)
-    if not isinstance(report, _SpotcheckReport):
-        return _fail("spotcheck_report_invalid", "Latest validation_report.json is missing or invalid.")
-    if (
-        report.status.upper() != "PASS"
-        or report.release_confidence < 0.80
-        or not report.this_round_pass
-        or report.current_run_pass_rounds_count < report.current_run_pass_rounds_required
-        or len(report.agents) < 2
-        or not all(agent.ok for agent in report.agents)
-    ):
-        return _fail("spotcheck_not_passed", "Latest spot-check must PASS at confidence >= 0.80.")
-    return _ok(project.rel(report_path))
-
-
-def _validate_review_independent(
-    project: BookProject, parameters: FrozenModel
-) -> GateDecision:
-    if invalid := _require_type("review.independent", parameters, ReviewBatchInput):
-        return invalid
-    refs: list[str] = []
-    for reviewer in ("agent_a", "agent_b"):
-        path = project.root / f"reviews/{reviewer}/review.md"
-        if not path.exists() or not _contains_pass(path.read_text(encoding="utf-8")):
-            return _fail(
-                "independent_review_not_passed",
-                f"reviews/{reviewer}/review.md must conclude result: PASS.",
+        text = view.read_text(f"qa/chapter_controls/{chapter}.control.md")
+        if not all(re.search(rf"(?im)^\s*{field}\s*:\s*{value}\s*$", text) for field, value in {
+            "scope": "FULL_CHAPTER", "issues_found": "0", "unresolved_blocking_issues": "0",
+            "latest_round_status": "PASS", "allow_next_chapter": "true",
+        }.items()):
+            return _decision(
+                view, passed=False, reason_code="chapter_control_not_passed",
+                message="Chapter control must record a zero-issue PASS.",
+                validator_id="chapter.control"
             )
-        refs.append(project.rel(path))
-    return _ok(*refs)
+    return result
 
 
-def _validate_release_prepare(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("release.prepare", parameters, ReleaseInput):
-        return invalid
-    assert isinstance(parameters, ReleaseInput)
-    from abi.release.create import validate_created_release
-
-    result = validate_created_release(project, version=parameters.version)
-    if not result.ok:
-        return _fail("release_not_passed", result.summary())
-    artifact = result.details.get("artifact")
-    return _ok(str(artifact)) if isinstance(artifact, str) else _fail(
-        "release_not_passed", "Release validation did not identify an artifact."
-    )
-
-
-def _validate_output_finalize(project: BookProject, parameters: FrozenModel) -> GateDecision:
-    if invalid := _require_type("output.finalize", parameters, EmptyInput):
-        return invalid
-    return _ok(project.rel(project.final_manifest)) if project.final_manifest.exists() else _fail(
-        "final_manifest_missing", "output/final_manifest.md is required."
-    )
-
-
-def _validate_retrospective_capture(
-    project: BookProject, parameters: FrozenModel
+def _review_spotcheck(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
 ) -> GateDecision:
-    if invalid := _require_type("retrospective.capture", parameters, EmptyInput):
+    if not isinstance(parameters, SpotcheckInput):
+        return _decision(
+            view, passed=False, reason_code="invalid_validator_parameters",
+            message="review.spotcheck requires SpotcheckInput.", validator_id="review.spotcheck"
+        )
+    if invalid := _validate_expected("review.spotcheck", view, parameters, bundle):
         return invalid
-    suggestions = project.root / "retrospective/template_update_suggestions.md"
-    if not project.retrospective.exists() or not suggestions.exists():
-        return _fail("retrospective_missing", "Both retrospective reports are required.")
-    return _ok(project.rel(project.retrospective), project.rel(suggestions))
+    root = f"reviews/random_spotcheck/{parameters.round_id}"
+    try:
+        report = json.loads(view.read_text(f"{root}/validation_report.json"))
+        manifest = json.loads(view.read_text(f"{root}/round_manifest.json"))
+        summaries = {
+            reviewer: json.loads(
+                view.read_text(f"{root}/reviews/{reviewer}_summary.json")
+            )
+            for reviewer in parameters.reviewers
+        }
+        sample_indexes = {
+            reviewer: json.loads(
+                view.read_text(f"{root}/samples/{reviewer}/samples.json")
+            )
+            for reviewer in parameters.reviewers
+        }
+    except (
+        KeyError,
+        PermissionError,
+        UnicodeError,
+        json.JSONDecodeError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return _decision(
+            view, passed=False, reason_code="spotcheck_not_passed", message=str(exc),
+            validator_id="review.spotcheck"
+        )
+
+    prior_rounds: list[dict[str, dict[str, Any]]] = []
+    visible = set(view.paths())
+    round_no = int(parameters.round_id.removeprefix("round_"))
+    try:
+        for prior_no in range(round_no - 1, 0, -1):
+            prior_root = f"reviews/random_spotcheck/round_{prior_no:03d}/reviews"
+            paths = {
+                reviewer: f"{prior_root}/{reviewer}_summary.json"
+                for reviewer in parameters.reviewers
+            }
+            if any(path not in visible for path in paths.values()):
+                break
+            prior_rounds.append(
+                {
+                    reviewer: json.loads(view.read_text(path))
+                    for reviewer, path in paths.items()
+                }
+            )
+    except (
+        PermissionError,
+        UnicodeError,
+        json.JSONDecodeError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return _decision(
+            view, passed=False, reason_code="spotcheck_not_passed", message=str(exc),
+            validator_id="review.spotcheck"
+        )
+
+    from abi.qa.validator import evaluate_spotcheck_summaries
+
+    _, expected_report_bytes = evaluate_spotcheck_summaries(
+        round_id=parameters.round_id,
+        summaries=summaries,
+        prior_rounds=tuple(prior_rounds),
+        require_pass=True,
+    )
+    expected_report = json.loads(expected_report_bytes)
+    manifest_valid = (
+        isinstance(manifest, dict)
+        and manifest.get("round_id") == parameters.round_id
+        and manifest.get("reviewers") == list(parameters.reviewers)
+        and manifest.get("chapters") == list(parameters.chapters)
+        and manifest.get("samples_per_agent") == parameters.samples_per_agent
+        and manifest.get("seed") == parameters.seed
+    )
+    samples_valid = all(
+        isinstance(index, list)
+        and all(
+            isinstance(item, dict) and item.get("chapter") in parameters.chapters
+            for item in index
+        )
+        for index in sample_indexes.values()
+    )
+    valid = (
+        len(parameters.reviewers) >= 2
+        and manifest_valid
+        and samples_valid
+        and isinstance(report, dict)
+        and report == expected_report
+        and expected_report.get("status") == "PASS"
+    )
+    return _decision(
+        view,
+        passed=valid,
+        reason_code="evidence_valid" if valid else "spotcheck_not_passed",
+        message="Spot-check report is a complete deterministic PASS." if valid else "Spot-check report is not a complete PASS.",
+        validator_id="review.spotcheck",
+        evidence_refs=(
+            f"{root}/validation_report.json",
+        ),
+    )
 
 
-_VALIDATORS: Mapping[str, ActionValidator] = {
-    "source.ingest": _validate_source_ingest,
-    "source.split": _validate_source_split,
-    "research.global": _validate_research_global,
-    "research.book": _validate_research_book,
-    "translation.trial": _validate_translation_trial,
-    "glossary.prepare": _validate_glossary_prepare,
-    "chapter.translate": _validate_chapter_translate,
-    "chapter.control": _validate_chapter_control,
-    "chapter.review": _validate_chapter_review,
-    "preproduction.spec": _validate_preproduction_spec,
-    "preproduction.sample": _validate_preproduction_sample,
-    "epub.build": _validate_epub_build,
-    "review.spotcheck": _validate_review_spotcheck,
-    "review.independent": _validate_review_independent,
-    "release.prepare": _validate_release_prepare,
-    "output.finalize": _validate_output_finalize,
-    "retrospective.capture": _validate_retrospective_capture,
+def _release_prepare(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    if not isinstance(parameters, ReleaseInput):
+        return _decision(
+            view, passed=False, reason_code="invalid_validator_parameters",
+            message="release.prepare requires ReleaseInput.", validator_id="release.prepare"
+        )
+    if invalid := _validate_expected("release.prepare", view, parameters, bundle):
+        return invalid
+    try:
+        state = json.loads(view.read_text("output/release/release_state.json"))
+    except (UnicodeError, json.JSONDecodeError, OSError, ValueError) as exc:
+        return _decision(
+            view, passed=False, reason_code="release_not_passed", message=str(exc),
+            validator_id="release.prepare"
+        )
+    releases = state.get("releases") if isinstance(state, dict) else None
+    matching = (
+        [item for item in releases if isinstance(item, dict) and item.get("version") == parameters.version]
+        if isinstance(releases, list)
+        else []
+    )
+    valid = (
+        isinstance(state, dict)
+        and state.get("latest_status") == "PASS"
+        and state.get("latest_version") == parameters.version
+        and len(matching) == 1
+        and matching[0].get("epub") == f"book_{parameters.version}.epub"
+        and view.exists(f"output/release/book_{parameters.version}.epub")
+    )
+    return _decision(
+        view,
+        passed=valid,
+        reason_code="evidence_valid" if valid else "release_not_passed",
+        message="Requested release version is present and passed." if valid else "Requested release version is absent or not passed.",
+        validator_id="release.prepare",
+        evidence_refs=("output/release/release_state.json",),
+    )
+
+
+def _epub_build(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    if not isinstance(parameters, BuildEpubInput):
+        return _decision(
+            view, passed=False, reason_code="invalid_validator_parameters",
+            message="epub.build requires BuildEpubInput.", validator_id="epub.build"
+        )
+    if invalid := _validate_expected("epub.build", view, parameters, bundle):
+        return invalid
+    try:
+        reports = tuple(
+            json.loads(view.read_text(path))
+            for path in (
+                "output/asset_manifest_check.json",
+                "output/epubcheck.json",
+                "output/publication_lint.json",
+            )
+        )
+        epub = view.read_bytes("output/book.epub")
+    except (UnicodeError, json.JSONDecodeError, OSError, ValueError) as exc:
+        return _decision(
+            view, passed=False, reason_code="epub_gate_failed", message=str(exc),
+            validator_id="epub.build"
+        )
+    valid = bool(epub) and all(
+        isinstance(report, dict) and report.get("ok") is True for report in reports
+    )
+    return _decision(
+        view,
+        passed=valid,
+        reason_code="evidence_valid" if valid else "epub_gate_failed",
+        message="EPUB and all deterministic gates passed." if valid else "EPUB or a deterministic gate failed.",
+        validator_id="epub.build",
+        evidence_refs=tuple(entry.canonical_relpath for entry in bundle.entries),
+    )
+
+
+_PARAMETER_TYPES: Mapping[str, type[FrozenModel]] = {
+    "source.split": SourceSplitInput,
+    "research.global": ResearchInput,
+    "research.book": ResearchInput,
+    "translation.trial": EmptyInput,
+    "glossary.prepare": EmptyInput,
+    "chapter.review": ReviewBatchInput,
+    "preproduction.spec": EmptyInput,
+    "preproduction.sample": BuildEpubInput,
+    "epub.build": BuildEpubInput,
+    "review.spotcheck": SpotcheckInput,
+    "review.independent": ReviewBatchInput,
+    "release.prepare": ReleaseInput,
+    "output.finalize": EmptyInput,
+    "retrospective.capture": EmptyInput,
 }
 
 
+def _registered_generic(capability: str) -> Validator:
+    expected_type = _PARAMETER_TYPES[capability]
+
+    def validate(
+        view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+    ) -> GateDecision:
+        if not isinstance(parameters, expected_type):
+            return _decision(
+                view, passed=False, reason_code="invalid_validator_parameters",
+                message=f"{capability} requires {expected_type.__name__}.", validator_id=capability
+            )
+        return _generic(capability, view, parameters, bundle)
+
+    return validate
+
+
+_VALIDATORS: dict[str, Validator] = {
+    capability: _registered_generic(capability) for capability in _PARAMETER_TYPES
+}
+_VALIDATORS.update(
+    {
+        "source.ingest": _source_ingest,
+        "chapter.translate": _chapter_translate,
+        "chapter.control": _chapter_control,
+        "epub.build": _epub_build,
+        "review.spotcheck": _review_spotcheck,
+        "release.prepare": _release_prepare,
+    }
+)
+
+
 def validator_catalog() -> dict[str, ActionValidator]:
-    """Return the closed validator bindings used by ActionRegistry startup checks."""
-    return dict(_VALIDATORS)
+    return cast(dict[str, ActionValidator], dict(_VALIDATORS))
 
 
 def validate_evidence(
-    capability: str, project: BookProject, parameters: FrozenModel
+    capability: str,
+    evidence_view: StagingEvidenceView,
+    parameters: FrozenModel,
+    bundle: ArtifactBundle,
 ) -> GateDecision:
     validator = _VALIDATORS.get(capability)
     if validator is None:
-        return GateDecision(
+        return _decision(
+            evidence_view,
             passed=False,
             reason_code="validator_not_registered",
             message=f"No validator for {capability}; register one before authorizing this Action.",
+            validator_id="unregistered",
         )
-    return validator(project, parameters)
+    return validator(evidence_view, parameters, bundle)
+
+
+__all__ = ["validate_evidence", "validator_catalog"]

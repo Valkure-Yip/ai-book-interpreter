@@ -20,14 +20,22 @@ from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionStatus,
     ActionView,
+    ArtifactMetadata,
     ArtifactRef,
+    AttemptOutcomeReceiptPayload,
     AuthorizedAction,
+    ExpectedArtifactManifest,
+    GateArtifactIdentity,
     GateEvidence,
+    GateReceiptPayload,
     IncidentView,
     PlanPatch,
     PlanRejectionView,
+    RetryPolicySpec,
     RunSnapshot,
     RunStatus,
+    canonical_manifest_json,
+    canonical_model_json,
 )
 
 
@@ -87,6 +95,11 @@ class ActionRecord(FrozenModel):
     write_set: tuple[str, ...] = ()
     status: ActionStatus
     idempotency_key: str
+    expected_artifact_manifest: ExpectedArtifactManifest
+    expected_manifest_digest: str
+    expected_evidence_refs: tuple[str, ...] = ()
+    retry_policy: RetryPolicySpec
+    retry_policy_fingerprint: str
     failure_signature: str | None = None
     committed_at: datetime | None = None
 
@@ -97,7 +110,15 @@ class ActionAttemptRecord(FrozenModel):
     action_id: str
     attempt: int = Field(ge=1)
     status: ActionStatus
-    started_at: datetime
+    parameters_json: str
+    expected_artifact_manifest: ExpectedArtifactManifest
+    expected_manifest_digest: str
+    expected_evidence_refs: tuple[str, ...]
+    retry_policy: RetryPolicySpec
+    retry_policy_fingerprint: str
+    retry_of_attempt: int | None = None
+    staging_relpath: str
+    started_at: datetime | None = None
     finished_at: datetime | None = None
     failure_signature: str | None = None
 
@@ -141,9 +162,26 @@ class IncidentRecord(FrozenModel):
     subject: str | None = None
     message: str
     action_id: str | None = None
+    repair_class: Literal["semantic", "integrity"] | None = None
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"] | None = None
+    reason_code: str | None = None
     status: str
     created_at: datetime
     resolved_at: datetime | None = None
+
+
+class OutboxEventRecord(FrozenModel):
+    """One ordered, not-yet-delivered rebuildable projection event."""
+
+    sequence: int = Field(ge=1)
+    event_id: str
+    run_id: str
+    event_name: str
+    aggregate_id: str
+    payload_json: str
+    idempotency_key: str
+    created_at: datetime
+    delivered_at: datetime | None = None
 
 
 PromotionStatus = Literal["PENDING", "COMMITTED", "CONFLICT"]
@@ -159,9 +197,42 @@ class PromotionIntent(FrozenModel):
     canonical_relpath: str
     checksum: str
     media_type: str
+    evidence_role: str
+    metadata_json: str
+    ordinal: int = Field(ge=0)
+    bundle_digest: str
     status: PromotionStatus
     created_at: datetime
     committed_at: datetime | None = None
+
+
+class AttemptOutcomeReceiptRecord(AttemptOutcomeReceiptPayload):
+    recorded_at: datetime
+
+
+class GateReceiptRecord(GateReceiptPayload):
+    recorded_at: datetime
+
+
+class RepairFactRecord(FrozenModel):
+    action_id: str
+    attempt: int = Field(ge=1)
+    repair_class: Literal["semantic", "integrity"]
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"]
+    reason_code: str
+    defect_codes: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    message: str
+    outcome_digest: str
+    recorded_at: datetime
+
+
+class _GateIdentityList(FrozenModel):
+    items: tuple[GateArtifactIdentity, ...]
+
+
+class _MetadataList(FrozenModel):
+    items: tuple[ArtifactMetadata, ...]
 
 
 Clock = Callable[[], datetime]
@@ -238,6 +309,15 @@ class RunLedger:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (run_id, version, patch.objective, patch.rationale, patch.model_dump_json(), now),
             )
+            await self._insert_outbox(
+                db,
+                run_id=run_id,
+                event_name="plan.proposed",
+                aggregate_id=f"plan:{run_id}:{version}",
+                payload_json=json.dumps({"plan_version": version}, sort_keys=True),
+                idempotency_key=f"plan.proposed:plan:{run_id}:{version}",
+                now=now,
+            )
         return PlanVersionRecord(run_id=run_id, version=version, patch=patch, created_at=_parse_time(now))
 
     async def record_plan_rejection(
@@ -269,6 +349,18 @@ class RunLedger:
                 "VALUES (?, ?, ?, ?, ?)",
                 (str(uuid4()), run_id, plan_version, _dump_tuple(reason_codes), now),
             )
+            await self._insert_outbox(
+                db,
+                run_id=run_id,
+                event_name="plan.rejected",
+                aggregate_id=f"plan:{run_id}:{plan_version}",
+                payload_json=json.dumps(
+                    {"plan_version": plan_version, "reason_codes": reason_codes},
+                    sort_keys=True,
+                ),
+                idempotency_key=f"plan.rejected:plan:{run_id}:{plan_version}",
+                now=now,
+            )
         return rejection
 
     async def authorize_actions(
@@ -283,6 +375,15 @@ class RunLedger:
                 raise LedgerTransitionError(
                     f"run {run_id} has no plan; append an immutable plan before authorizing actions"
                 )
+            await self._insert_outbox(
+                db,
+                run_id=run_id,
+                event_name="plan.authorized",
+                aggregate_id=f"plan:{run_id}:{latest}",
+                payload_json=json.dumps({"plan_version": latest}, sort_keys=True),
+                idempotency_key=f"plan.authorized:plan:{run_id}:{latest}",
+                now=self._now(),
+            )
             for action in actions:
                 if action.plan_version != latest:
                     raise LedgerTransitionError(
@@ -291,8 +392,10 @@ class RunLedger:
                     )
                 await db.execute(
                     "INSERT INTO actions (action_id, run_id, plan_version, capability, parameters_json, "
-                    "dependencies_json, priority, read_set_json, write_set_json, status, idempotency_key) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "dependencies_json, priority, read_set_json, write_set_json, status, idempotency_key, "
+                    "expected_manifest_json, expected_manifest_digest, expected_evidence_refs_json, "
+                    "retry_policy_json, retry_policy_fingerprint) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         action.action_id,
                         run_id,
@@ -305,7 +408,28 @@ class RunLedger:
                         _dump_tuple(action.write_set),
                         ActionStatus.AUTHORIZED.value,
                         action.idempotency_key,
+                        canonical_manifest_json(action.expected_artifact_manifest),
+                        action.expected_artifact_manifest_digest,
+                        _dump_tuple(action.expected_evidence_refs),
+                        canonical_model_json(action.retry_policy),
+                        action.retry_policy_fingerprint,
                     ),
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=run_id,
+                    event_name="action.authorized",
+                    aggregate_id=action.action_id,
+                    payload_json=json.dumps(
+                        {
+                            "action_id": action.action_id,
+                            "capability": action.capability,
+                            "plan_version": action.plan_version,
+                        },
+                        sort_keys=True,
+                    ),
+                    idempotency_key=f"action.authorized:{action.action_id}",
+                    now=self._now(),
                 )
         return tuple([await self.get_action(action.action_id) for action in actions])
 
@@ -317,34 +441,76 @@ class RunLedger:
             )
         return self._action_from_row(row)
 
-    async def start_attempt(self, action_id: str) -> ActionAttemptRecord:
+    async def start_attempt(self, action_id: str, *, attempt: int = 1) -> ActionAttemptRecord:
+        """Claim exactly one authorized attempt and snapshot all execution facts first."""
+        if attempt < 1:
+            raise LedgerTransitionError("attempt must be positive")
         now = self._now()
         async with self.transaction() as db:
             action = await self._require_action(db, action_id)
             await self._require_running_run(db, action["run_id"])
             status = _action_status(action["status"], "actions.status")
-            if status not in {ActionStatus.AUTHORIZED, ActionStatus.RETRY_WAIT}:
+            if status is not ActionStatus.AUTHORIZED:
                 raise LedgerTransitionError(
                     f"action {action_id} is {status.value}; authorize or schedule a retry before starting an attempt"
                 )
-            cursor = await db.execute(
-                "SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt FROM action_attempts WHERE action_id = ?",
-                (action_id,),
-            )
-            row = await cursor.fetchone()
-            assert row is not None
-            attempt = int(row["attempt"])
+            row = await self._fetch_attempt_row(db, action_id, attempt)
+            if row is None:
+                if attempt != 1:
+                    raise LedgerTransitionError(
+                        f"attempt {attempt} is not authorized; create_next_attempt before dispatch"
+                    )
+                await db.execute(
+                    "INSERT INTO action_attempts (action_id, attempt, status, parameters_json, "
+                    "expected_manifest_json, expected_manifest_digest, expected_evidence_refs_json, "
+                    "retry_policy_json, retry_policy_fingerprint, retry_of_attempt, staging_relpath, "
+                    "started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                    (
+                        action_id,
+                        attempt,
+                        ActionStatus.RUNNING.value,
+                        action["parameters_json"],
+                        action["expected_manifest_json"],
+                        action["expected_manifest_digest"],
+                        action["expected_evidence_refs_json"],
+                        action["retry_policy_json"],
+                        action["retry_policy_fingerprint"],
+                        f"state/staging/{action_id}/{attempt}",
+                        now,
+                    ),
+                )
+            else:
+                if _action_status(row["status"], "action_attempts.status") is not ActionStatus.AUTHORIZED:
+                    raise LedgerTransitionError(
+                        f"attempt {attempt} for {action_id} is {row['status']}; never re-enter a claimed attempt"
+                    )
+                await db.execute(
+                    "UPDATE action_attempts SET status = ?, started_at = ? "
+                    "WHERE action_id = ? AND attempt = ?",
+                    (ActionStatus.RUNNING.value, now, action_id, attempt),
+                )
             await db.execute(
                 "UPDATE actions SET status = ?, failure_signature = NULL WHERE action_id = ?",
                 (ActionStatus.RUNNING.value, action_id),
             )
-            await db.execute(
-                "INSERT INTO action_attempts (action_id, attempt, status, started_at) VALUES (?, ?, ?, ?)",
-                (action_id, attempt, ActionStatus.RUNNING.value, now),
+            await self._insert_outbox(
+                db,
+                run_id=action["run_id"],
+                event_name="action.started",
+                aggregate_id=action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": action_id,
+                        "attempt": attempt,
+                        "capability": action["capability"],
+                        "plan_version": action["plan_version"],
+                    },
+                    sort_keys=True,
+                ),
+                idempotency_key=f"action.started:{action_id}:{attempt}",
+                now=now,
             )
-        return ActionAttemptRecord(
-            action_id=action_id, attempt=attempt, status=ActionStatus.RUNNING, started_at=_parse_time(now)
-        )
+        return await self.get_attempt(action_id, attempt)
 
     async def get_attempt(self, action_id: str, attempt: int) -> ActionAttemptRecord:
         """Load one typed attempt row without exposing SQLite row shapes to callers."""
@@ -357,6 +523,378 @@ class RunLedger:
                 f"attempt {attempt} for {action_id} was not found; start the action before reading its attempt"
             )
         return self._attempt_from_row(row)
+
+    async def record_attempt_outcome(
+        self, payload: AttemptOutcomeReceiptPayload
+    ) -> AttemptOutcomeReceiptRecord:
+        """Persist the immutable executor handoff before any controller hook."""
+        now = self._now()
+        async with self.transaction() as db:
+            action = await self._require_action(db, payload.action_id)
+            attempt = await self._attempt_row(db, payload.action_id, payload.attempt)
+            if _action_status(attempt["status"], "action_attempts.status") is not ActionStatus.RUNNING:
+                cursor = await db.execute(
+                    "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                    (payload.action_id, payload.attempt),
+                )
+                prior = await cursor.fetchone()
+                if prior is not None and self._outcome_receipt_from_row(prior).model_dump(
+                    exclude={"recorded_at"}
+                ) == payload.model_dump():
+                    return self._outcome_receipt_from_row(prior)
+                raise LedgerTransitionError(
+                    f"attempt {payload.attempt} is not RUNNING; preserve its durable outcome"
+                )
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (payload.action_id, payload.attempt),
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                record = self._outcome_receipt_from_row(prior)
+                if record.model_dump(exclude={"recorded_at"}) != payload.model_dump():
+                    raise LedgerConflictError(
+                        "attempt outcome receipt conflicts with its durable handoff; block and inspect evidence"
+                    )
+                return record
+            if payload.canonical_bundle_json is not None:
+                bundle = json.loads(payload.canonical_bundle_json)
+                expected = json.loads(attempt["expected_manifest_json"])
+                actual_effects = tuple(
+                    (
+                        item["canonical_relpath"],
+                        item["media_type"],
+                        item["evidence_role"],
+                        item.get("metadata", []),
+                    )
+                    for item in bundle["entries"]
+                )
+                expected_effects = tuple(
+                    (
+                        item["canonical_relpath"],
+                        item["media_type"],
+                        item["evidence_role"],
+                        item.get("metadata", []),
+                    )
+                    for item in expected["entries"]
+                )
+                if bundle["action_id"] != payload.action_id or bundle["attempt"] != payload.attempt:
+                    raise LedgerConflictError("outcome bundle identity conflicts with its attempt")
+                if actual_effects != expected_effects:
+                    raise LedgerConflictError("outcome bundle does not equal the durable expected manifest")
+            await db.execute(
+                "INSERT INTO attempt_outcome_receipts (action_id, attempt, canonical_outcome_json, "
+                "outcome_digest, canonical_bundle_json, bundle_digest, evidence_refs_json, error_code, "
+                "failure_signature, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    payload.action_id,
+                    payload.attempt,
+                    payload.canonical_outcome_json,
+                    payload.outcome_digest,
+                    payload.canonical_bundle_json,
+                    payload.bundle_digest,
+                    _dump_tuple(payload.evidence_refs),
+                    payload.error_code,
+                    payload.failure_signature,
+                    now,
+                ),
+            )
+            outcome = json.loads(payload.canonical_outcome_json)
+            if outcome.get("kind") == "retryable_failure":
+                policy = RetryPolicySpec.model_validate_json(attempt["retry_policy_json"])
+                error_code = payload.error_code or ""
+                if error_code not in policy.retryable_codes or payload.attempt >= policy.max_attempts:
+                    raise LedgerTransitionError(
+                        f"{error_code} is not eligible for another attempt under the frozen retry policy"
+                    )
+                await db.execute(
+                    "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
+                    (ActionStatus.RETRY_WAIT.value, now, payload.action_id, payload.attempt),
+                )
+                await db.execute(
+                    "UPDATE actions SET status = ? WHERE action_id = ?",
+                    (ActionStatus.RETRY_WAIT.value, payload.action_id),
+                )
+            await self._insert_outbox(
+                db,
+                run_id=action["run_id"],
+                event_name="action.outcome",
+                aggregate_id=payload.action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": payload.action_id,
+                        "attempt": payload.attempt,
+                        "classification": outcome.get("kind"),
+                    }
+                ),
+                idempotency_key=f"action.outcome:{payload.action_id}:{payload.attempt}",
+                now=now,
+            )
+        return await self.get_attempt_outcome(payload.action_id, payload.attempt)
+
+    async def get_attempt_outcome(
+        self, action_id: str, attempt: int
+    ) -> AttemptOutcomeReceiptRecord:
+        row = await self._fetch_one(
+            "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        if row is None:
+            raise LedgerNotFoundError("attempt outcome receipt is absent; reconcile staging or block")
+        return self._outcome_receipt_from_row(row)
+
+    async def create_next_attempt(
+        self, action_id: str, *, previous_attempt: int
+    ) -> ActionAttemptRecord:
+        """Idempotently reserve exactly previous_attempt+1 after durable RETRY_WAIT."""
+        next_attempt = previous_attempt + 1
+        async with self.transaction() as db:
+            action = await self._require_action(db, action_id)
+            previous = await self._attempt_row(db, action_id, previous_attempt)
+            cursor = await db.execute(
+                "SELECT * FROM action_attempts WHERE action_id = ? AND retry_of_attempt = ?",
+                (action_id, previous_attempt),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                if int(existing["attempt"]) != next_attempt:
+                    raise LedgerConflictError("retry successor is not strictly consecutive")
+                return self._attempt_from_row(existing)
+            if _action_status(previous["status"], "action_attempts.status") is not ActionStatus.RETRY_WAIT:
+                raise LedgerTransitionError("only a durable RETRY_WAIT attempt can create a successor")
+            if _action_status(action["status"], "actions.status") is not ActionStatus.RETRY_WAIT:
+                raise LedgerTransitionError("Action must be RETRY_WAIT before successor reservation")
+            await db.execute(
+                "INSERT INTO action_attempts (action_id, attempt, status, parameters_json, "
+                "expected_manifest_json, expected_manifest_digest, expected_evidence_refs_json, "
+                "retry_policy_json, retry_policy_fingerprint, retry_of_attempt, staging_relpath) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    action_id,
+                    next_attempt,
+                    ActionStatus.AUTHORIZED.value,
+                    previous["parameters_json"],
+                    previous["expected_manifest_json"],
+                    previous["expected_manifest_digest"],
+                    previous["expected_evidence_refs_json"],
+                    previous["retry_policy_json"],
+                    previous["retry_policy_fingerprint"],
+                    previous_attempt,
+                    f"state/staging/{action_id}/{next_attempt}",
+                ),
+            )
+            await db.execute(
+                "UPDATE actions SET status = ? WHERE action_id = ?",
+                (ActionStatus.AUTHORIZED.value, action_id),
+            )
+        return await self.get_attempt(action_id, next_attempt)
+
+    async def create_gate_receipt_and_bundle_intents(
+        self, payload: GateReceiptPayload
+    ) -> tuple[GateReceiptRecord, tuple[PromotionIntent, ...]]:
+        """Persist PASS plus the complete ordered intent set before canonical mutation."""
+        now = self._now()
+        try:
+            async with self.transaction() as db:
+                action = await self._require_action(db, payload.action_id)
+                attempt = await self._attempt_row(db, payload.action_id, payload.attempt)
+                cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (payload.action_id, payload.attempt),
+            )
+                outcome = await cursor.fetchone()
+                if outcome is None or outcome["bundle_digest"] != payload.bundle_digest:
+                    raise LedgerConflictError("gate receipt is not bound to the durable outcome receipt")
+                cursor = await db.execute(
+                "SELECT * FROM gate_receipts WHERE action_id = ? AND attempt = ?",
+                (payload.action_id, payload.attempt),
+            )
+                prior = await cursor.fetchone()
+                if prior is not None:
+                    record = self._gate_receipt_from_row(prior)
+                    intents = await self._intent_rows_for_attempt(db, payload.action_id, payload.attempt)
+                    if record.model_dump(exclude={"recorded_at"}) != payload.model_dump() or len(intents) != len(payload.artifacts):
+                        await self._mark_bundle_conflict_tx(
+                            db, action, attempt, "partial_intent_set", "gate/intents replay conflicts"
+                        )
+                        raise LedgerConflictError("gate receipt or complete intent set conflicts")
+                    return record, tuple(self._promotion_intent_from_row(row) for row in intents)
+                expected = ExpectedArtifactManifest.model_validate_json(attempt["expected_manifest_json"])
+                if len(expected.entries) != len(payload.artifacts):
+                    raise LedgerConflictError("gate artifact count does not equal durable manifest")
+                for identity, artifact in zip(payload.artifacts, expected.entries, strict=True):
+                    if identity.canonical_relpath != artifact.canonical_relpath:
+                        raise LedgerConflictError("gate artifact order/identity differs from manifest")
+                await db.execute(
+                "INSERT INTO gate_receipts (action_id, attempt, validator_id, validator_version, "
+                "canonical_gate_decision_json, gate_decision_digest, bundle_digest, artifacts_json, "
+                "evidence_refs_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    payload.action_id,
+                    payload.attempt,
+                    payload.validator_id,
+                    payload.validator_version,
+                    payload.canonical_gate_decision_json,
+                    payload.gate_decision_digest,
+                    payload.bundle_digest,
+                    canonical_model_json(_GateIdentityList(items=payload.artifacts)),
+                    _dump_tuple(payload.evidence_refs),
+                    now,
+                ),
+            )
+                for ordinal, (identity, artifact) in enumerate(
+                    zip(payload.artifacts, expected.entries, strict=True)
+                ):
+                    await db.execute(
+                    "INSERT INTO promotion_intents (intent_id, action_id, attempt, staged_relpath, "
+                    "canonical_relpath, checksum, media_type, evidence_role, metadata_json, ordinal, "
+                    "bundle_digest, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"intent:{payload.action_id}:{payload.attempt}:{ordinal}",
+                        payload.action_id,
+                        payload.attempt,
+                        identity.staged_relpath,
+                        canonical_artifact_key(identity.canonical_relpath),
+                        identity.checksum,
+                        artifact.media_type,
+                        artifact.evidence_role,
+                        canonical_model_json(_MetadataList(items=artifact.metadata)),
+                        ordinal,
+                        payload.bundle_digest,
+                        "PENDING",
+                        now,
+                    ),
+                    )
+        except aiosqlite.IntegrityError as exc:
+            await self.mark_bundle_conflict(
+                payload.action_id,
+                payload.attempt,
+                reason_code="artifact_checksum_conflict",
+                message="canonical artifact already has a promotion intent; inspect and choose the canonical artifact",
+            )
+            raise LedgerConflictError(
+                "bundle promotion conflicts with a canonical artifact; inspect and choose the canonical artifact"
+            ) from exc
+        return await self.get_gate_receipt_and_intents(payload.action_id, payload.attempt)
+
+    async def get_gate_receipt_and_intents(
+        self, action_id: str, attempt: int
+    ) -> tuple[GateReceiptRecord, tuple[PromotionIntent, ...]]:
+        row = await self._fetch_one(
+            "SELECT * FROM gate_receipts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
+        )
+        if row is None:
+            raise LedgerNotFoundError("gate receipt is absent")
+        intents = await self._fetch_all(
+            "SELECT * FROM promotion_intents WHERE action_id = ? AND attempt = ? ORDER BY ordinal",
+            (action_id, attempt),
+        )
+        return self._gate_receipt_from_row(row), tuple(
+            self._promotion_intent_from_row(item) for item in intents
+        )
+
+    async def record_repair_required(
+        self,
+        *,
+        action_id: str,
+        attempt: int,
+        repair_class: str,
+        repair_source: str,
+        reason_code: str,
+        defect_codes: tuple[str, ...],
+        evidence_refs: tuple[str, ...],
+        message: str,
+        semantic_reason_mapped: bool,
+    ) -> RepairFactRecord:
+        """Record one receipt-bound semantic repair or integrity block transaction."""
+        now = self._now()
+        effective_class = (
+            "semantic"
+            if repair_class == "semantic" and semantic_reason_mapped and repair_source in {"action_outcome", "validator"}
+            else "integrity"
+        )
+        effective_source = repair_source if effective_class == repair_class else "integrity_guard"
+        effective_reason = reason_code if effective_class == repair_class else "repair_class_unknown"
+        async with self.transaction() as db:
+            action = await self._require_action(db, action_id)
+            await self._attempt_row(db, action_id, attempt)
+            cursor = await db.execute(
+                "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+                (action_id, attempt),
+            )
+            receipt = await cursor.fetchone()
+            if receipt is None:
+                raise LedgerTransitionError("repair fact requires the durable outcome receipt")
+            cursor = await db.execute(
+                "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                return self._repair_fact_from_row(prior)
+            await db.execute(
+                "INSERT INTO repair_facts (action_id, attempt, repair_class, repair_source, reason_code, "
+                "defect_codes_json, evidence_refs_json, message, outcome_digest, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    action_id, attempt, effective_class, effective_source, effective_reason,
+                    _dump_tuple(defect_codes), _dump_tuple(evidence_refs), message,
+                    receipt["outcome_digest"], now,
+                ),
+            )
+            await db.execute(
+                "UPDATE action_attempts SET status = ?, repair_class = ?, repair_source = ?, "
+                "reason_code = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
+                (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, now, action_id, attempt),
+            )
+            await db.execute(
+                "UPDATE actions SET status = ?, repair_class = ?, repair_source = ?, reason_code = ? "
+                "WHERE action_id = ?",
+                (ActionStatus.REPAIR_REQUIRED.value, effective_class, effective_source, effective_reason, action_id),
+            )
+            incident_id = f"repair:{action_id}:{attempt}"
+            await db.execute(
+                "INSERT INTO incidents (incident_id, run_id, action_id, error_code, subject, message, "
+                "repair_class, repair_source, reason_code, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+                (incident_id, action["run_id"], action_id, effective_reason, incident_id, message,
+                 effective_class, effective_source, effective_reason, now),
+            )
+            if effective_class == "integrity":
+                await db.execute(
+                    "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    (RunStatus.BLOCKED.value, now, action["run_id"]),
+                )
+        row = await self._fetch_one(
+            "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
+        )
+        assert row is not None
+        return self._repair_fact_from_row(row)
+
+    async def mark_bundle_conflict(
+        self,
+        action_id: str,
+        attempt: int,
+        *,
+        reason_code: str,
+        message: str,
+    ) -> ActionAttemptRecord:
+        """Atomically compensate the complete attempt and block its run."""
+        async with self.transaction() as db:
+            action = await self._require_action(db, action_id)
+            attempt_row = await self._attempt_row(db, action_id, attempt)
+            await self._mark_bundle_conflict_tx(
+                db, action, attempt_row, reason_code, message
+            )
+        return await self.get_attempt(action_id, attempt)
+
+    async def attempt_status(self, action_id: str, attempt: int) -> ActionStatus:
+        return (await self.get_attempt(action_id, attempt)).status
+
+    async def attempt_numbers(self, action_id: str) -> tuple[int, ...]:
+        rows = await self._fetch_all(
+            "SELECT attempt FROM action_attempts WHERE action_id = ? ORDER BY attempt", (action_id,)
+        )
+        return tuple(int(row["attempt"]) for row in rows)
 
     async def finish_attempt(
         self,
@@ -397,14 +935,24 @@ class RunLedger:
                 "UPDATE actions SET status = ?, failure_signature = ? WHERE action_id = ?",
                 (status.value, failure_signature, action_id),
             )
-        return ActionAttemptRecord(
-            action_id=action_id,
-            attempt=attempt,
-            status=status,
-            started_at=_parse_time(row["started_at"]),
-            finished_at=_parse_time(now),
-            failure_signature=failure_signature,
-        )
+            await self._insert_outbox(
+                db,
+                run_id=action["run_id"],
+                event_name="action.outcome",
+                aggregate_id=action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": action_id,
+                        "attempt": attempt,
+                        "capability": action["capability"],
+                        "classification": status.value.lower(),
+                    },
+                    sort_keys=True,
+                ),
+                idempotency_key=f"action.outcome:{action_id}:{attempt}",
+                now=now,
+            )
+        return await self.get_attempt(action_id, attempt)
 
     async def commit_success(self, commit: SuccessCommit) -> CommittedAction:
         commit = _canonical_success_commit(commit)
@@ -489,20 +1037,56 @@ class RunLedger:
                             now,
                         ),
                     )
-                    payload = json.dumps(
-                        {"action_id": commit.action_id, "attempt": commit.attempt}, sort_keys=True
-                    )
-                    await db.execute(
-                        "INSERT INTO event_outbox (event_id, event_name, aggregate_id, payload_json, "
-                        "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            f"action.committed:{commit.action_id}",
-                            "action.committed",
-                            commit.action_id,
-                            payload,
-                            f"action.committed:{commit.action_id}",
-                            now,
+                    await self._insert_outbox(
+                        db,
+                        run_id=action["run_id"],
+                        event_name="action.outcome",
+                        aggregate_id=commit.action_id,
+                        payload_json=json.dumps(
+                            {
+                                "action_id": commit.action_id,
+                                "attempt": commit.attempt,
+                                "capability": action["capability"],
+                                "classification": "succeeded",
+                            },
+                            sort_keys=True,
                         ),
+                        idempotency_key=(
+                            f"action.outcome:{commit.action_id}:{commit.attempt}"
+                        ),
+                        now=now,
+                    )
+                    await self._insert_outbox(
+                        db,
+                        run_id=action["run_id"],
+                        event_name="action.validated",
+                        aggregate_id=commit.action_id,
+                        payload_json=json.dumps(
+                            {
+                                "action_id": commit.action_id,
+                                "attempt": commit.attempt,
+                                "gates": tuple(
+                                    item.gate for item in commit.gate_evidence
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                        idempotency_key=(
+                            f"action.validated:{commit.action_id}:{commit.attempt}"
+                        ),
+                        now=now,
+                    )
+                    await self._insert_outbox(
+                        db,
+                        run_id=action["run_id"],
+                        event_name="action.committed",
+                        aggregate_id=commit.action_id,
+                        payload_json=json.dumps(
+                            {"action_id": commit.action_id, "attempt": commit.attempt},
+                            sort_keys=True,
+                        ),
+                        idempotency_key=f"action.committed:{commit.action_id}",
+                        now=now,
                     )
         except aiosqlite.IntegrityError as exc:
             raise LedgerConflictError(
@@ -611,6 +1195,10 @@ class RunLedger:
             canonical_relpath=canonical_key,
             checksum=checksum,
             media_type=media_type,
+            evidence_role="legacy_promotion",
+            metadata_json="[]",
+            ordinal=0,
+            bundle_digest=checksum,
             status="PENDING",
             created_at=_parse_time(now),
         )
@@ -628,9 +1216,20 @@ class RunLedger:
         """Return the durable state of one promotion intent."""
         return (await self.get_promotion_intent(intent_id)).status
 
-    async def promotion_intents(self) -> tuple[PromotionIntent, ...]:
-        """List promotion intents so a filesystem reconciler can resume them."""
-        rows = await self._fetch_all("SELECT * FROM promotion_intents ORDER BY created_at, intent_id", ())
+    async def promotion_intents(self, run_id: str | None = None) -> tuple[PromotionIntent, ...]:
+        """List promotion intents, optionally scoped to one durable run."""
+        if run_id is None:
+            rows = await self._fetch_all(
+                "SELECT * FROM promotion_intents ORDER BY created_at, intent_id", ()
+            )
+        else:
+            await self.get_run(run_id)
+            rows = await self._fetch_all(
+                "SELECT pi.* FROM promotion_intents pi "
+                "JOIN actions a ON a.action_id = pi.action_id "
+                "WHERE a.run_id = ? ORDER BY pi.created_at, pi.intent_id",
+                (run_id,),
+            )
         return tuple(self._promotion_intent_from_row(row) for row in rows)
 
     async def commit_promotion_intent(self, intent_id: str) -> PromotionIntent:
@@ -661,7 +1260,6 @@ class RunLedger:
         self, intent_id: str, *, error_code: str, message: str
     ) -> PromotionIntent:
         """Atomically compensate a pending or committed promotion and record its incident."""
-        now = self._now()
         async with self.transaction() as db:
             cursor = await db.execute(
                 "SELECT pi.*, a.run_id FROM promotion_intents pi "
@@ -673,27 +1271,10 @@ class RunLedger:
                 raise LedgerNotFoundError(
                     f"promotion intent {intent_id} was not found; cannot compensate its promotion"
                 )
-            status = _promotion_status(row["status"], intent_id)
-            if status != "CONFLICT":
-                await db.execute(
-                    "UPDATE promotion_intents SET status = ? WHERE intent_id = ?",
-                    ("CONFLICT", intent_id),
-                )
-            cursor = await db.execute(
-                "SELECT * FROM incidents WHERE action_id = ? AND error_code = ? AND subject = ? "
-                "AND status = 'OPEN'",
-                (row["action_id"], error_code, intent_id),
-            )
-            if await cursor.fetchone() is None:
-                await self._insert_incident(
-                    db,
-                    run_id=row["run_id"],
-                    error_code=error_code,
-                    message=message,
-                    action_id=row["action_id"],
-                    subject=intent_id,
-                    now=now,
-                )
+            _promotion_status(row["status"], intent_id)
+            action = await self._require_action(db, row["action_id"])
+            attempt = await self._attempt_row(db, row["action_id"], row["attempt"])
+            await self._mark_bundle_conflict_tx(db, action, attempt, error_code, message)
             cursor = await db.execute(
                 "SELECT * FROM promotion_intents WHERE intent_id = ?", (intent_id,)
             )
@@ -756,7 +1337,153 @@ class RunLedger:
             await db.execute(
                 "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?", (status.value, now, run_id)
             )
+            event_name = {
+                RunStatus.PAUSED_BUDGET: "run.paused",
+                RunStatus.PAUSED_HITL: "run.paused",
+                RunStatus.BLOCKED: "run.blocked",
+                RunStatus.COMPLETED: "run.completed",
+                RunStatus.RUNNING: "run.resumed",
+                RunStatus.CANCELLED: "run.cancelled",
+            }[status]
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS count FROM event_outbox "
+                "WHERE run_id = ? AND event_name LIKE 'run.%'",
+                (run_id,),
+            )
+            transition_row = await cursor.fetchone()
+            assert transition_row is not None
+            transition = int(transition_row["count"]) + 1
+            await self._insert_outbox(
+                db,
+                run_id=run_id,
+                event_name=event_name,
+                aggregate_id=run_id,
+                payload_json=json.dumps(
+                    {
+                        "previous_status": current.value,
+                        "status": status.value,
+                        "transition": transition,
+                    },
+                    sort_keys=True,
+                ),
+                idempotency_key=f"{event_name}:{run_id}:{transition}",
+                now=now,
+            )
         return await self.get_run(run_id)
+
+    async def record_event(
+        self,
+        *,
+        run_id: str,
+        event_name: str,
+        aggregate_id: str,
+        payload_json: str,
+        idempotency_key: str,
+    ) -> OutboxEventRecord:
+        """Append one idempotent business event to the durable outbox."""
+        if not event_name or not aggregate_id or not idempotency_key:
+            raise LedgerTransitionError(
+                "outbox identity fields must be non-empty; derive stable event, aggregate, and "
+                "idempotency identities before recording the event"
+            )
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            raise LedgerTransitionError(
+                "outbox payload must be valid JSON; serialize the typed event payload first"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise LedgerTransitionError(
+                "outbox payload must be a JSON object; serialize a typed event model first"
+            )
+        payload["run_id"] = run_id
+        canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        now = self._now()
+        async with self.transaction() as db:
+            await self._require_run(db, run_id)
+            cursor = await db.execute(
+                "SELECT rowid AS sequence, * FROM event_outbox WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                if (
+                    prior["event_name"] != event_name
+                    or prior["aggregate_id"] != aggregate_id
+                    or prior["payload_json"] != canonical_payload
+                ):
+                    raise LedgerConflictError(
+                        f"outbox event {idempotency_key} disagrees with its durable fact; inspect "
+                        "the controller event identity before retrying"
+                    )
+                return self._outbox_event_from_row(prior)
+            event_id = idempotency_key
+            await db.execute(
+                "INSERT INTO event_outbox (event_id, run_id, event_name, aggregate_id, payload_json, "
+                "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event_id,
+                    run_id,
+                    event_name,
+                    aggregate_id,
+                    canonical_payload,
+                    idempotency_key,
+                    now,
+                ),
+            )
+            cursor = await db.execute(
+                "SELECT rowid AS sequence, * FROM event_outbox WHERE event_id = ?",
+                (event_id,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            return self._outbox_event_from_row(row)
+
+    async def undelivered_events(self, run_id: str | None = None) -> tuple[OutboxEventRecord, ...]:
+        """Return pending projection events in SQLite insertion order."""
+        where = "delivered_at IS NULL AND run_id IS NOT NULL"
+        parameters: tuple[object, ...] = ()
+        if run_id is not None:
+            await self.get_run(run_id)
+            where += " AND run_id = ?"
+            parameters = (run_id,)
+        rows = await self._fetch_all(
+            f"SELECT rowid AS sequence, * FROM event_outbox WHERE {where} ORDER BY rowid",
+            parameters,
+        )
+        return tuple(self._outbox_event_from_row(row) for row in rows)
+
+    async def mark_event_delivered(
+        self, event_id: str, *, run_id: str | None = None
+    ) -> OutboxEventRecord:
+        """Idempotently mark an event delivered after its projection is durable."""
+        now = self._now()
+        async with self.transaction() as db:
+            cursor = await db.execute(
+                "SELECT rowid AS sequence, * FROM event_outbox WHERE event_id = ?",
+                (event_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerNotFoundError(
+                    f"outbox event {event_id} was not found; reload undelivered events before marking it"
+                )
+            if run_id is not None and row["run_id"] != run_id:
+                raise LedgerTransitionError(
+                    f"outbox event {event_id} belongs to another run; flush only the requested run"
+                )
+            if row["delivered_at"] is None:
+                await db.execute(
+                    "UPDATE event_outbox SET delivered_at = ? WHERE event_id = ?",
+                    (now, event_id),
+                )
+            cursor = await db.execute(
+                "SELECT rowid AS sequence, * FROM event_outbox WHERE event_id = ?",
+                (event_id,),
+            )
+            delivered = await cursor.fetchone()
+            assert delivered is not None
+            return self._outbox_event_from_row(delivered)
 
     async def load_snapshot(self, run_id: str, *, rejection_limit: int | None = 20) -> RunSnapshot:
         if rejection_limit is not None and rejection_limit < 0:
@@ -803,6 +1530,9 @@ class RunLedger:
                     capability=row["capability"],
                     status=_action_status(row["status"], "actions.status"),
                     failure_signature=row["failure_signature"],
+                    repair_class=row["repair_class"],
+                    repair_source=row["repair_source"],
+                    reason_code=row["reason_code"],
                 )
                 for row in actions
             ),
@@ -831,6 +1561,9 @@ class RunLedger:
                     error_code=row["error_code"],
                     message=row["message"],
                     action_id=row["action_id"],
+                    repair_class=row["repair_class"],
+                    repair_source=row["repair_source"],
+                    reason_code=row["reason_code"],
                 )
                 for row in incidents
             ),
@@ -874,8 +1607,28 @@ class RunLedger:
     async def action_status(self, action_id: str) -> ActionStatus:
         return (await self.get_action(action_id)).status
 
+    async def list_actions(self, run_id: str) -> tuple[ActionRecord, ...]:
+        """Load durable Actions without exposing SQLite rows to the controller."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT * FROM actions WHERE run_id = ? ORDER BY action_id", (run_id,)
+        )
+        return tuple(self._action_from_row(row) for row in rows)
+
+    async def running_attempts(self, run_id: str) -> tuple[ActionAttemptRecord, ...]:
+        """Load attempts left RUNNING across a controller crash boundary."""
+        await self.get_run(run_id)
+        rows = await self._fetch_all(
+            "SELECT aa.* FROM action_attempts aa "
+            "JOIN actions a ON a.action_id = aa.action_id "
+            "WHERE a.run_id = ? AND a.status = ? AND aa.status = ? "
+            "ORDER BY aa.action_id, aa.attempt",
+            (run_id, ActionStatus.RUNNING.value, ActionStatus.RUNNING.value),
+        )
+        return tuple(self._attempt_from_row(row) for row in rows)
+
     async def event_names(self) -> tuple[str, ...]:
-        rows = await self._fetch_all("SELECT event_name FROM event_outbox ORDER BY created_at, event_id", ())
+        rows = await self._fetch_all("SELECT event_name FROM event_outbox ORDER BY rowid", ())
         return tuple(row["event_name"] for row in rows)
 
     async def has_open_incident(self, error_code: str) -> bool:
@@ -894,6 +1647,67 @@ class RunLedger:
     async def _fetch_all(self, sql: str, parameters: tuple[object, ...]) -> list[aiosqlite.Row]:
         cursor = await self._db.execute(sql, parameters)
         return list(await cursor.fetchall())
+
+    @staticmethod
+    async def _intent_rows_for_attempt(
+        db: aiosqlite.Connection, action_id: str, attempt: int
+    ) -> list[aiosqlite.Row]:
+        cursor = await db.execute(
+            "SELECT * FROM promotion_intents WHERE action_id = ? AND attempt = ? ORDER BY ordinal",
+            (action_id, attempt),
+        )
+        return list(await cursor.fetchall())
+
+    async def _mark_bundle_conflict_tx(
+        self,
+        db: aiosqlite.Connection,
+        action: aiosqlite.Row,
+        attempt: aiosqlite.Row,
+        reason_code: str,
+        message: str,
+    ) -> None:
+        now = self._now()
+        await db.execute(
+            "UPDATE promotion_intents SET status = 'CONFLICT' WHERE action_id = ? AND attempt = ?",
+            (action["action_id"], attempt["attempt"]),
+        )
+        await db.execute(
+            "UPDATE action_attempts SET status = ?, repair_class = 'integrity', "
+            "repair_source = 'integrity_guard', reason_code = ?, finished_at = ? "
+            "WHERE action_id = ? AND attempt = ?",
+            (ActionStatus.REPAIR_REQUIRED.value, reason_code, now, action["action_id"], attempt["attempt"]),
+        )
+        await db.execute(
+            "UPDATE actions SET status = ?, repair_class = 'integrity', "
+            "repair_source = 'integrity_guard', reason_code = ? WHERE action_id = ?",
+            (ActionStatus.REPAIR_REQUIRED.value, reason_code, action["action_id"]),
+        )
+        await db.execute(
+            "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+            (RunStatus.BLOCKED.value, now, action["run_id"]),
+        )
+        subject = f"attempt:{attempt['attempt']}"
+        cursor = await db.execute(
+            "SELECT incident_id FROM incidents WHERE action_id = ? AND error_code = ? "
+            "AND subject = ? AND status = 'OPEN'",
+            (action["action_id"], reason_code, subject),
+        )
+        prior = await cursor.fetchone()
+        if prior is None:
+            incident = await self._insert_incident(
+                db,
+                run_id=action["run_id"],
+                error_code=reason_code,
+                message=message,
+                action_id=action["action_id"],
+                subject=subject,
+                now=now,
+            )
+            await db.execute(
+                "UPDATE incidents SET repair_class = 'integrity', "
+                "repair_source = 'integrity_guard', reason_code = ? WHERE incident_id = ?",
+                (reason_code, incident.incident_id),
+            )
 
     async def _count(self, sql: str, parameters: tuple[object, ...]) -> int:
         row = await self._fetch_one(sql, parameters)
@@ -927,15 +1741,22 @@ class RunLedger:
         return row
 
     async def _attempt_row(self, db: aiosqlite.Connection, action_id: str, attempt: int) -> aiosqlite.Row:
-        cursor = await db.execute(
-            "SELECT * FROM action_attempts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
-        )
-        row = await cursor.fetchone()
+        row = await self._fetch_attempt_row(db, action_id, attempt)
         if row is None:
             raise LedgerNotFoundError(
                 f"attempt {attempt} for {action_id} was not found; start the action before finishing it"
             )
         return row
+
+    @staticmethod
+    async def _fetch_attempt_row(
+        db: aiosqlite.Connection, action_id: str, attempt: int
+    ) -> aiosqlite.Row | None:
+        cursor = await db.execute(
+            "SELECT * FROM action_attempts WHERE action_id = ? AND attempt = ?",
+            (action_id, attempt),
+        )
+        return await cursor.fetchone()
 
     async def _latest_plan_version(self, db: aiosqlite.Connection, run_id: str) -> int | None:
         cursor = await db.execute("SELECT MAX(version) AS version FROM plan_versions WHERE run_id = ?", (run_id,))
@@ -945,12 +1766,21 @@ class RunLedger:
 
     async def _ready_to_complete(self, db: aiosqlite.Connection, run_id: str) -> bool:
         cursor = await db.execute(
-            "SELECT COUNT(*) AS total, SUM(status = ?) AS successful FROM actions WHERE run_id = ?",
-            (ActionStatus.SUCCEEDED.value, run_id),
+            "SELECT SUM(status = ?) AS successful, "
+            "SUM(status IN (?, ?, ?, ?, ?)) AS unfinished FROM actions WHERE run_id = ?",
+            (
+                ActionStatus.SUCCEEDED.value,
+                ActionStatus.AUTHORIZED.value,
+                ActionStatus.RUNNING.value,
+                ActionStatus.RETRY_WAIT.value,
+                ActionStatus.INDETERMINATE.value,
+                ActionStatus.PAUSED.value,
+                run_id,
+            ),
         )
         row = await cursor.fetchone()
         assert row is not None
-        return int(row["total"]) > 0 and int(row["successful"] or 0) == int(row["total"])
+        return int(row["successful"] or 0) > 0 and int(row["unfinished"] or 0) == 0
 
     async def _committed_action(self, db: aiosqlite.Connection, action_id: str) -> CommittedAction:
         action = await self._require_action(db, action_id)
@@ -997,6 +1827,51 @@ class RunLedger:
         assert row is not None
         return float(row["cost"])
 
+    async def _insert_outbox(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        run_id: str,
+        event_name: str,
+        aggregate_id: str,
+        payload_json: str,
+        idempotency_key: str,
+        now: str,
+    ) -> None:
+        payload = json.loads(payload_json)
+        payload["run_id"] = run_id
+        canonical_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        cursor = await db.execute(
+            "SELECT * FROM event_outbox WHERE idempotency_key = ?",
+            (idempotency_key,),
+        )
+        prior = await cursor.fetchone()
+        if prior is not None:
+            if (
+                prior["event_name"] != event_name
+                or prior["run_id"] != run_id
+                or prior["aggregate_id"] != aggregate_id
+                or prior["payload_json"] != canonical_payload
+            ):
+                raise LedgerConflictError(
+                    f"outbox event {idempotency_key} disagrees with its durable fact; inspect "
+                    "the controller event identity before retrying"
+                )
+            return
+        await db.execute(
+            "INSERT INTO event_outbox (event_id, run_id, event_name, aggregate_id, payload_json, "
+            "idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                idempotency_key,
+                run_id,
+                event_name,
+                aggregate_id,
+                canonical_payload,
+                idempotency_key,
+                now,
+            ),
+        )
+
     async def _insert_incident(
         self,
         db: aiosqlite.Connection,
@@ -1017,6 +1892,22 @@ class RunLedger:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (record.incident_id, run_id, action_id, error_code, subject, message, record.status, now),
         )
+        await self._insert_outbox(
+            db,
+            run_id=run_id,
+            event_name="incident.created",
+            aggregate_id=action_id or run_id,
+            payload_json=json.dumps(
+                {
+                    "incident_id": record.incident_id,
+                    "action_id": action_id,
+                    "error_code": error_code,
+                },
+                sort_keys=True,
+            ),
+            idempotency_key=f"incident.created:{record.incident_id}",
+            now=now,
+        )
         return record
 
     @staticmethod
@@ -1034,6 +1925,13 @@ class RunLedger:
             dependencies=tuple(json.loads(row["dependencies_json"])), priority=row["priority"],
             read_set=tuple(json.loads(row["read_set_json"])), write_set=tuple(json.loads(row["write_set_json"])),
             status=_action_status(row["status"], "actions.status"), idempotency_key=row["idempotency_key"],
+            expected_artifact_manifest=ExpectedArtifactManifest.model_validate_json(
+                row["expected_manifest_json"]
+            ),
+            expected_manifest_digest=row["expected_manifest_digest"],
+            expected_evidence_refs=tuple(json.loads(row["expected_evidence_refs_json"])),
+            retry_policy=RetryPolicySpec.model_validate_json(row["retry_policy_json"]),
+            retry_policy_fingerprint=row["retry_policy_fingerprint"],
             failure_signature=row["failure_signature"],
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
         )
@@ -1049,6 +1947,10 @@ class RunLedger:
             canonical_relpath=row["canonical_relpath"],
             checksum=row["checksum"],
             media_type=row["media_type"],
+            evidence_role=row["evidence_role"],
+            metadata_json=row["metadata_json"],
+            ordinal=row["ordinal"],
+            bundle_digest=row["bundle_digest"],
             status=status,
             created_at=_parse_time(row["created_at"]),
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
@@ -1063,9 +1965,30 @@ class RunLedger:
             subject=row["subject"],
             message=row["message"],
             action_id=row["action_id"],
+            repair_class=row["repair_class"],
+            repair_source=row["repair_source"],
+            reason_code=row["reason_code"],
             status=row["status"],
             created_at=_parse_time(row["created_at"]),
             resolved_at=None if row["resolved_at"] is None else _parse_time(row["resolved_at"]),
+        )
+
+    @staticmethod
+    def _outbox_event_from_row(row: aiosqlite.Row) -> OutboxEventRecord:
+        return OutboxEventRecord(
+            sequence=row["sequence"],
+            event_id=row["event_id"],
+            run_id=row["run_id"],
+            event_name=row["event_name"],
+            aggregate_id=row["aggregate_id"],
+            payload_json=row["payload_json"],
+            idempotency_key=row["idempotency_key"],
+            created_at=_parse_time(row["created_at"]),
+            delivered_at=(
+                None
+                if row["delivered_at"] is None
+                else _parse_time(row["delivered_at"])
+            ),
         )
 
     @staticmethod
@@ -1094,9 +2017,65 @@ class RunLedger:
             action_id=row["action_id"],
             attempt=row["attempt"],
             status=_action_status(row["status"], "action_attempts.status"),
-            started_at=_parse_time(row["started_at"]),
+            parameters_json=row["parameters_json"],
+            expected_artifact_manifest=ExpectedArtifactManifest.model_validate_json(
+                row["expected_manifest_json"]
+            ),
+            expected_manifest_digest=row["expected_manifest_digest"],
+            expected_evidence_refs=tuple(json.loads(row["expected_evidence_refs_json"])),
+            retry_policy=RetryPolicySpec.model_validate_json(row["retry_policy_json"]),
+            retry_policy_fingerprint=row["retry_policy_fingerprint"],
+            retry_of_attempt=row["retry_of_attempt"],
+            staging_relpath=row["staging_relpath"],
+            started_at=None if row["started_at"] is None else _parse_time(row["started_at"]),
             finished_at=None if row["finished_at"] is None else _parse_time(row["finished_at"]),
             failure_signature=row["failure_signature"],
+        )
+
+    @staticmethod
+    def _outcome_receipt_from_row(row: aiosqlite.Row) -> AttemptOutcomeReceiptRecord:
+        return AttemptOutcomeReceiptRecord(
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            canonical_outcome_json=row["canonical_outcome_json"],
+            outcome_digest=row["outcome_digest"],
+            canonical_bundle_json=row["canonical_bundle_json"],
+            bundle_digest=row["bundle_digest"],
+            evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+            error_code=row["error_code"],
+            failure_signature=row["failure_signature"],
+            recorded_at=_parse_time(row["recorded_at"]),
+        )
+
+    @staticmethod
+    def _gate_receipt_from_row(row: aiosqlite.Row) -> GateReceiptRecord:
+        identities = _GateIdentityList.model_validate_json(row["artifacts_json"])
+        return GateReceiptRecord(
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            validator_id=row["validator_id"],
+            validator_version=row["validator_version"],
+            canonical_gate_decision_json=row["canonical_gate_decision_json"],
+            gate_decision_digest=row["gate_decision_digest"],
+            bundle_digest=row["bundle_digest"],
+            artifacts=identities.items,
+            evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+            recorded_at=_parse_time(row["recorded_at"]),
+        )
+
+    @staticmethod
+    def _repair_fact_from_row(row: aiosqlite.Row) -> RepairFactRecord:
+        return RepairFactRecord(
+            action_id=row["action_id"],
+            attempt=row["attempt"],
+            repair_class=row["repair_class"],
+            repair_source=row["repair_source"],
+            reason_code=row["reason_code"],
+            defect_codes=tuple(json.loads(row["defect_codes_json"])),
+            evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+            message=row["message"],
+            outcome_digest=row["outcome_digest"],
+            recorded_at=_parse_time(row["recorded_at"]),
         )
 
 

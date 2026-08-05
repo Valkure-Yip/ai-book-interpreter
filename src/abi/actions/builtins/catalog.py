@@ -17,20 +17,25 @@ from abi.actions.builtins.inputs import (
     ReviewBatchInput,
     SourceIngestInput,
     SourceSplitInput,
+    SpotcheckInput,
 )
 from abi.actions.contracts import ActionDefinition, ActionExecutionContext
+from abi.actions.effects import expand_expected_artifacts
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.actions.validators import validator_catalog
+from abi.epub.result import GateResult
+from abi.project.artifacts import ArtifactStore, BufferedAttemptWriter
 from abi.project.layout import BookProject
 from abi.prompts.actions import ActionPromptRegistry, ActionPromptSnapshot
-from abi.tools.belt import ToolBelt, build_belt
+from abi.tools.belt import build_belt
 from abi.tools.context import ToolContext
 from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionArgument,
     ActionKind,
+    ActionOutcome,
     ActionOutcomeEnvelope,
     ActionSpec,
     ActionStatus,
@@ -141,7 +146,7 @@ _BUILTINS = (
     _Builtin("epub.build", "Build and lint the full EPUB deterministically.", BuildEpubInput,
              ActionKind.DETERMINISTIC, "preproduction.sample", "output/book.epub", "output/book.epub",
              (), (), ("chapters/final", "frontmatter", "metadata", "assets"), ("output",), 0.0),
-    _Builtin("review.spotcheck", "Run isolated stratified random review.", ReviewBatchInput,
+    _Builtin("review.spotcheck", "Run isolated stratified random review.", SpotcheckInput,
              ActionKind.COMPOSITE, "epub.build", "reviews/random_spotcheck", "reviews/random_spotcheck",
              ("read_file", "grep", "select_random_review_passages",
               "validate_random_spotcheck", "spawn_review_agent"), _QUALITY_SKILLS,
@@ -258,6 +263,8 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
                 )
             )
     elif capability == "review.spotcheck":
+        if not isinstance(parameters, SpotcheckInput):
+            raise TypeError("review.spotcheck requires SpotcheckInput")
         write_dirs = []
 
     return ActionPathPermissions(
@@ -382,16 +389,26 @@ class AgentActionExecutor:
     async def __call__(
         self, context: ActionExecutionContext, parameters: FrozenModel
     ) -> ActionOutcomeEnvelope:
+        parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
+        action_id = context.action_id or f"{self._capability}:{parameter_hash}"
         if self._tool_context is None or self._tool_context.project.root != context.project.root:
             return ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=context.attempt,
                 outcome=PermanentFailure(
                     error_code="action_runtime_not_bound",
                     message="Bind this catalog to the current ToolContext before dispatch.",
                 )
             )
         envelope = build_action_envelope(self._capability, parameters)
-        parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
-        action_id = context.action_id or f"{self._capability}:{parameter_hash}"
+        store = ArtifactStore(context.project, None)
+        attempt_writer = store.writer(action_id, context.attempt)
+        writer = (
+            BufferedAttemptWriter(action_id, context.attempt)
+            if self._capability == "review.spotcheck"
+            else attempt_writer
+        )
+        manifest = expand_expected_artifacts(self._capability, action_id, parameters)
         belt = build_belt(
             self._tool_context,
             get_run_snapshot=lambda: context.snapshot,
@@ -407,6 +424,9 @@ class AgentActionExecutor:
                 target_language=context.target_lang,
                 publication_mode=context.publication_mode,
             ),
+            writer=writer,
+            expected_artifacts={item.canonical_relpath: item for item in manifest.entries},
+            spotcheck_input=parameters if isinstance(parameters, SpotcheckInput) else None,
         )
         try:
             tools = belt.resolve(tuple(tool.name for tool in envelope.tools))
@@ -420,27 +440,68 @@ class AgentActionExecutor:
             if skill_context:
                 user_prompt = f"{user_prompt}\n\n# Action skills\n{skill_context}"
         except (OSError, TypeError, ValueError) as exc:
+            store.close()
             return ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=context.attempt,
                 outcome=RepairRequired(
+                    repair_class="integrity",
+                    repair_source="action_outcome",
+                    reason_code="action_envelope_invalid",
                     defect_codes=("action_envelope_invalid",),
                     message=str(exc),
                 )
             )
         from abi.providers.agent_runtime import AgentActionRequest
 
-        result = await self._tool_context.services.agent.run_action(
-            AgentActionRequest(
-                system_prompt=self._prompts.system_prompt(self._capability, snapshot),
-                user_prompt=user_prompt,
-                tools=tools,
-                agent_name=self._capability.replace(".", "_"),
-                thread_id=f"{context.run_id}:{self._capability}:{parameter_hash}",
-                checkpoint_path=context.project.graph_checkpoints,
-                max_iterations=40,
-                may_have_side_effects=bool(envelope.permissions.write_files or envelope.permissions.write_dirs),
+        try:
+            result = await self._tool_context.services.agent.run_action(
+                AgentActionRequest(
+                    system_prompt=self._prompts.system_prompt(self._capability, snapshot),
+                    user_prompt=user_prompt,
+                    tools=tools,
+                    agent_name=self._capability.replace(".", "_"),
+                    thread_id=f"{context.run_id}/{action_id}/{context.attempt}",
+                    checkpoint_path=context.project.graph_checkpoints,
+                    max_iterations=40,
+                    may_have_side_effects=bool(envelope.permissions.write_files or envelope.permissions.write_dirs),
+                )
             )
-        )
-        return ActionOutcomeEnvelope(outcome=result.outcome)
+            outcome: ActionOutcome
+            if isinstance(result.outcome, Succeeded):
+                bundle = writer.artifact_bundle()
+                expected_effects = tuple(
+                    (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
+                    for item in manifest.entries
+                )
+                actual_effects = tuple(
+                    (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
+                    for item in bundle.entries
+                )
+                if actual_effects != expected_effects:
+                    return ActionOutcomeEnvelope(
+                        action_id=action_id,
+                        attempt=context.attempt,
+                        outcome=RepairRequired(
+                            repair_class="integrity",
+                            repair_source="action_outcome",
+                            reason_code="artifact_bundle_conflict",
+                            defect_codes=("artifact_bundle_conflict",),
+                            message="Recorded attempt effects do not equal the authorized manifest.",
+                        ),
+                    )
+                if isinstance(writer, BufferedAttemptWriter):
+                    bundle = writer.flush_to(attempt_writer)
+                outcome = Succeeded(
+                    artifact_bundle=bundle, evidence_refs=result.outcome.evidence_refs
+                )
+            else:
+                outcome = result.outcome
+            return ActionOutcomeEnvelope(
+                action_id=action_id, attempt=context.attempt, outcome=outcome
+            )
+        finally:
+            store.close()
 
 
 class DeterministicActionExecutor:
@@ -453,92 +514,221 @@ class DeterministicActionExecutor:
     async def __call__(
         self, context: ActionExecutionContext, parameters: FrozenModel
     ) -> ActionOutcomeEnvelope:
+        action_id = context.action_id or self._capability.replace(".", "-")
+        store = ArtifactStore(context.project, None)
         try:
-            if self._capability in {"source.ingest", "source.split"}:
-                if self._tool_context is None:
-                    raise RuntimeError("bind ToolContext before executing source Actions")
-                belt: ToolBelt = build_belt(
-                    self._tool_context,
-                    get_run_snapshot=lambda: context.snapshot,
-                    permissions=_permissions_for(self._capability, parameters),
+            writer = store.writer(action_id, context.attempt)
+            evidence_refs: tuple[str, ...]
+            if self._capability == "source.ingest":
+                if not isinstance(parameters, SourceIngestInput):
+                    raise TypeError("source.ingest requires SourceIngestInput")
+                from abi.ir import ingest
+
+                source_path = context.project.root / parameters.source_relpath
+                if not source_path.is_file():
+                    raise FileNotFoundError(f"source input {parameters.source_relpath} is missing")
+                book, warnings = ingest(source_path)
+                paragraphs = book.iter_paragraphs()
+                clean = "\n\n".join(
+                    item.source_text for item in paragraphs if item.source_text.strip()
                 )
-                tool_name = "ingest_source" if self._capability == "source.ingest" else "split_chapters"
-                tool = next(item for item in belt.content if item.name == tool_name)
-                if isinstance(parameters, SourceIngestInput):
-                    summary = str(tool.callable(source_relpath=parameters.source_relpath))
-                elif isinstance(parameters, SourceSplitInput):
-                    summary = str(
-                        tool.callable(
-                            source_relpath=parameters.source_relpath,
-                            refine_toc=parameters.refine_toc,
-                        )
+                manifest = {
+                    "authors": book.meta.authors,
+                    "format": book.meta.source_format,
+                    "paragraphs": len(paragraphs),
+                    "sections": len(book.toc),
+                    "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                    "source_file": parameters.source_relpath,
+                    "source_language": book.meta.source_language,
+                    "title": book.meta.title,
+                    "warnings": warnings[:50],
+                }
+                writer.write_text(
+                    "source/source_manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    media_type="application/json",
+                    evidence_role="source_manifest",
+                )
+                writer.write_text(
+                    "source/source_text.txt",
+                    clean,
+                    media_type="text/plain",
+                    evidence_role="source_text",
+                )
+                evidence_refs = ("source_manifest", "source_text")
+            elif self._capability == "source.split":
+                if not isinstance(parameters, SourceSplitInput):
+                    raise TypeError("source.split requires SourceSplitInput")
+                from abi.ir import ingest
+                from abi.ir.split import render_chapters
+
+                source_path = context.project.root / parameters.source_relpath
+                if not source_path.is_file():
+                    source_path = context.project.source_clean
+                if not source_path.is_file():
+                    raise FileNotFoundError("source input for source.split is missing")
+                book, _ = ingest(source_path)
+                rendered = render_chapters(book)
+                entries = [entry for entry, _ in rendered]
+                actual_chapters = tuple(entry.slug for entry in entries)
+                if actual_chapters != parameters.expected_chapters:
+                    raise ValueError(
+                        "actual source chapter stems do not exactly equal expected_chapters"
                     )
-                else:
-                    raise TypeError(f"invalid typed parameters for {self._capability}")
-                if summary.startswith("ERROR:"):
-                    return ActionOutcomeEnvelope(
-                        outcome=RepairRequired(
-                            defect_codes=("deterministic_action_failed",), message=summary
-                        )
+                for entry, content in rendered:
+                    writer.write_text(
+                        f"chapters/src/{entry.src_path}",
+                        content,
+                        media_type="text/markdown",
+                        evidence_role="source_chapter",
                     )
-                evidence = "source/source_manifest.json" if self._capability == "source.ingest" else "source/toc.json"
+                toc = [
+                    {
+                        "index": entry.index,
+                        "slug": entry.slug,
+                        "title": entry.title,
+                        "src": f"chapters/src/{entry.src_path}",
+                        "paragraphs": entry.paragraph_count,
+                    }
+                    for entry in entries
+                ]
+                writer.write_text(
+                    "source/toc.json",
+                    json.dumps(toc, ensure_ascii=False, indent=2),
+                    media_type="application/json",
+                    evidence_role="source_toc",
+                )
+                evidence_refs = (*parameters.expected_chapters, "source_toc")
             elif self._capability == "epub.build":
+                if not isinstance(parameters, BuildEpubInput):
+                    raise TypeError("epub.build requires BuildEpubInput")
                 from abi.epub.assets import asset_manifest_check
-                from abi.epub.build import build_epub
-                from abi.epub.epubcheck import run_epubcheck
+                from abi.epub.build import build_epub_bytes
+                from abi.epub.epubcheck import run_epubcheck_readonly
                 from abi.epub.lint import publication_lint
 
-                checks = (
-                    publication_lint(
-                        context.project,
-                        runtime_metadata=GateRuntimeMetadata(
-                            target_language=context.target_lang,
-                            publication_mode=context.publication_mode,
-                        ),
-                    ),
-                    asset_manifest_check(context.project),
+                build_result, epub_bytes = build_epub_bytes(context.project)
+                if not build_result.ok or not epub_bytes:
+                    raise ValueError(build_result.message)
+                asset_result = asset_manifest_check(context.project, write_report=False)
+                lint_result = publication_lint(
+                    context.project,
+                    runtime_metadata=context.runtime_metadata,
+                    write_report=False,
                 )
-                failed = next((result for result in checks if not result.ok), None)
-                if failed is None:
-                    failed = build_epub(context.project)
-                if failed.ok:
-                    failed = run_epubcheck(context.project, context.project.book_epub)
-                if not failed.ok:
-                    return ActionOutcomeEnvelope(
-                        outcome=RepairRequired(
-                            defect_codes=("epub_gate_failed",), message=failed.summary()
-                        )
-                    )
-                evidence = "output/book.epub"
+                writer.write_bytes(
+                    "output/asset_manifest_check.json",
+                    _gate_result_json(asset_result),
+                    media_type="application/json",
+                    evidence_role="asset_gate",
+                )
+                writer.write_bytes(
+                    "output/book.epub",
+                    epub_bytes,
+                    media_type="application/epub+zip",
+                    evidence_role="epub",
+                )
+                epubcheck_result = run_epubcheck_readonly(
+                    writer.staged_path("output/book.epub")
+                )
+                writer.write_bytes(
+                    "output/epubcheck.json",
+                    _gate_result_json(epubcheck_result),
+                    media_type="application/json",
+                    evidence_role="epubcheck",
+                )
+                writer.write_bytes(
+                    "output/publication_lint.json",
+                    _gate_result_json(lint_result),
+                    media_type="application/json",
+                    evidence_role="publication_gate",
+                )
+                evidence_refs = (
+                    "asset_gate",
+                    "epub",
+                    "epubcheck",
+                    "publication_gate",
+                )
             elif self._capability == "release.prepare":
-                from abi.release.create import create_release
-
                 if not isinstance(parameters, ReleaseInput):
                     raise TypeError("release.prepare requires ReleaseInput")
-                result = create_release(
-                    context.project,
-                    version=parameters.version,
-                    runtime_metadata=GateRuntimeMetadata(
-                        target_language=context.target_lang,
-                        publication_mode=context.publication_mode,
-                    ),
+                if not context.project.book_epub.is_file():
+                    raise FileNotFoundError("output/book.epub is missing")
+                rounds = sorted(context.project.random_spotcheck_dir.glob("round_*"))
+                if not rounds:
+                    raise ValueError("random spot-check evidence is missing")
+                report = json.loads(
+                    (rounds[-1] / "validation_report.json").read_text(encoding="utf-8")
                 )
-                if not result.ok:
-                    return ActionOutcomeEnvelope(
-                        outcome=RepairRequired(
-                            defect_codes=("release_gate_failed",), message=result.summary()
-                        )
-                    )
-                evidence = "output/release"
+                if not isinstance(report, dict) or report.get("status") != "PASS":
+                    raise ValueError("random spot-check has not passed")
+                version = (
+                    parameters.version
+                    if parameters.version.startswith("v")
+                    else f"v{parameters.version}"
+                )
+                artifact_name = f"book_{version}.epub"
+                state = {
+                    "book": context.book_slug,
+                    "producer": "ABI",
+                    "latest_status": "PASS",
+                    "latest_version": version,
+                    "releases": [
+                        {
+                            "version": version,
+                            "epub": artifact_name,
+                            "created_at": "staged",
+                            "status": "PASS",
+                        }
+                    ],
+                }
+                writer.write_bytes(
+                    f"output/release/{artifact_name}",
+                    context.project.book_epub.read_bytes(),
+                    media_type="application/epub+zip",
+                    evidence_role="release_epub",
+                )
+                writer.write_text(
+                    "output/release/release_state.json",
+                    json.dumps(state, ensure_ascii=False, indent=2),
+                    media_type="application/json",
+                    evidence_role="release_state",
+                )
+                evidence_refs = ("release_epub", "release_state")
             else:
-                raise RuntimeError(f"no deterministic executor for {self._capability}")
+                raise RuntimeError(
+                    f"{self._capability} requires a staged sink adapter before execution"
+                )
+            bundle = writer.artifact_bundle()
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=context.attempt,
                 outcome=PermanentFailure(
                     error_code="deterministic_action_error", message=str(exc)
                 )
             )
-        return ActionOutcomeEnvelope(outcome=Succeeded(staging_relpath=evidence))
+        finally:
+            store.close()
+        return ActionOutcomeEnvelope(
+            action_id=action_id,
+            attempt=context.attempt,
+            outcome=Succeeded(artifact_bundle=bundle, evidence_refs=evidence_refs),
+        )
+
+
+def _gate_result_json(result: GateResult) -> bytes:
+    return json.dumps(
+        {
+            "ok": bool(result.ok),
+            "message": str(result.message),
+            "errors": list(result.hard_errors),
+            "warnings": list(result.warnings),
+            "details": dict(result.details),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionRegistry:
@@ -573,6 +763,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
             validator=item.capability,
             resource_class="review" if item.kind == ActionKind.COMPOSITE else "default",
             estimated_cost_usd=item.estimated_cost,
+            may_have_side_effects=bool(item.write_set),
         )
         executor = (
             DeterministicActionExecutor(item.capability, tool_context=tool_context)
@@ -586,6 +777,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
                 input_model=item.input_model,
                 executor=executor,
                 validator=validator,
+                effect_expander=expand_expected_artifacts,
             )
         )
     registry.validate_startup()

@@ -5,13 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from abi.actions.builtins.inputs import SpotcheckInput
+from abi.project.artifacts import AttemptStagingWriter, BufferedAttemptWriter
 from abi.tools.content import make_content_tools
 from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
 from abi.tools.gates import make_gate_tools
 from abi.tools.permissions import ActionPathPermissions
 from abi.tools.subagent import make_subagent_tools
-from abi.types.orchestration import RunSnapshot
+from abi.types.orchestration import ExpectedArtifact, RunSnapshot
 from abi.types.tools import GateRuntimeMetadata, ReviewActionIdentity, ToolBinding
 
 
@@ -58,9 +60,17 @@ def build_belt(
     action_identity: ReviewActionIdentity | None = None,
     capability: str | None = None,
     runtime_metadata: GateRuntimeMetadata | None = None,
+    writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
+    expected_artifacts: dict[str, ExpectedArtifact] | None = None,
+    spotcheck_input: SpotcheckInput | None = None,
 ) -> ToolBelt:
     return ToolBelt(
-        fs=make_fs_tools(ctx, permissions=permissions),
+        fs=make_fs_tools(
+            ctx,
+            permissions=permissions,
+            writer=writer,
+            expected_artifacts=expected_artifacts,
+        ),
         content=make_content_tools(
             ctx,
             get_run_snapshot=get_run_snapshot,
@@ -70,11 +80,16 @@ def build_belt(
             ctx,
             permissions=gate_permissions or permissions,
             runtime_metadata=runtime_metadata,
+            writer=writer,
+            spotcheck_input=spotcheck_input,
         ),
         subagent=make_subagent_tools(
             ctx,
             permissions=permissions,
             action_identity=action_identity,
             capability=capability,
+            writer=writer,
+            spotcheck_input=spotcheck_input,
+            expected_artifacts=expected_artifacts,
         ),
     )

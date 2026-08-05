@@ -8,14 +8,18 @@ message history and a read-only-ish tool subset.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import Field
 
+from abi.actions.builtins.inputs import SpotcheckInput
+from abi.project.artifacts import AttemptStagingWriter, BufferedAttemptWriter
 from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
 from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
+from abi.types.orchestration import ExpectedArtifact
 from abi.types.tools import ReviewActionIdentity, ToolBinding
 
 
@@ -32,6 +36,9 @@ def make_subagent_tools(
     permissions: ActionPathPermissions | None = None,
     action_identity: ReviewActionIdentity | None = None,
     capability: str | None = None,
+    writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
+    spotcheck_input: SpotcheckInput | None = None,
+    expected_artifacts: Mapping[str, ExpectedArtifact] | None = None,
 ) -> list[ToolBinding]:
     def reviewer_permissions(agent_label: str) -> tuple[ActionPathPermissions, str]:
         if permissions is None:
@@ -40,10 +47,11 @@ def make_subagent_tools(
             output = f"reviews/{agent_label}/review.md"
             return permissions.model_copy(update={"write_files": (output,), "write_dirs": ()}), output
         if capability == "review.spotcheck":
-            rounds = sorted(ctx.project.random_spotcheck_dir.glob("round_*"))
-            if not rounds:
-                raise RuntimeError("select a spot-check round before spawning reviewers")
-            round_rel = ctx.project.rel(rounds[-1])
+            if spotcheck_input is None:
+                raise RuntimeError("spot-check reviewer requires frozen controller input")
+            if agent_label not in spotcheck_input.reviewers:
+                raise PermissionError(f"reviewer {agent_label!r} is not authorized for this round")
+            round_rel = f"reviews/random_spotcheck/{spotcheck_input.round_id}"
             review = f"{round_rel}/reviews/{agent_label}_review.md"
             summary = f"{round_rel}/reviews/{agent_label}_summary.json"
             scoped = permissions.model_copy(
@@ -81,7 +89,12 @@ def make_subagent_tools(
         if action_identity is None:
             raise RuntimeError("review sub-agent requires controller-owned Action identity")
         scoped_permissions, output = reviewer_permissions(agent_label)
-        tools = make_fs_tools(ctx, permissions=scoped_permissions)
+        tools = make_fs_tools(
+            ctx,
+            permissions=scoped_permissions,
+            writer=writer,
+            expected_artifacts=expected_artifacts,
+        )
         from abi.providers.agent_runtime import AgentActionRequest, CheckpointResume
 
         thread_id = (

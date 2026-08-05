@@ -20,6 +20,7 @@ from abi.actions.builtins.inputs import (
     SourceIngestInput,
 )
 from abi.actions.contracts import ActionDefinition, ActionExecutionContext
+from abi.actions.effects import expand_expected_artifacts
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry, RegistryConfigurationError
 from abi.project.layout import BookProject
@@ -169,7 +170,15 @@ async def test_source_action_executes_the_typed_source_path(tmp_path: Path) -> N
     )
 
     assert isinstance(result.outcome, Succeeded)
-    assert "Alternate source." in project.source_clean.read_text(encoding="utf-8")
+    clean = next(
+        entry
+        for entry in result.outcome.artifact_bundle.entries
+        if entry.canonical_relpath == "source/source_text.txt"
+    )
+    assert "Alternate source." in (project.root / clean.staged_relpath).read_text(
+        encoding="utf-8"
+    )
+    assert not project.source_clean.exists()
 
 
 @pytest.mark.asyncio
@@ -210,7 +219,13 @@ async def test_release_action_passes_typed_mode_without_legacy_state(
     )
 
     assert isinstance(result.outcome, Succeeded)
-    assert tuple(project.release_dir.glob("*_v0.0.1.epub"))
+    assert tuple(
+        entry.canonical_relpath for entry in result.outcome.artifact_bundle.entries
+    ) == (
+        "output/release/book_v0.0.1.epub",
+        "output/release/release_state.json",
+    )
+    assert not project.release_dir.exists()
 
 
 def test_action_prompt_registry_selects_by_capability_and_rejects_unknown() -> None:
@@ -333,6 +348,7 @@ def test_registry_rejects_nonportable_machine_namespaces(
         input_model=EmptyInput,
         executor=executor,  # type: ignore[arg-type]
         validator=validator,  # type: ignore[arg-type]
+        effect_expander=expand_expected_artifacts,
     )
 
     with pytest.raises(RegistryConfigurationError, match="portable lowercase ASCII"):

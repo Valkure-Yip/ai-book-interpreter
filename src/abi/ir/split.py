@@ -14,11 +14,11 @@ from pathlib import Path
 
 from abi.types.book import Book, Paragraph, Section
 
-_SLUG_RE = re.compile(r"[^\w\u4e00-\u9fff-]+")
+_SLUG_RE = re.compile(r"[^a-z0-9._-]+")
 
 
 def _slug(text: str, *, max_len: int = 40) -> str:
-    text = _SLUG_RE.sub("_", text.strip())
+    text = _SLUG_RE.sub("_", text.strip().casefold())
     text = re.sub(r"_+", "_", text).strip("_")
     return text[:max_len] or "section"
 
@@ -70,21 +70,37 @@ class ChapterEntry:
 def split_book_to_chapters(book: Book, chapters_src_dir: Path) -> list[ChapterEntry]:
     """Write one Markdown file per top-level section. Returns the TOC entries."""
     chapters_src_dir.mkdir(parents=True, exist_ok=True)
+    rendered = render_chapters(book)
+    entries = [entry for entry, _ in rendered]
+    for entry, content in rendered:
+        path = chapters_src_dir / entry.src_path
+        path.write_text(content, encoding="utf-8")
+    return entries
+
+
+def plan_chapters(book: Book) -> list[ChapterEntry]:
+    """Return deterministic chapter identities without writing filesystem output."""
     entries: list[ChapterEntry] = []
-    for i, section in enumerate(book.toc, start=1):
-        slug = f"{i:03d}_{_slug(section.heading)}"
-        path = chapters_src_dir / f"{slug}.md"
-        path.write_text(_render_chapter(section), encoding="utf-8")
+    for index, section in enumerate(book.toc, start=1):
+        slug = f"{index:03d}_{_slug(section.heading)}"
         entries.append(
             ChapterEntry(
-                index=i,
+                index=index,
                 slug=slug,
                 title=section.heading.strip(),
-                src_path=path.name,
+                src_path=f"{slug}.md",
                 paragraph_count=len(_collect_paragraphs(section)),
             )
         )
     return entries
+
+
+def render_chapters(book: Book) -> list[tuple[ChapterEntry, str]]:
+    """Render deterministic chapter payloads in memory without filesystem effects."""
+    return [
+        (entry, _render_chapter(section))
+        for entry, section in zip(plan_chapters(book), book.toc, strict=True)
+    ]
 
 
 def write_toc_json(entries: list[ChapterEntry], toc_path: Path) -> None:

@@ -16,7 +16,12 @@ from abi.orchestrator.driver import Orchestrator
 from abi.project import ScaffoldRequest, Status, scaffold_project
 from abi.providers.agent_runtime import AgentActionRequest
 from abi.tools.context import ToolContext
-from abi.types.orchestration import AgentRunResult, Succeeded
+from abi.types.orchestration import (
+    AgentRunResult,
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    Succeeded,
+)
 
 
 class _FakeServices:
@@ -54,7 +59,20 @@ class _FakeAgent:
         self._ingest_split(request.agent_name, self._p)
         self._gates(request.agent_name, self._p)
         return AgentRunResult(
-            outcome=Succeeded(staging_relpath="state/staging/offline/result.json"),
+            outcome=Succeeded(
+                artifact_bundle=ArtifactBundle(
+                    action_id="offline",
+                    attempt=1,
+                    entries=(
+                        ArtifactBundleEntry(
+                            staged_relpath="state/staging/offline/1/result.json",
+                            canonical_relpath="result.json",
+                            media_type="application/json",
+                            evidence_role="offline_fixture",
+                        ),
+                    ),
+                )
+            ),
             tool_calls=0,
             llm_calls=0,
             cost_usd=0.0,

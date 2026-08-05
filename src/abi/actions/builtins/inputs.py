@@ -32,11 +32,21 @@ class SourceSplitInput(FrozenModel):
 
     source_relpath: str = "source/source_text_raw.txt"
     refine_toc: bool = True
+    expected_chapters: tuple[str, ...] = Field(min_length=1)
 
     @field_validator("source_relpath")
     @classmethod
     def _portable_source_path(cls, value: str) -> str:
         return canonical_artifact_key(value)
+
+    @field_validator("expected_chapters")
+    @classmethod
+    def _ordered_expected_chapters(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(_CHAPTER_RE.fullmatch(chapter) is None for chapter in value):
+            raise ValueError("expected chapter stems must use portable lowercase ASCII")
+        if value != tuple(sorted(value)) or len(value) != len(set(value)):
+            raise ValueError("expected chapter stems must be unique and in canonical order")
+        return value
 
 
 class ResearchInput(FrozenModel):
@@ -77,6 +87,25 @@ class ReviewBatchInput(FrozenModel):
             raise ValueError(
                 "review batch names must use portable lowercase ASCII a-z, 0-9, '.', '_', or '-'"
             )
+        return value
+
+
+class SpotcheckInput(FrozenModel):
+    """Controller-frozen identity and sampling inputs for one review round."""
+
+    round_id: str = Field(pattern=r"^round_[0-9]{3}$")
+    reviewers: tuple[str, ...] = Field(min_length=1)
+    chapters: tuple[str, ...] = Field(min_length=1)
+    samples_per_agent: int = Field(ge=1)
+    seed: int = Field(ge=0)
+
+    @field_validator("reviewers", "chapters")
+    @classmethod
+    def _portable_ordered_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(_CHAPTER_RE.fullmatch(item) is None for item in value):
+            raise ValueError("spot-check names must use portable lowercase ASCII")
+        if value != tuple(sorted(value)) or len(value) != len(set(value)):
+            raise ValueError("spot-check names must be unique and in canonical order")
         return value
 
 

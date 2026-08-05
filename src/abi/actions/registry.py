@@ -70,6 +70,30 @@ class ActionRegistry:
     def validate_startup(self) -> None:
         for definition in self._definitions.values():
             self._validate_definition(definition)
+            probe = definition.spec.probe_capability
+            if probe is not None and probe not in self._definitions:
+                raise RegistryConfigurationError(
+                    f"probe capability {probe} for {definition.spec.capability} is not registered; "
+                    "register the read-only probe before startup"
+                )
+            if probe is not None:
+                probe_spec = self._definitions[probe].spec
+                if probe_spec.write_set or probe_spec.may_have_side_effects:
+                    raise RegistryConfigurationError(
+                        f"probe capability {probe} for {definition.spec.capability} must be "
+                        "read-only and side-effect-free; correct its ActionSpec before startup"
+                    )
+            for alternative in definition.spec.alternative_capabilities:
+                if alternative not in self._definitions:
+                    raise RegistryConfigurationError(
+                        f"alternative capability {alternative} for {definition.spec.capability} "
+                        "is not registered; register it before startup"
+                    )
+                if alternative == definition.spec.capability:
+                    raise RegistryConfigurationError(
+                        f"alternative capability for {definition.spec.capability} cannot point "
+                        "to itself; register a genuinely different capability"
+                    )
 
     def eligible(self, snapshot: RunSnapshot) -> tuple[EligibleAction, ...]:
         eligible: list[EligibleAction] = []
@@ -115,6 +139,28 @@ class ActionRegistry:
             definition=definition,
             parameters=parameters,
             parameters_json=parameters.model_dump_json(),
+        )
+
+    def resolve_json(self, capability: str, parameters_json: str) -> ResolvedAction:
+        """Re-parse durable canonical parameters before they enter an executor."""
+        definition = self.get(capability)
+        try:
+            parameters = definition.input_model.model_validate_json(parameters_json)
+        except ValidationError as exc:
+            raise RegistryConfigurationError(
+                f"durable arguments for {capability} are invalid; repair the authorized Action "
+                "from its original typed plan"
+            ) from exc
+        canonical_json = parameters.model_dump_json()
+        if canonical_json != parameters_json:
+            raise RegistryConfigurationError(
+                f"durable arguments for {capability} are not canonical; re-authorize the Action "
+                "through PolicyEngine before dispatch"
+            )
+        return ResolvedAction(
+            definition=definition,
+            parameters=parameters,
+            parameters_json=canonical_json,
         )
 
     def _validate_definition(self, definition: ActionDefinition) -> None:
@@ -175,6 +221,11 @@ class ActionRegistry:
                     f"skill {skill_ref} for {spec.capability} is not registered; "
                     "register the skill before startup"
                 )
+        if spec.probe_capability is not None and spec.probe_capability == spec.capability:
+            raise RegistryConfigurationError(
+                f"probe capability for {spec.capability} cannot point to itself; register a "
+                "separate read-only probe Action"
+            )
 
     @staticmethod
     def _decode_unique_arguments(

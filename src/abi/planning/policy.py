@@ -12,6 +12,9 @@ from abi.types.orchestration import (
     PlanPatch,
     ProposedAction,
     RunSnapshot,
+    canonical_manifest_json,
+    canonical_model_json,
+    sha256_canonical_json,
 )
 
 
@@ -203,6 +206,10 @@ class PolicyEngine:
             dependencies = tuple(
                 action_ids.get(dependency, dependency) for dependency in proposal.dependencies
             )
+            manifest = resolved.definition.effect_expander(
+                proposal.capability, action_id, resolved.parameters
+            )
+            retry_policy = resolved.definition.spec.retry_policy
             authorized.append(
                 AuthorizedAction(
                     action_id=action_id,
@@ -215,6 +222,19 @@ class PolicyEngine:
                     read_set=resolved.definition.spec.read_set,
                     write_set=resolved.definition.spec.write_set,
                     idempotency_key=action_id,
+                    expected_artifact_manifest=manifest,
+                    expected_artifact_manifest_digest=sha256_canonical_json(
+                        canonical_manifest_json(manifest)
+                    ),
+                    expected_evidence_refs=tuple(
+                        item.name
+                        for item in resolved.definition.spec.expected_evidence
+                        if item.required
+                    ),
+                    retry_policy=retry_policy,
+                    retry_policy_fingerprint=sha256_canonical_json(
+                        canonical_model_json(retry_policy)
+                    ),
                 )
             )
         return tuple(authorized)

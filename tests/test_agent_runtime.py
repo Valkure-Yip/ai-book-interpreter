@@ -37,6 +37,32 @@ from abi.types.run import LLMConfig
 from abi.types.tools import ToolBinding
 
 
+def _succeeded_envelope_payload(
+    *, evidence_refs: list[str] | None = None, leaf: str = "result.json"
+) -> dict[str, Any]:
+    action_id = "provider-result"
+    return {
+        "action_id": action_id,
+        "attempt": 1,
+        "outcome": {
+            "kind": "succeeded",
+            "artifact_bundle": {
+                "action_id": action_id,
+                "attempt": 1,
+                "entries": [
+                    {
+                        "staged_relpath": f"state/staging/{action_id}/1/{leaf}",
+                        "canonical_relpath": leaf,
+                        "media_type": "application/json",
+                        "evidence_role": "provider_result",
+                    }
+                ],
+            },
+            "evidence_refs": evidence_refs or [],
+        },
+    }
+
+
 def test_action_runtime_exposes_abi_owned_request_and_result_surface() -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
 
@@ -73,23 +99,25 @@ class _HistoryAwareModel(BaseChatModel):
     ) -> ChatResult:
         human_turns = sum(message.type == "human" for message in messages)
         if human_turns == 1:
-            outcome: dict[str, Any] = {
-                "kind": "paused",
-                "reason": "hitl",
-                "message": "resume this Action on the same durable thread",
+            envelope_args: dict[str, Any] = {
+                "action_id": "provider-result",
+                "attempt": 1,
+                "outcome": {
+                    "kind": "paused",
+                    "reason": "hitl",
+                    "message": "resume this Action on the same durable thread",
+                },
             }
         else:
-            outcome = {
-                "kind": "succeeded",
-                "staging_relpath": "state/staging/a1/1/result.json",
-                "evidence_refs": ["prior_tool_result"],
-            }
+            envelope_args = _succeeded_envelope_payload(
+                evidence_refs=["prior_tool_result"]
+            )
         message = AIMessage(
             content="",
             tool_calls=[
                 {
                     "name": "ActionOutcomeEnvelope",
-                    "args": {"outcome": outcome},
+                    "args": envelope_args,
                     "id": f"outcome-{human_turns}",
                     "type": "tool_call",
                 }
@@ -227,11 +255,7 @@ def _success_message(*, evidence: list[str] | None = None) -> AIMessage:
             {
                 "name": "ActionOutcomeEnvelope",
                 "args": {
-                    "outcome": {
-                        "kind": "succeeded",
-                        "staging_relpath": "state/staging/a1/1/result.json",
-                        "evidence_refs": evidence or [],
-                    }
+                    **_succeeded_envelope_payload(evidence_refs=evidence)
                 },
                 "id": "outcome-success",
                 "type": "tool_call",
@@ -840,13 +864,9 @@ async def test_same_node_resumes_second_interrupt_despite_historical_resume_writ
         if "deliver_b" not in effects:
             effects.append("deliver_b")
         return {
-            "structured_response": {
-                "outcome": {
-                    "kind": "succeeded",
-                    "staging_relpath": "state/staging/a1/1/result.json",
-                    "evidence_refs": ["two-approved-effects"],
-                }
-            }
+            "structured_response": _succeeded_envelope_payload(
+                evidence_refs=["two-approved-effects"]
+            )
         }
 
     def real_node_agent(*args: Any, **kwargs: Any) -> Any:
@@ -997,13 +1017,9 @@ async def test_real_parallel_partial_resume_excludes_completed_task_interrupt(
 
     def finish(state: _ParallelInterruptState) -> dict[str, object]:
         return {
-            "structured_response": {
-                "outcome": {
-                    "kind": "succeeded",
-                    "staging_relpath": "state/staging/parallel/result.json",
-                    "evidence_refs": state["effects"],
-                }
-            }
+            "structured_response": _succeeded_envelope_payload(
+                evidence_refs=state["effects"], leaf="parallel/result.json"
+            )
         }
 
     def build_graph(checkpointer: Any) -> Any:

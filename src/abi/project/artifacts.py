@@ -15,11 +15,23 @@ from weakref import finalize
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.layout import BookProject
 from abi.project.run_ledger import LedgerTransitionError, PromotionIntent, RunLedger
+from abi.types.orchestration import (
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    ArtifactMetadata,
+    AttemptOutcomeReceiptPayload,
+    ExpectedArtifactManifest,
+    Succeeded,
+    canonical_bundle_json,
+    canonical_model_json,
+    sha256_canonical_json,
+)
 
 __all__ = [
     "ArtifactConflictError",
     "ArtifactReconciliationError",
     "ArtifactStore",
+    "AttemptStagingWriter",
     "InjectedCrash",
     "PromotionIntent",
     "sha256_file",
@@ -49,6 +61,179 @@ class ArtifactReconciliationError(ArtifactConflictError):
 
 class InjectedCrash(RuntimeError):
     """Test-only failure raised at a durable promotion crash boundary."""
+
+
+class AttemptStagingWriter:
+    """Create-only logical canonical writes bound to one attempt namespace."""
+
+    def __init__(self, store: ArtifactStore, action_id: str, attempt: int) -> None:
+        _validate_attempt(action_id, attempt)
+        self._store = store
+        self.action_id = action_id
+        self.attempt = attempt
+        self._entries: list[ArtifactBundleEntry] = []
+
+    def write_bytes(
+        self,
+        canonical_relpath: str,
+        content: bytes,
+        *,
+        media_type: str,
+        evidence_role: str,
+        metadata: tuple[ArtifactMetadata, ...] = (),
+    ) -> ArtifactBundleEntry:
+        key = canonical_artifact_key(canonical_relpath)
+        if self._entries and key <= self._entries[-1].canonical_relpath:
+            raise ValueError(
+                "attempt effects must be emitted once in strict canonical order; fix the writer"
+            )
+        self._store.write_staged_bytes(
+            action_id=self.action_id,
+            attempt=self.attempt,
+            relative_path=key,
+            content=content,
+        )
+        entry = ArtifactBundleEntry(
+            staged_relpath=f"state/staging/{self.action_id}/{self.attempt}/{key}",
+            canonical_relpath=key,
+            media_type=media_type,
+            evidence_role=evidence_role,
+            metadata=metadata,
+        )
+        self._entries.append(entry)
+        return entry
+
+    def write_text(
+        self,
+        canonical_relpath: str,
+        content: str,
+        *,
+        media_type: str = "text/plain",
+        evidence_role: str,
+        metadata: tuple[ArtifactMetadata, ...] = (),
+    ) -> ArtifactBundleEntry:
+        return self.write_bytes(
+            canonical_relpath,
+            content.encode("utf-8"),
+            media_type=media_type,
+            evidence_role=evidence_role,
+            metadata=metadata,
+        )
+
+    @property
+    def entries(self) -> tuple[ArtifactBundleEntry, ...]:
+        return tuple(self._entries)
+
+    def read_bytes(self, canonical_relpath: str) -> bytes:
+        """Read one output already emitted by this writer through no-follow dirfds."""
+        key = canonical_artifact_key(canonical_relpath)
+        if key not in {entry.canonical_relpath for entry in self._entries}:
+            raise KeyError(f"{key} has not been emitted by this attempt writer")
+        return self._store.read_staged_bytes(self.action_id, self.attempt, key)
+
+    def staged_path(self, canonical_relpath: str) -> Path:
+        """Return the fixed display path of an output already emitted by this writer."""
+        key = canonical_artifact_key(canonical_relpath)
+        entry = next(
+            (item for item in self._entries if item.canonical_relpath == key), None
+        )
+        if entry is None:
+            raise KeyError(f"{key} has not been emitted by this attempt writer")
+        return self._store._project.root / entry.staged_relpath
+
+    def artifact_bundle(self) -> ArtifactBundle:
+        return ArtifactBundle(
+            action_id=self.action_id,
+            attempt=self.attempt,
+            entries=self.entries,
+        )
+
+class BufferedAttemptWriter:
+    """Collect composite outputs in memory, then flush once in canonical order."""
+
+    def __init__(self, action_id: str, attempt: int) -> None:
+        _validate_attempt(action_id, attempt)
+        self.action_id = action_id
+        self.attempt = attempt
+        self._items: dict[str, tuple[bytes, str, str, tuple[ArtifactMetadata, ...]]] = {}
+
+    def write_bytes(
+        self,
+        canonical_relpath: str,
+        content: bytes,
+        *,
+        media_type: str,
+        evidence_role: str,
+        metadata: tuple[ArtifactMetadata, ...] = (),
+    ) -> ArtifactBundleEntry:
+        key = canonical_artifact_key(canonical_relpath)
+        if key in self._items:
+            raise FileExistsError(f"composite output {key} was already emitted")
+        self._items[key] = (content, media_type, evidence_role, metadata)
+        return self._entry(key)
+
+    def write_text(
+        self,
+        canonical_relpath: str,
+        content: str,
+        *,
+        media_type: str = "text/plain",
+        evidence_role: str,
+        metadata: tuple[ArtifactMetadata, ...] = (),
+    ) -> ArtifactBundleEntry:
+        return self.write_bytes(
+            canonical_relpath,
+            content.encode(),
+            media_type=media_type,
+            evidence_role=evidence_role,
+            metadata=metadata,
+        )
+
+    @property
+    def entries(self) -> tuple[ArtifactBundleEntry, ...]:
+        return tuple(self._entry(key) for key in sorted(self._items))
+
+    def read_bytes(self, canonical_relpath: str) -> bytes:
+        key = canonical_artifact_key(canonical_relpath)
+        try:
+            return self._items[key][0]
+        except KeyError as exc:
+            raise KeyError(f"{key} has not been emitted by this buffered writer") from exc
+
+    def artifact_bundle(self) -> ArtifactBundle:
+        return ArtifactBundle(
+            action_id=self.action_id,
+            attempt=self.attempt,
+            entries=self.entries,
+        )
+
+    def staged_path(self, canonical_relpath: str) -> Path:
+        canonical_artifact_key(canonical_relpath)
+        raise RuntimeError("buffered outputs have no filesystem path before canonical-order flush")
+
+    def flush_to(self, writer: AttemptStagingWriter) -> ArtifactBundle:
+        if writer.action_id != self.action_id or writer.attempt != self.attempt:
+            raise ValueError("buffer and attempt writer identities must match")
+        for key in sorted(self._items):
+            content, media_type, evidence_role, metadata = self._items[key]
+            writer.write_bytes(
+                key,
+                content,
+                media_type=media_type,
+                evidence_role=evidence_role,
+                metadata=metadata,
+            )
+        return writer.artifact_bundle()
+
+    def _entry(self, key: str) -> ArtifactBundleEntry:
+        _, media_type, evidence_role, metadata = self._items[key]
+        return ArtifactBundleEntry(
+            staged_relpath=f"state/staging/{self.action_id}/{self.attempt}/{key}",
+            canonical_relpath=key,
+            media_type=media_type,
+            evidence_role=evidence_role,
+            metadata=metadata,
+        )
 
 
 def sha256_file(path: Path) -> str:
@@ -92,6 +277,24 @@ class ArtifactStore:
         """Return an unsafe display-only path; use :meth:`write_staged_bytes` for writes."""
         _validate_attempt(action_id, attempt)
         return self._project.staging_root / action_id / str(attempt)
+
+    def writer(self, action_id: str, attempt: int) -> AttemptStagingWriter:
+        """Return the only output-writing capability exposed to an Action attempt."""
+        return AttemptStagingWriter(self, action_id, attempt)
+
+    def read_staged_bytes(self, action_id: str, attempt: int, canonical_relpath: str) -> bytes:
+        """Read a current-attempt staged regular file without following links."""
+        key = canonical_artifact_key(canonical_relpath)
+        fd = self._open_staged_file(action_id, attempt, _safe_relative_parts(key))
+        if fd is None:
+            raise FileNotFoundError(key)
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 1024 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
 
     def write_staged_bytes(
         self, *, action_id: str, attempt: int, relative_path: str, content: bytes
@@ -179,6 +382,103 @@ class ArtifactStore:
         if conflicts:
             raise ArtifactReconciliationError(tuple(conflicts))
         return tuple(reconciled)
+
+    async def verify_committed_bundle(
+        self, action_id: str, attempt: int
+    ) -> tuple[PromotionIntent, ...]:
+        """Reopen and verify every canonical intent as one success prerequisite."""
+        intents = tuple(
+            item
+            for item in await self._require_ledger().promotion_intents()
+            if item.action_id == action_id and item.attempt == attempt
+        )
+        if not intents or any(item.status != "COMMITTED" for item in intents):
+            await self._require_ledger().mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="partial_intent_set",
+                message="Every bundle intent must be COMMITTED before unified postcheck.",
+            )
+            raise ArtifactConflictError("bundle has pending or conflicting intents")
+        for intent in intents:
+            try:
+                canonical = self._durable_root / canonical_artifact_key(intent.canonical_relpath)
+                if sha256_file(canonical) != intent.checksum:
+                    raise ValueError("checksum drift")
+            except (OSError, ValueError) as exc:
+                await self._require_ledger().mark_bundle_conflict(
+                    action_id,
+                    attempt,
+                    reason_code="post_success_drift",
+                    message=f"Canonical bundle postcheck failed for {intent.canonical_relpath}: {exc}",
+                )
+                raise ArtifactConflictError("canonical bundle postcheck failed") from exc
+        return intents
+
+    async def rebuild_outcome_receipt(
+        self, action_id: str, attempt: int
+    ) -> AttemptOutcomeReceiptPayload:
+        """Rebuild success only from the exact durable manifest and safe staged leaf set."""
+        ledger = self._require_ledger()
+        attempt_record = await ledger.get_attempt(action_id, attempt)
+        manifest: ExpectedArtifactManifest = attempt_record.expected_artifact_manifest
+        if not manifest.entries:
+            await ledger.mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="artifact_bundle_conflict",
+                message="An empty expected manifest cannot prove an executor outcome.",
+            )
+            raise ArtifactConflictError("empty manifest outcome is not reconstructable")
+        namespace = self.staging_dir(action_id, attempt)
+        expected_paths = {item.canonical_relpath for item in manifest.entries}
+        observed: set[str] = set()
+        if namespace.exists():
+            for path in namespace.rglob("*"):
+                if path.is_symlink() or (path.exists() and not path.is_file() and not path.is_dir()):
+                    await ledger.mark_bundle_conflict(
+                        action_id, attempt, reason_code="artifact_bundle_conflict",
+                        message="Unsafe staged entry prevents receipt reconstruction.",
+                    )
+                    raise ArtifactConflictError("unsafe staging evidence")
+                if path.is_file():
+                    observed.add(path.relative_to(namespace).as_posix())
+        if observed != expected_paths:
+            await ledger.mark_bundle_conflict(
+                action_id,
+                attempt,
+                reason_code="artifact_bundle_conflict",
+                message="Staged leaf set differs from the durable expected manifest.",
+            )
+            raise ArtifactConflictError("staging evidence is incomplete or contains extras")
+        entries = tuple(
+            ArtifactBundleEntry(
+                staged_relpath=f"state/staging/{action_id}/{attempt}/{item.canonical_relpath}",
+                canonical_relpath=item.canonical_relpath,
+                media_type=item.media_type,
+                evidence_role=item.evidence_role,
+                metadata=item.metadata,
+            )
+            for item in manifest.entries
+        )
+        bundle = ArtifactBundle(action_id=action_id, attempt=attempt, entries=entries)
+        outcome = Succeeded(
+            artifact_bundle=bundle,
+            evidence_refs=attempt_record.expected_evidence_refs,
+        )
+        outcome_json = canonical_model_json(outcome)
+        bundle_json = canonical_bundle_json(bundle)
+        payload = AttemptOutcomeReceiptPayload(
+            action_id=action_id,
+            attempt=attempt,
+            canonical_outcome_json=outcome_json,
+            outcome_digest=sha256_canonical_json(outcome_json),
+            canonical_bundle_json=bundle_json,
+            bundle_digest=sha256_canonical_json(bundle_json),
+            evidence_refs=attempt_record.expected_evidence_refs,
+        )
+        await ledger.record_attempt_outcome(payload)
+        return payload
 
     async def _complete(
         self, intent: PromotionIntent, *, crash_after: str | None = None

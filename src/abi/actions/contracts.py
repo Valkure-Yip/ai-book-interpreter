@@ -5,14 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from abi.actions.evidence import StagingEvidenceView
 from abi.project.layout import BookProject
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     ActionSpec,
+    ArtifactBundle,
+    ExpectedArtifactManifest,
     GateDecision,
     RunSnapshot,
 )
+from abi.types.tools import GateRuntimeMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,21 @@ class ActionExecutionContext:
     publication_mode: str = "public_domain"
     book_slug: str = "book"
     profile: str | None = None
+    runtime_metadata: GateRuntimeMetadata | None = None
+
+    def __post_init__(self) -> None:
+        if self.runtime_metadata is None:
+            return
+        if self.target_lang != self.runtime_metadata.target_language:
+            raise ValueError(
+                "Action target_lang must match GateRuntimeMetadata.target_language; "
+                "construct both values from the controller run configuration"
+            )
+        if self.publication_mode != self.runtime_metadata.publication_mode:
+            raise ValueError(
+                "Action publication_mode must match GateRuntimeMetadata.publication_mode; "
+                "construct both values from the controller run configuration"
+            )
 
 
 class ActionExecutor(Protocol):
@@ -43,7 +62,18 @@ class ActionExecutor(Protocol):
 class ActionValidator(Protocol):
     """Check deterministic evidence emitted by a completed action."""
 
-    def __call__(self, project: BookProject, parameters: FrozenModel) -> GateDecision: ...
+    def __call__(
+        self,
+        evidence_view: StagingEvidenceView,
+        parameters: FrozenModel,
+        bundle: ArtifactBundle,
+    ) -> GateDecision: ...
+
+
+class EffectExpander(Protocol):
+    def __call__(
+        self, capability: str, action_id: str, parameters: FrozenModel
+    ) -> ExpectedArtifactManifest: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +84,7 @@ class ActionDefinition:
     input_model: type[FrozenModel]
     executor: ActionExecutor
     validator: ActionValidator
+    effect_expander: EffectExpander
 
 
 @dataclass(frozen=True, slots=True)

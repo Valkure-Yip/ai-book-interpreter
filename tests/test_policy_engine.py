@@ -14,6 +14,8 @@ from abi.types.orchestration import (
     ActionKind,
     ActionSpec,
     EligibleAction,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
     GateDecision,
     GateEvidence,
     PlanPatch,
@@ -36,8 +38,31 @@ async def _execute_unused(context: object, parameters: FrozenModel) -> object:
     raise AssertionError("policy tests must not execute actions")
 
 
-def _validate_unused(project: object, parameters: FrozenModel) -> GateDecision:
-    return GateDecision(passed=True, reason_code="ok", message="valid")
+def _validate_unused(view: object, parameters: FrozenModel, bundle: object) -> GateDecision:
+    return GateDecision(
+        passed=True,
+        reason_code="ok",
+        message="valid",
+        validator_id="unused",
+        validator_version="1",
+        bundle_digest="0" * 64,
+        artifact_checksums=("0" * 64,),
+    )
+
+
+def _expand(
+    capability: str, action_id: str, parameters: FrozenModel
+) -> ExpectedArtifactManifest:
+    return ExpectedArtifactManifest(
+        action_id=action_id,
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath=f"effects/{capability.replace('.', '-')}.json",
+                media_type="application/json",
+                evidence_role="policy_fixture",
+            ),
+        ),
+    )
 
 
 def _definition(
@@ -66,6 +91,7 @@ def _definition(
         input_model=input_model,
         executor=_execute_unused,
         validator=_validate_unused,
+        effect_expander=_expand,
     )
 
 

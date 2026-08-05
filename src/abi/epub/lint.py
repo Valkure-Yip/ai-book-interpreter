@@ -46,6 +46,7 @@ def publication_lint(
     project: BookProject,
     *,
     runtime_metadata: GateRuntimeMetadata | None = None,
+    write_report: bool = True,
 ) -> GateResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -89,5 +90,6 @@ def publication_lint(
         warnings=warnings,
         details={"files": len(targets), "language": lang},
     )
-    res.write_json(project.publication_lint_report)
+    if write_report:
+        res.write_json(project.publication_lint_report)
     return res

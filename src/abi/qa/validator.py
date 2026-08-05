@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from abi.epub.result import GateResult
 from abi.project.layout import BookProject
@@ -38,7 +40,7 @@ class _AgentEval:
     confidence: float
 
 
-def _eval_agent(label: str, data: dict) -> _AgentEval:
+def _eval_agent(label: str, data: dict[str, Any]) -> _AgentEval:
     reasons: list[str] = []
     avg = float(data.get("average_score", 0) or 0)
     low = float(data.get("lowest_score", 0) or 0)
@@ -58,12 +60,68 @@ def _eval_agent(label: str, data: dict) -> _AgentEval:
     return _AgentEval(label, not reasons, reasons, confidence)
 
 
-def _latest_round(project: BookProject):
+def evaluate_spotcheck_summaries(
+    *,
+    round_id: str,
+    summaries: dict[str, dict[str, Any]],
+    prior_rounds: tuple[dict[str, dict[str, Any]], ...] = (),
+    require_pass: bool = True,
+) -> tuple[GateResult, bytes]:
+    """Evaluate reviewer summaries and serialize the report without filesystem writes."""
+    evals = [_eval_agent(label, summaries[label]) for label in sorted(summaries)]
+    reasons = [reason for item in evals for reason in item.reasons]
+    release_confidence = min((item.confidence for item in evals), default=0.0)
+    if release_confidence < CONFIDENCE_FLOOR:
+        reasons.append(f"release_confidence {release_confidence:.2f} < {CONFIDENCE_FLOOR}")
+    this_round_pass = not reasons
+    consecutive = 1 if this_round_pass else 0
+    if this_round_pass:
+        for prior in prior_rounds:
+            prior_evals = [_eval_agent(label, prior[label]) for label in sorted(prior)]
+            if (
+                prior_evals
+                and all(item.ok for item in prior_evals)
+                and min(item.confidence for item in prior_evals) >= CONFIDENCE_FLOOR
+            ):
+                consecutive += 1
+            else:
+                break
+    required = _required_pass_rounds()
+    if this_round_pass and consecutive < required:
+        reasons.append(
+            f"need {required} consecutive passing rounds; have {consecutive} "
+            "(run another spot-check round)"
+        )
+    status = "PASS" if this_round_pass and consecutive >= required else "FAIL"
+    report = {
+        "round": round_id,
+        "status": status,
+        "release_confidence": round(release_confidence, 4),
+        "this_round_pass": this_round_pass,
+        "current_run_pass_rounds_count": consecutive,
+        "current_run_pass_rounds_required": required,
+        "agents": [
+            {"label": item.label, "ok": item.ok, "confidence": item.confidence}
+            for item in evals
+        ],
+        "reasons": reasons,
+    }
+    result = GateResult(
+        status == "PASS" if require_pass else True,
+        f"{round_id}: {status}, confidence={release_confidence:.2f}, "
+        f"pass_rounds={consecutive}/{required}",
+        hard_errors=reasons,
+        details=report,
+    )
+    return result, json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True).encode()
+
+
+def _latest_round(project: BookProject) -> Path | None:
     rounds = sorted(project.random_spotcheck_dir.glob("round_*"))
     return rounds[-1] if rounds else None
 
 
-def _round_quality_passed(round_dir) -> bool:
+def _round_quality_passed(round_dir: Path) -> bool:
     """Whether a prior round met the quality bar (independent of the consecutive
     rounds requirement, recomputed from reviewer-owned summaries rather than a
     potentially forged validation report."""

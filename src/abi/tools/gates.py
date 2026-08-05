@@ -7,8 +7,14 @@ PASS/FAIL summary the agent must obey before advancing state.
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from pydantic import Field
 
+from abi.actions.builtins.inputs import SpotcheckInput
+from abi.epub.result import GateResult
+from abi.project.artifacts import AttemptStagingWriter, BufferedAttemptWriter
 from abi.tools.context import ToolContext
 from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
@@ -48,8 +54,17 @@ def make_gate_tools(
     *,
     permissions: ActionPathPermissions | None = None,
     runtime_metadata: GateRuntimeMetadata | None = None,
+    writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
+    spotcheck_input: SpotcheckInput | None = None,
 ) -> list[ToolBinding]:
     project = ctx.project
+
+    def require_writer() -> AttemptStagingWriter | BufferedAttemptWriter:
+        if writer is None:
+            raise PermissionError(
+                "gate output requires an AttemptStagingWriter; dispatch inside an authorized attempt"
+            )
+        return writer
 
     def require_read(path: str) -> None:
         if permissions is not None and not permissions.can_read(path):
@@ -76,7 +91,13 @@ def make_gate_tools(
         require_write("output/publication_lint.json")
         from abi.epub.lint import publication_lint as _lint
 
-        res = _lint(project, runtime_metadata=runtime_metadata)
+        res = _lint(project, runtime_metadata=runtime_metadata, write_report=False)
+        require_writer().write_text(
+            "output/publication_lint.json",
+            _gate_result_json(res),
+            media_type="application/json",
+            evidence_role="publication_gate",
+        )
         return res.summary()
 
     def asset_manifest_check() -> str:
@@ -88,7 +109,13 @@ def make_gate_tools(
         require_write("output/asset_manifest_check.json")
         from abi.epub.assets import asset_manifest_check as _check
 
-        res = _check(project)
+        res = _check(project, write_report=False)
+        require_writer().write_text(
+            "output/asset_manifest_check.json",
+            _gate_result_json(res),
+            media_type="application/json",
+            evidence_role="asset_gate",
+        )
         return res.summary()
 
     def build_sample_epub(chapter_slugs: str = "") -> str:
@@ -98,28 +125,48 @@ def make_gate_tools(
         """
         require_reads("chapters/final", "frontmatter", "metadata", "assets")
         require_write("preproduction/stage2_sample/sample_book.epub")
-        from abi.epub.build import build_sample_epub as _build
+        from abi.epub.build import build_sample_epub_bytes as _build
 
         slugs = [s.strip() for s in chapter_slugs.split(",") if s.strip()]
-        res = _build(project, chapter_slugs=slugs or None)
+        res, payload = _build(project, chapter_slugs=slugs or None)
+        if res.ok:
+            require_writer().write_bytes(
+                "preproduction/stage2_sample/sample_book.epub",
+                payload,
+                media_type="application/epub+zip",
+                evidence_role="sample_epub",
+            )
         return res.summary()
 
     def build_epub() -> str:
         """Build the full EPUB from chapters/final/ into output/book.epub."""
         require_reads("chapters/final", "frontmatter", "metadata", "assets")
         require_write("output/book.epub")
-        from abi.epub.build import build_epub as _build
+        from abi.epub.build import build_epub_bytes as _build
 
-        res = _build(project)
+        res, payload = _build(project)
+        if res.ok:
+            require_writer().write_bytes(
+                "output/book.epub",
+                payload,
+                media_type="application/epub+zip",
+                evidence_role="epub",
+            )
         return res.summary()
 
     def epubcheck(epub_path: str = "output/book.epub") -> str:
         """Run EPUBCheck on the given EPUB (needs Java). Writes output/epubcheck.json."""
         require_read(epub_path)
         require_write("output/epubcheck.json")
-        from abi.epub.epubcheck import run_epubcheck
+        from abi.epub.epubcheck import run_epubcheck_readonly
 
-        res = run_epubcheck(project, ctx.resolve(epub_path))
+        staged_paths = {entry.canonical_relpath for entry in require_writer().entries}
+        source = (
+            require_writer().staged_path(epub_path)
+            if epub_path in staged_paths
+            else ctx.resolve(epub_path)
+        )
+        res = run_epubcheck_readonly(source)
         return res.summary()
 
     def select_random_review_passages(
@@ -132,15 +179,36 @@ def make_gate_tools(
         """
         require_reads("chapters/final")
         require_write("reviews/random_spotcheck")
-        from abi.qa.sampler import select_random_review_passages as _select
+        if spotcheck_input is None:
+            raise PermissionError("spot-check selection requires frozen controller input")
+        if agents != len(spotcheck_input.reviewers):
+            raise ValueError("agents must equal the frozen reviewer count")
+        if samples_per_agent != spotcheck_input.samples_per_agent:
+            raise ValueError("samples_per_agent must equal the frozen controller value")
+        if target_confidence != 0.80:
+            raise ValueError("target_confidence is fixed by policy at 0.80")
+        from abi.qa.sampler import plan_random_review_passages
 
-        res = _select(
+        result, outputs = plan_random_review_passages(
             project,
-            agents=agents,
-            samples_per_agent=samples_per_agent,
-            target_confidence=target_confidence,
+            round_id=spotcheck_input.round_id,
+            reviewers=spotcheck_input.reviewers,
+            chapters=spotcheck_input.chapters,
+            samples_per_agent=spotcheck_input.samples_per_agent,
+            seed=spotcheck_input.seed,
         )
-        return res.summary()
+        if result.ok:
+            current_writer = require_writer()
+            for path in sorted(outputs):
+                media_type = "application/json" if path.endswith(".json") else "text/markdown"
+                role = "round_manifest" if path.endswith("round_manifest.json") else "review_samples"
+                current_writer.write_bytes(
+                    path,
+                    outputs[path],
+                    media_type=media_type,
+                    evidence_role=role,
+                )
+        return result.summary()
 
     def validate_random_spotcheck(require_pass: bool = True) -> str:
         """Validate the latest spot-check round against the excellence gate.
@@ -150,10 +218,65 @@ def make_gate_tools(
         """
         require_reads("reviews/random_spotcheck")
         require_write("reviews/random_spotcheck")
-        from abi.qa.validator import validate_random_spotcheck as _validate
+        if spotcheck_input is None:
+            raise PermissionError("spot-check validation requires frozen controller input")
+        current_writer = require_writer()
+        root = f"reviews/random_spotcheck/{spotcheck_input.round_id}"
+        summaries: dict[str, dict[str, Any]] = {}
+        for reviewer in spotcheck_input.reviewers:
+            summary_path = f"{root}/reviews/{reviewer}_summary.json"
+            try:
+                payload = json.loads(current_writer.read_bytes(summary_path))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"missing or invalid reviewer summary {summary_path}: {exc}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise ValueError(f"reviewer summary {summary_path} must be a JSON object")
+            summaries[reviewer] = payload
 
-        res = _validate(project, require_pass=require_pass)
-        return res.summary()
+        prior_rounds: list[dict[str, dict[str, Any]]] = []
+        round_no = int(spotcheck_input.round_id.removeprefix("round_"))
+        for prior_no in range(round_no - 1, 0, -1):
+            prior: dict[str, dict[str, Any]] = {}
+            for reviewer in spotcheck_input.reviewers:
+                prior_path = (
+                    project.random_spotcheck_dir
+                    / f"round_{prior_no:03d}"
+                    / "reviews"
+                    / f"{reviewer}_summary.json"
+                )
+                if not prior_path.is_file() or prior_path.is_symlink():
+                    prior = {}
+                    break
+                try:
+                    payload = json.loads(prior_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, ValueError):
+                    prior = {}
+                    break
+                if not isinstance(payload, dict):
+                    prior = {}
+                    break
+                prior[reviewer] = payload
+            if not prior:
+                break
+            prior_rounds.append(prior)
+
+        from abi.qa.validator import evaluate_spotcheck_summaries
+
+        result, report = evaluate_spotcheck_summaries(
+            round_id=spotcheck_input.round_id,
+            summaries=summaries,
+            prior_rounds=tuple(prior_rounds),
+            require_pass=require_pass,
+        )
+        current_writer.write_bytes(
+            f"{root}/validation_report.json",
+            report,
+            media_type="application/json",
+            evidence_role="review_gate",
+        )
+        return result.summary()
 
     def create_release(version: str = "") -> str:
         """Create a versioned release (or private artifact) from output/book.epub.
@@ -169,14 +292,9 @@ def make_gate_tools(
         release_root = "output/private_artifacts" if private_mode else "output/release"
         require_read(release_root)
         require_write(release_root)
-        from abi.release.create import create_release as _create
-
-        res = _create(
-            project,
-            version=version or None,
-            runtime_metadata=runtime_metadata,
+        raise PermissionError(
+            "release creation is a deterministic built-in and cannot run as an agent tool"
         )
-        return res.summary()
 
     return [
         ToolBinding(
@@ -218,3 +336,19 @@ def make_gate_tools(
             create_release,
         ),
     ]
+
+
+def _gate_result_json(result: GateResult) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "ok": bool(result.ok),
+            "message": str(result.message),
+            "errors": list(result.hard_errors),
+            "warnings": list(result.warnings),
+            "details": dict(result.details),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )

@@ -14,6 +14,7 @@ from abi.types.orchestration import (
     ActionArgument,
     ActionKind,
     ActionSpec,
+    ExpectedArtifactManifest,
     GateDecision,
     RunSnapshot,
     RunStatus,
@@ -26,6 +27,12 @@ class SourceIngestInput(FrozenModel):
 
 async def _execute_unused(context: object, parameters: FrozenModel) -> object:
     raise AssertionError("registry tests must not execute actions")
+
+
+def _expand_unused(
+    capability: str, action_id: str, parameters: FrozenModel
+) -> ExpectedArtifactManifest:
+    return ExpectedArtifactManifest(action_id=action_id)
 
 
 def _validate_unused(project: object, parameters: FrozenModel) -> GateDecision:
@@ -51,6 +58,7 @@ def _definition(
         input_model=SourceIngestInput,
         executor=_execute_unused,
         validator=_validate_unused,
+        effect_expander=_expand_unused,
     )
 
 
@@ -169,6 +177,7 @@ def test_eligible_evaluates_predicates_and_sorts_summaries() -> None:
             input_model=SourceIngestInput,
             executor=_execute_unused,
             validator=_validate_unused,
+            effect_expander=_expand_unused,
         )
     )
 
@@ -205,6 +214,7 @@ def test_eligible_evaluates_every_declared_predicate_before_rejecting() -> None:
             input_model=SourceIngestInput,
             executor=_execute_unused,
             validator=_validate_unused,
+            effect_expander=_expand_unused,
         )
     )
 

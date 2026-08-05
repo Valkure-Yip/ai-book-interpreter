@@ -1,62 +1,249 @@
-"""Contracts for constrained dynamic orchestration."""
+"""Frozen bundle, receipt, repair, and probe contracts."""
 
 from __future__ import annotations
+
+import hashlib
+import json
 
 import pytest
 from pydantic import ValidationError
 
 from abi.types.orchestration import (
-    ActionArgument,
     ActionOutcomeEnvelope,
-    PermanentFailure,
-    PlanPatch,
-    ProposedAction,
-    RunStatus,
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    ArtifactMetadata,
+    AttemptOutcomeReceiptPayload,
+    ExpectedArtifact,
+    ExpectedArtifactManifest,
+    GateArtifactIdentity,
+    GateReceiptPayload,
+    Indeterminate,
+    ProbeResolution,
+    RepairRequired,
+    Succeeded,
+    canonical_bundle_json,
+    canonical_failure_signature,
+    sha256_canonical_json,
 )
 
 
-def test_plan_patch_is_frozen_and_rejects_unknown_fields() -> None:
-    """Catch mutable or permissive planner proposals at the boundary."""
-    patch = PlanPatch(
-        objective="ingest source",
-        proposed_actions=(
-            ProposedAction(
-                proposal_id="p1",
-                capability="source.ingest",
-                arguments=(
-                    ActionArgument(name="source_relpath", value_json='"source/raw.txt"'),
-                ),
-                dependencies=(),
-                expected_evidence=("source_manifest",),
-                priority=100,
-            ),
-        ),
-        rationale="source evidence is absent",
+def _entry(
+    canonical: str = "chapters/translated/001.md",
+    *,
+    staged: str = "state/staging/a1/1/chapters/translated/001.md",
+) -> ArtifactBundleEntry:
+    return ArtifactBundleEntry(
+        staged_relpath=staged,
+        canonical_relpath=canonical,
+        media_type="text/markdown",
+        evidence_role="translation",
+        metadata=(ArtifactMetadata(name="chapter", value_json='"001"'),),
     )
 
-    with pytest.raises(ValidationError):
-        patch.objective = "mutated"  # type: ignore[misc]
 
+def _bundle() -> ArtifactBundle:
+    return ArtifactBundle(action_id="a1", attempt=1, entries=(_entry(),))
+
+
+@pytest.mark.parametrize(
+    ("canonical", "staged"),
+    (
+        ("CHAPTERS/translated/001.md", "state/staging/a1/1/CHAPTERS/translated/001.md"),
+        ("chapters/translated/*.md", "state/staging/a1/1/chapters/translated/*.md"),
+        ("chapters/translated/001.md", "state/staging/a1/2/chapters/translated/001.md"),
+        ("chapters/translated/001.md", "chapters/translated/001.md"),
+    ),
+)
+def test_bundle_rejects_nonportable_or_cross_attempt_paths(
+    canonical: str, staged: str
+) -> None:
+    """Catch outputs escaping the exact authorized attempt namespace."""
     with pytest.raises(ValidationError):
-        PlanPatch(
-            objective="ingest source",
-            proposed_actions=(),
-            rationale="source evidence is absent",
-            unexpected=True,
+        ArtifactBundle(
+            action_id="a1",
+            attempt=1,
+            entries=(
+                ArtifactBundleEntry(
+                    staged_relpath=staged,
+                    canonical_relpath=canonical,
+                    media_type="text/markdown",
+                    evidence_role="translation",
+                ),
+            ),
         )
 
 
-def test_action_outcome_is_discriminated() -> None:
-    """Catch outcome parsing that loses permanent-failure semantics."""
-    envelope = ActionOutcomeEnvelope.model_validate(
+def test_bundle_rejects_empty_duplicate_and_caller_disordered_entries() -> None:
+    """Catch old single-file effects and any implicit effect ordering repair."""
+    with pytest.raises(ValidationError):
+        ArtifactBundle(action_id="a1", attempt=1, entries=())
+    with pytest.raises(ValidationError):
+        ArtifactBundle(action_id="a1", attempt=1, entries=(_entry(), _entry()))
+    second = _entry(
+        canonical="chapters/translated/002.md",
+        staged="state/staging/a1/1/chapters/translated/002.md",
+    )
+    with pytest.raises(ValidationError):
+        ArtifactBundle(action_id="a1", attempt=1, entries=(second, _entry()))
+
+
+def test_metadata_and_expected_manifest_require_exact_order_and_identity() -> None:
+    """Catch metadata sorting or manifest duplicates hiding an effect mismatch."""
+    with pytest.raises(ValidationError):
+        ArtifactBundleEntry(
+            staged_relpath="state/staging/a1/1/report.json",
+            canonical_relpath="reports/report.json",
+            media_type="application/json",
+            evidence_role="report",
+            metadata=(
+                ArtifactMetadata(name="z", value_json="1"),
+                ArtifactMetadata(name="a", value_json="2"),
+            ),
+        )
+    with pytest.raises(ValidationError):
+        ExpectedArtifactManifest(
+            action_id="a1",
+            entries=(
+                ExpectedArtifact(
+                    canonical_relpath="reports/b.json",
+                    media_type="application/json",
+                    evidence_role="report",
+                ),
+                ExpectedArtifact(
+                    canonical_relpath="reports/a.json",
+                    media_type="application/json",
+                    evidence_role="report",
+                ),
+            ),
+        )
+
+
+def test_success_has_only_a_typed_bundle_and_envelope_identity_is_exact() -> None:
+    """Catch reintroduction of Succeeded.staging_relpath or mismatched envelope identity."""
+    bundle = _bundle()
+    envelope = ActionOutcomeEnvelope(
+        action_id="a1", attempt=1, outcome=Succeeded(artifact_bundle=bundle)
+    )
+    assert envelope.outcome.artifact_bundle == bundle
+    with pytest.raises(ValidationError):
+        Succeeded.model_validate({"staging_relpath": "legacy.md"})
+    with pytest.raises(ValidationError):
+        ActionOutcomeEnvelope(
+            action_id="a2", attempt=1, outcome=Succeeded(artifact_bundle=bundle)
+        )
+
+
+def test_bundle_canonical_json_and_digest_are_stable() -> None:
+    """Catch noncanonical serialization weakening durable receipt comparisons."""
+    encoded = canonical_bundle_json(_bundle())
+    assert encoded == (
+        '{"action_id":"a1","attempt":1,"entries":[{"canonical_relpath":'
+        '"chapters/translated/001.md","evidence_role":"translation","media_type":'
+        '"text/markdown","metadata":[{"name":"chapter","value_json":"\\\"001\\\""}],'
+        '"staged_relpath":"state/staging/a1/1/chapters/translated/001.md"}]}'
+    )
+    assert sha256_canonical_json(encoded) == hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def test_indeterminate_requires_error_code_and_canonical_failure_signature() -> None:
+    """Catch ambiguous external-side-effect failures that cannot be probed safely."""
+    signature = canonical_failure_signature("release.prepare", "{}", "provider_timeout")
+    assert Indeterminate(
+        operation_key="release:v1",
+        error_code="provider_timeout",
+        failure_signature=signature,
+        message="commit result unknown",
+    ).failure_signature == signature
+    with pytest.raises(ValidationError):
+        Indeterminate(
+            operation_key="release:v1",
+            error_code="provider_timeout",
+            failure_signature="bad",
+            message="commit result unknown",
+        )
+
+
+@pytest.mark.parametrize("disposition", ("succeeded", "absent", "unknown"))
+def test_probe_resolution_parses_every_durable_disposition(disposition: str) -> None:
+    """Catch probe evidence being coerced into ordinary artifact success."""
+    resolution = ProbeResolution.model_validate(
         {
-            "outcome": {
-                "kind": "permanent_failure",
-                "error_code": "unsupported_format",
-                "message": "convert the source to txt or epub",
-            }
+            "operation_key": "release:v1",
+            "disposition": disposition,
+            "evidence_refs": ["provider:release:v1"],
+            "message": "observed",
         }
     )
+    assert resolution.disposition == disposition
 
-    assert isinstance(envelope.outcome, PermanentFailure)
-    assert RunStatus.BLOCKED.value == "BLOCKED"
+
+def test_repair_required_needs_explicit_class_source_and_reason() -> None:
+    """Catch malformed repair outcomes silently defaulting to semantic replanning."""
+    assert RepairRequired(
+        repair_class="semantic",
+        repair_source="action_outcome",
+        reason_code="term_drift",
+        defect_codes=("term_drift",),
+        message="repair glossary",
+    ).reason_code == "term_drift"
+    with pytest.raises(ValidationError):
+        RepairRequired.model_validate(
+            {"defect_codes": ["term_drift"], "message": "repair glossary"}
+        )
+
+
+def test_outcome_and_gate_receipts_bind_canonical_json_and_digests() -> None:
+    """Catch caller-supplied receipt digests or artifact identities drifting from facts."""
+    outcome = Succeeded(artifact_bundle=_bundle(), evidence_refs=("translation",))
+    outcome_json = json.dumps(
+        outcome.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    )
+    bundle_json = canonical_bundle_json(_bundle())
+    receipt = AttemptOutcomeReceiptPayload(
+        action_id="a1",
+        attempt=1,
+        canonical_outcome_json=outcome_json,
+        outcome_digest=sha256_canonical_json(outcome_json),
+        canonical_bundle_json=bundle_json,
+        bundle_digest=sha256_canonical_json(bundle_json),
+        evidence_refs=("translation",),
+    )
+    assert receipt.bundle_digest == sha256_canonical_json(bundle_json)
+    with pytest.raises(ValidationError):
+        AttemptOutcomeReceiptPayload.model_validate(
+            {**receipt.model_dump(mode="json"), "bundle_digest": "0" * 64}
+        )
+
+    gate_json = json.dumps(
+        {
+            "artifact_checksums": ["a" * 64],
+            "bundle_digest": receipt.bundle_digest,
+            "evidence_refs": ["translation"],
+            "message": "valid",
+            "passed": True,
+            "reason_code": "evidence_valid",
+            "validator_id": "chapter.translate",
+            "validator_version": "1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    gate = GateReceiptPayload(
+        action_id="a1",
+        attempt=1,
+        validator_id="chapter.translate",
+        validator_version="1",
+        canonical_gate_decision_json=gate_json,
+        gate_decision_digest=sha256_canonical_json(gate_json),
+        bundle_digest=receipt.bundle_digest or "",
+        artifacts=(
+            GateArtifactIdentity(
+                staged_relpath=_entry().staged_relpath,
+                canonical_relpath=_entry().canonical_relpath,
+                checksum="a" * 64,
+            ),
+        ),
+        evidence_refs=("translation",),
+    )
+    assert gate.artifacts[0].canonical_relpath == "chapters/translated/001.md"

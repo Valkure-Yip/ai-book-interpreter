@@ -11,6 +11,9 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from abi.actions.builtins.inputs import SpotcheckInput
+from abi.project.artifacts import ArtifactStore, AttemptStagingWriter
+from abi.project.layout import BookProject
 from abi.providers.agent_runtime.tooling import to_langchain_tool
 from abi.providers.llm.budget import BudgetGate
 from abi.tools.belt import build_belt
@@ -18,7 +21,13 @@ from abi.tools.content import make_content_tools
 from abi.tools.permissions import ActionPathPermissions
 from abi.tools.subagent import make_subagent_tools
 from abi.types._base import FrozenModel
-from abi.types.orchestration import RunSnapshot, RunStatus, Succeeded
+from abi.types.orchestration import (
+    ArtifactBundle,
+    ArtifactBundleEntry,
+    RunSnapshot,
+    RunStatus,
+    Succeeded,
+)
 from abi.types.tools import ReviewActionIdentity, ToolBinding
 
 
@@ -40,6 +49,30 @@ class _Project:
 def _context(tmp_path: Path) -> SimpleNamespace:
     project = _Project(tmp_path)
     return SimpleNamespace(project=project, resolve=lambda path: tmp_path / path)
+
+
+def _success(action_id: str = "review-child", attempt: int = 1) -> Succeeded:
+    return Succeeded(
+        artifact_bundle=ArtifactBundle(
+            action_id=action_id,
+            attempt=attempt,
+            entries=(
+                ArtifactBundleEntry(
+                    staged_relpath=f"state/staging/{action_id}/{attempt}/reviews/review.md",
+                    canonical_relpath="reviews/review.md",
+                    media_type="text/markdown",
+                    evidence_role="review",
+                ),
+            ),
+        )
+    )
+
+
+def _review_writer(
+    tmp_path: Path, action_id: str = "review-1", attempt: int = 1
+) -> tuple[ArtifactStore, AttemptStagingWriter]:
+    store = ArtifactStore(BookProject(tmp_path), None)
+    return store, store.writer(action_id, attempt)
 
 
 def test_business_tool_factories_return_abi_bindings(tmp_path: Path) -> None:
@@ -159,17 +192,17 @@ async def test_review_subagent_uses_abi_owned_stable_distinct_threads(
     class RecordingAgent:
         async def run_action(self, request: object) -> object:
             requests.append(request)
-            return SimpleNamespace(
-                outcome=Succeeded(staging_relpath="state/staging/review.json")
-            )
+            return SimpleNamespace(outcome=_success())
 
     context = _context(tmp_path)
     context.services = SimpleNamespace(agent=RecordingAgent())
+    store, writer = _review_writer(tmp_path)
     spawn = make_subagent_tools(
         context,
         permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
         action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1"),
         capability="review.independent",
+        writer=writer,
     )[0].callable  # type: ignore[arg-type]
 
     first = json.loads(await spawn(agent_label="agent_a", instructions="review round one"))
@@ -186,6 +219,7 @@ async def test_review_subagent_uses_abi_owned_stable_distinct_threads(
             instructions="attempt fake resume",
             resume_thread_id="attacker-controlled",
         )
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -197,21 +231,24 @@ async def test_review_subagent_retry_keeps_thread_and_requests_checkpoint_resume
     class RecordingAgent:
         async def run_action(self, request: object) -> object:
             requests.append(request)
-            return SimpleNamespace(outcome=Succeeded(staging_relpath="reviews/agent_a/review.md"))
+            return SimpleNamespace(outcome=_success())
 
     context = _context(tmp_path)
     context.services = SimpleNamespace(agent=RecordingAgent())
+    store, writer = _review_writer(tmp_path, attempt=2)
     spawn = make_subagent_tools(
         context,
         permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
         action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1", attempt=2),
         capability="review.independent",
+        writer=writer,
     )[0].callable  # type: ignore[arg-type]
 
     payload = json.loads(await spawn(agent_label="agent_a", instructions="continue"))
 
     assert payload["thread_id"] == "review:run-1:review-1:agent_a"
     assert requests[0].resume.kind == "checkpoint"  # type: ignore[union-attr]
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -223,7 +260,7 @@ async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
     class RecordingAgent:
         async def run_action(self, request: object) -> object:
             requests.append(request)
-            return SimpleNamespace(outcome=Succeeded(staging_relpath="review"))
+            return SimpleNamespace(outcome=_success())
 
     context = _context(tmp_path)
     context.services = SimpleNamespace(agent=RecordingAgent())
@@ -233,11 +270,20 @@ async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
     (samples / "samples.md").write_text("sample", encoding="utf-8")
     (samples / "samples.json").write_text("[]", encoding="utf-8")
     permissions = ActionPathPermissions(read_dirs=("reviews",), write_dirs=())
+    store, writer = _review_writer(tmp_path, action_id="spotcheck-1")
     spawn = make_subagent_tools(
         context,
         permissions=permissions,
         action_identity=ReviewActionIdentity(run_id="run-1", action_id="spotcheck-1"),
         capability="review.spotcheck",
+        writer=writer,
+        spotcheck_input=SpotcheckInput(
+            round_id="round_001",
+            reviewers=("agent_a", "agent_b"),
+            chapters=("001",),
+            samples_per_agent=1,
+            seed=1,
+        ),
     )[0].callable  # type: ignore[arg-type]
 
     await spawn(agent_label="agent_a", instructions="review")
@@ -251,6 +297,7 @@ async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
             path="reviews/random_spotcheck/round_001/validation_report.json",
             content='{"status":"PASS"}',
         )
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -264,16 +311,18 @@ async def test_composite_reviewers_share_the_run_budget_gate(tmp_path: Path) -> 
 
         async def run_action(self, request: object) -> object:
             observed_budget_ids.append(id(self.budget))
-            return SimpleNamespace(outcome=Succeeded(staging_relpath="review"))
+            return SimpleNamespace(outcome=_success())
 
     context = _context(tmp_path)
     agent = BudgetAwareAgent()
     context.services = SimpleNamespace(agent=agent, budget=budget)
+    store, writer = _review_writer(tmp_path)
     spawn = make_subagent_tools(
         context,
         permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
         action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1"),
         capability="review.independent",
+        writer=writer,
     )[0].callable  # type: ignore[arg-type]
 
     first = json.loads(await spawn(agent_label="agent_a", instructions="review"))
@@ -281,3 +330,4 @@ async def test_composite_reviewers_share_the_run_budget_gate(tmp_path: Path) -> 
 
     assert first["thread_id"] != second["thread_id"]
     assert observed_budget_ids == [id(context.services.budget), id(context.services.budget)]
+    store.close()

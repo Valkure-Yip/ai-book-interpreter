@@ -8,11 +8,13 @@ replaces PDBT's Node ``build:epub`` script.
 from __future__ import annotations
 
 import contextlib
+import io
 import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 from lxml import etree, html
@@ -73,7 +75,7 @@ def _md_to_xhtml_body(md_text: str) -> str:
     xml = etree.tostring(container, method="xml", encoding="unicode")
     # Strip the wrapper <div> tags, keep inner content.
     inner = xml[xml.find(">") + 1 : xml.rfind("</div>")]
-    return inner.strip()
+    return cast(str, inner.strip())
 
 
 def _first_heading_title(md_text: str, default: str) -> str:
@@ -84,12 +86,12 @@ def _first_heading_title(md_text: str, default: str) -> str:
     return default
 
 
-def _load_meta(project: BookProject) -> dict:
+def _load_meta(project: BookProject) -> dict[str, Any]:
     if project.book_yaml.exists():
         try:
             data = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
             if isinstance(data, dict):
-                return data
+                return cast(dict[str, Any], data)
         except Exception:
             pass
     return {}
@@ -138,7 +140,7 @@ def _xml_escape(text: str) -> str:
 
 def _opf(
     chapters: list[_Chapter],
-    meta: dict,
+    meta: dict[str, Any],
     *,
     lang: str,
     identifier: str,
@@ -222,29 +224,29 @@ def _gather_assets(project: BookProject) -> list[tuple[Path, str, str, str]]:
     return out
 
 
-def _build(project: BookProject, md_files: list[Path], out_path: Path) -> GateResult:
-    if not md_files:
-        return GateResult(False, "no chapter Markdown files to build")
+def _render_epub(project: BookProject, md_files: list[Path]) -> tuple[bytes, int, int]:
+    """Render an EPUB archive fully in memory for attempt-scoped callers."""
     meta = _load_meta(project)
     lang = str(meta.get("language") or "zh-Hans")
     identifier = str(meta.get("identifier") or "").strip() or f"urn:uuid:{uuid.uuid4()}"
-
     chapters = _collect_chapters(md_files, lang)
     assets = _gather_assets(project)
     asset_items = [(item_id, href, mtype) for _, href, item_id, mtype in assets]
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_path, "w") as zf:
-        # mimetype MUST be first and stored (uncompressed).
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as zf:
         zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         zf.writestr("META-INF/container.xml", _CONTAINER_XML, compress_type=zipfile.ZIP_DEFLATED)
         zf.writestr("OEBPS/styles/base.css", _CSS, compress_type=zipfile.ZIP_DEFLATED)
-        for c in chapters:
+        for chapter in chapters:
             xhtml = _XHTML_TMPL.format(
-                lang=lang, title=_xml_escape(c.title), css_href="styles/base.css",
-                body=c.body_xhtml,
+                lang=lang,
+                title=_xml_escape(chapter.title),
+                css_href="styles/base.css",
+                body=chapter.body_xhtml,
             )
-            zf.writestr(f"OEBPS/{c.xhtml_name}", xhtml, compress_type=zipfile.ZIP_DEFLATED)
+            zf.writestr(
+                f"OEBPS/{chapter.xhtml_name}", xhtml, compress_type=zipfile.ZIP_DEFLATED
+            )
         zf.writestr(
             "OEBPS/nav.xhtml", _nav_xhtml(chapters, lang, str(meta.get("title", "Book"))),
             compress_type=zipfile.ZIP_DEFLATED,
@@ -254,13 +256,40 @@ def _build(project: BookProject, md_files: list[Path], out_path: Path) -> GateRe
             _opf(chapters, meta, lang=lang, identifier=identifier, asset_items=asset_items),
             compress_type=zipfile.ZIP_DEFLATED,
         )
-        for src, href, _id, _mt in assets:
-            zf.writestr(f"OEBPS/{href}", src.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+        for source, href, _item_id, _media_type in assets:
+            zf.writestr(
+                f"OEBPS/{href}", source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED
+            )
+    return output.getvalue(), len(chapters), len(assets)
+
+
+def build_epub_bytes(project: BookProject) -> tuple[GateResult, bytes]:
+    """Build the full EPUB without writing project output paths."""
+    md_files = sorted(project.chapters_final.glob("*.md"))
+    if not md_files:
+        return GateResult(False, "chapters/final/ is empty — run the chapter gate first"), b""
+    payload, chapter_count, asset_count = _render_epub(project, md_files)
+    return (
+        GateResult(
+            True,
+            f"built book.epub: {chapter_count} chapters, {asset_count} assets",
+            details={"chapters": chapter_count, "assets": asset_count, "path": "output/book.epub"},
+        ),
+        payload,
+    )
+
+
+def _build(project: BookProject, md_files: list[Path], out_path: Path) -> GateResult:
+    if not md_files:
+        return GateResult(False, "no chapter Markdown files to build")
+    payload, chapter_count, asset_count = _render_epub(project, md_files)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(payload)
 
     return GateResult(
         True,
-        f"built {out_path.name}: {len(chapters)} chapters, {len(assets)} assets",
-        details={"chapters": len(chapters), "assets": len(assets),
+        f"built {out_path.name}: {chapter_count} chapters, {asset_count} assets",
+        details={"chapters": chapter_count, "assets": asset_count,
                  "path": project.rel(out_path)},
     )
 
@@ -292,3 +321,37 @@ def build_sample_epub(
     else:
         md_files = all_md[:1]
     return _build(project, md_files, project.sample_epub)
+
+
+def build_sample_epub_bytes(
+    project: BookProject, *, chapter_slugs: list[str] | None = None
+) -> tuple[GateResult, bytes]:
+    """Build the selected sample EPUB fully in memory."""
+    source_dir = (
+        project.chapters_final
+        if any(project.chapters_final.glob("*.md"))
+        else project.chapters_translated
+    )
+    all_markdown = sorted(source_dir.glob("*.md"))
+    if not all_markdown:
+        return GateResult(False, "no translated/final chapters available for a sample"), b""
+    if chapter_slugs:
+        wanted = set(chapter_slugs)
+        markdown = [path for path in all_markdown if path.stem in wanted]
+        if not markdown:
+            return GateResult(False, f"none of {chapter_slugs} found in {source_dir.name}"), b""
+    else:
+        markdown = all_markdown[:1]
+    payload, chapter_count, asset_count = _render_epub(project, markdown)
+    return (
+        GateResult(
+            True,
+            f"built sample_book.epub: {chapter_count} chapters, {asset_count} assets",
+            details={
+                "chapters": chapter_count,
+                "assets": asset_count,
+                "path": "preproduction/stage2_sample/sample_book.epub",
+            },
+        ),
+        payload,
+    )

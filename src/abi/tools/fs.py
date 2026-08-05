@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import mimetypes
 import re
+from collections.abc import Mapping
 
 from pydantic import Field
 
+from abi.project.artifacts import AttemptStagingWriter, BufferedAttemptWriter
 from abi.tools.context import ToolContext
 from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
+from abi.types.orchestration import ExpectedArtifact
 from abi.types.tools import ToolBinding
 
 _MAX_READ_CHARS = 60_000
@@ -51,6 +55,8 @@ def make_fs_tools(
     ctx: ToolContext,
     *,
     permissions: ActionPathPermissions | None = None,
+    writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
+    expected_artifacts: Mapping[str, ExpectedArtifact] | None = None,
 ) -> list[ToolBinding]:
     def require_read(path: str) -> None:
         if permissions is not None and not permissions.can_read(path):
@@ -71,6 +77,10 @@ def make_fs_tools(
     def read_file(path: str) -> str:
         """Read a UTF-8 text file inside the project. Path is project-relative."""
         require_read(path)
+        if writer is not None and path in {
+            entry.canonical_relpath for entry in writer.entries
+        }:
+            return writer.read_bytes(path).decode("utf-8", errors="replace")
         p = ctx.resolve(path)
         if not p.exists():
             return f"ERROR: file not found: {path}"
@@ -84,35 +94,41 @@ def make_fs_tools(
         return text
 
     def write_file(path: str, content: str) -> str:
-        """Create or overwrite a project-relative text file (creates parent dirs)."""
+        """Create one current-attempt staged output using its logical canonical path."""
         require_write(path)
-        p = ctx.resolve(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        if writer is None:
+            raise PermissionError(
+                "write_file requires an AttemptStagingWriter; dispatch this tool inside an authorized attempt"
+            )
+        expected = None if expected_artifacts is None else expected_artifacts.get(path)
+        writer.write_text(
+            path,
+            content,
+            media_type=(
+                expected.media_type
+                if expected is not None
+                else (mimetypes.guess_type(path)[0] or "text/plain")
+            ),
+            evidence_role=expected.evidence_role if expected is not None else "action_output",
+            metadata=expected.metadata if expected is not None else (),
+        )
         ctx.project.append_log(f"write_file: {path} ({len(content)} chars)")
         return f"wrote {len(content)} chars to {path}"
 
     def append_file(path: str, content: str) -> str:
-        """Append text to a project-relative file (creates it if missing)."""
+        """Reject non-create-only writes; submit complete content once."""
         require_write(path)
-        p = ctx.resolve(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(content)
-        return f"appended {len(content)} chars to {path}"
+        raise PermissionError(
+            "append_file is unavailable for attempt outputs; write the complete artifact once"
+        )
 
     def edit_file(path: str, old_string: str, new_string: str) -> str:
         """Replace the first occurrence of old_string with new_string in a file."""
         require_read(path)
         require_write(path)
-        p = ctx.resolve(path)
-        if not p.exists():
-            return f"ERROR: file not found: {path}"
-        text = p.read_text(encoding="utf-8")
-        if old_string not in text:
-            return f"ERROR: old_string not found in {path}"
-        p.write_text(text.replace(old_string, new_string, 1), encoding="utf-8")
-        return f"edited {path}"
+        raise PermissionError(
+            "edit_file cannot mutate committed or staged output in place; write one replacement artifact in a new attempt"
+        )
 
     def list_dir(path: str = ".") -> str:
         """List entries of a project-relative directory."""

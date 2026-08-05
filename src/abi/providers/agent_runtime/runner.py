@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -323,11 +324,21 @@ def _empty_result(outcome: ActionOutcome) -> AgentRunResult:
     )
 
 
+def _integrity_repair(defect_code: str, message: str) -> RepairRequired:
+    return RepairRequired(
+        repair_class="integrity",
+        repair_source="integrity_guard",
+        reason_code=defect_code,
+        defect_codes=(defect_code,),
+        message=message,
+    )
+
+
 def _checkpoint_not_resumable() -> AgentRunResult:
     return _empty_result(
-        RepairRequired(
-            defect_codes=("checkpoint_not_resumable",),
-            message=(
+        _integrity_repair(
+            "checkpoint_not_resumable",
+            (
                 "This thread has no compatible checkpoint to resume. "
                 "Start a fresh Action invocation instead."
             ),
@@ -337,9 +348,9 @@ def _checkpoint_not_resumable() -> AgentRunResult:
 
 def _checkpoint_path_unsafe() -> AgentRunResult:
     return _empty_result(
-        RepairRequired(
-            defect_codes=("checkpoint_path_unsafe",),
-            message=(
+        _integrity_repair(
+            "checkpoint_path_unsafe",
+            (
                 "The checkpoint path contains a symbolic link or unsafe component. "
                 "Use a direct regular-file path before resuming."
             ),
@@ -349,9 +360,9 @@ def _checkpoint_path_unsafe() -> AgentRunResult:
 
 def _checkpoint_foreign_database() -> AgentRunResult:
     return _empty_result(
-        RepairRequired(
-            defect_codes=("checkpoint_foreign_database",),
-            message=(
+        _integrity_repair(
+            "checkpoint_foreign_database",
+            (
                 "The checkpoint path is not an ABI Action checkpoint database. "
                 "Use the checkpoint created by a fresh ABI Action invocation."
             ),
@@ -379,18 +390,18 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         )
     if raw_sqlite_code in _sqlite_codes("SQLITE_IOERR_ACCESS", "SQLITE_IOERR_AUTH"):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_permission_denied",),
-                message=(
+            _integrity_repair(
+                "checkpoint_permission_denied",
+                (
                     "The checkpoint store is not readable. Repair its permissions before resuming."
                 ),
             )
         )
     if raw_sqlite_code in _sqlite_codes("SQLITE_IOERR_CORRUPTFS", "SQLITE_IOERR_DATA"):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_corrupt",),
-                message=(
+            _integrity_repair(
+                "checkpoint_corrupt",
+                (
                     "The checkpoint data is malformed or corrupt. Restore a valid "
                     "checkpoint before resuming."
                 ),
@@ -406,9 +417,9 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         "SQLITE_IOERR_VNODE",
     ):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_read_failed",),
-                message=(
+            _integrity_repair(
+                "checkpoint_read_failed",
+                (
                     "The checkpoint could not be read safely. Repair the checkpoint store "
                     "before resuming."
                 ),
@@ -425,18 +436,18 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         *_sqlite_codes("SQLITE_AUTH", "SQLITE_CANTOPEN", "SQLITE_PERM", "SQLITE_READONLY")
     }:
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_permission_denied",),
-                message=(
+            _integrity_repair(
+                "checkpoint_permission_denied",
+                (
                     "The checkpoint store is not readable. Repair its permissions before resuming."
                 ),
             )
         )
     if sqlite_code in _sqlite_codes("SQLITE_CORRUPT", "SQLITE_NOTADB"):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_corrupt",),
-                message=(
+            _integrity_repair(
+                "checkpoint_corrupt",
+                (
                     "The checkpoint data is malformed or corrupt. Restore a valid "
                     "checkpoint before resuming."
                 ),
@@ -444,9 +455,9 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         )
     if sqlite_code in _sqlite_codes("SQLITE_IOERR"):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_read_failed",),
-                message=(
+            _integrity_repair(
+                "checkpoint_read_failed",
+                (
                     "The checkpoint could not be read safely. Repair the checkpoint store "
                     "before resuming."
                 ),
@@ -457,18 +468,18 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
         (sqlite3.DatabaseError, UnicodeError, ValueError, TypeError, KeyError),
     ):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("checkpoint_corrupt",),
-                message=(
+            _integrity_repair(
+                "checkpoint_corrupt",
+                (
                     "The checkpoint data is malformed or corrupt. Restore a valid "
                     "checkpoint before resuming."
                 ),
             )
         )
     return _empty_result(
-        RepairRequired(
-            defect_codes=("checkpoint_read_failed",),
-            message=(
+        _integrity_repair(
+            "checkpoint_read_failed",
+            (
                 "The checkpoint could not be read safely. Repair the checkpoint store "
                 "before resuming."
             ),
@@ -774,9 +785,9 @@ def _validate_hitl_resume(
     supplied_by_id = {item.interrupt_id: item for item in request.resume.interrupts}
     if supplied_by_id.keys() != pending_by_id.keys():
         return _empty_result(
-            RepairRequired(
-                defect_codes=("hitl_interrupt_id_mismatch",),
-                message=(
+            _integrity_repair(
+                "hitl_interrupt_id_mismatch",
+                (
                     "The supplied HITL interrupt ids do not exactly match the pending "
                     "checkpoint interrupts. Refresh the pending approvals and retry."
                 ),
@@ -794,9 +805,9 @@ def _validate_hitl_resume(
     if count_mismatch is not None:
         supplied, pending_interrupt = count_mismatch
         return _empty_result(
-            RepairRequired(
-                defect_codes=("hitl_decision_count_mismatch",),
-                message=(
+            _integrity_repair(
+                "hitl_decision_count_mismatch",
+                (
                     f"Provided {len(supplied)} HITL decisions for "
                     f"{len(pending_interrupt.actions)} pending tools. Provide one "
                     "ordered approve/reject "
@@ -811,9 +822,9 @@ def _validate_hitl_resume(
         for action in interrupt.actions
     ):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("hitl_tool_not_allowed",),
-                message=(
+            _integrity_repair(
+                "hitl_tool_not_allowed",
+                (
                     "A pending HITL tool is no longer in this Action's approval allowlist. "
                     "Start a fresh authorized Action invocation."
                 ),
@@ -829,9 +840,9 @@ def _validate_hitl_resume(
         )
     ):
         return _empty_result(
-            RepairRequired(
-                defect_codes=("hitl_decision_not_allowed",),
-                message=(
+            _integrity_repair(
+                "hitl_decision_not_allowed",
+                (
                     "A supplied HITL decision is not allowed by the pending review policy. "
                     "Provide an allowed ordered decision."
                 ),
@@ -868,6 +879,8 @@ class _CostCallback(BaseCallbackHandler):
         metrics: MetricsAggregator,
         agent_name: str,
         max_output_tokens: int,
+        attempt_id: str = "provider-attempt",
+        invocation_id: str = "provider-invocation",
     ) -> None:
         self._model = model
         self._budget = budget
@@ -875,11 +888,14 @@ class _CostCallback(BaseCallbackHandler):
         self._metrics = metrics
         self._agent = agent_name
         self._max_out = max_output_tokens
+        self._attempt_id = attempt_id
+        self._invocation_id = invocation_id
         self.llm_calls = 0
         self.cost_usd = 0.0
         self.tool_log: list[ToolCallRecord] = []
         self._started_llm_runs: set[UUID] = set()
         self._finalized_llm_runs: set[UUID] = set()
+        self._call_ordinals: dict[UUID, int] = {}
 
     def on_chat_model_start(
         self,
@@ -893,6 +909,7 @@ class _CostCallback(BaseCallbackHandler):
             return
         self._started_llm_runs.add(run_id)
         self.llm_calls += 1
+        self._call_ordinals[run_id] = self.llm_calls
         joined = "\n".join(str(message.content) for batch in messages for message in batch)
         estimated_input = _estimate_text_tokens(joined)
         estimated_cost = estimate_cost_usd(
@@ -911,9 +928,13 @@ class _CostCallback(BaseCallbackHandler):
         self._budget.record(cost)
         self.cost_usd += cost
         self._metrics.record_llm_call(tokens_in=tokens_in, tokens_out=tokens_out, cost_usd=cost)
+        call_id = f"{self._invocation_id}:call:{self._call_ordinals[run_id]}"
         self._events.event(
             "agent.call",
+            event_id=f"agent.call:{call_id}",
             agent=self._agent,
+            attempt_id=self._attempt_id,
+            call_id=call_id,
             model=self._model,
             tokens={"input": tokens_in, "output": tokens_out},
             cost_usd=round(cost, 6),
@@ -933,9 +954,13 @@ class _CostCallback(BaseCallbackHandler):
             return
         self._finalized_llm_runs.add(run_id)
         self._metrics.record_llm_call(tokens_in=0, tokens_out=0, cost_usd=0.0)
+        call_id = f"{self._invocation_id}:call:{self._call_ordinals[run_id]}"
         self._events.event(
             "agent.call",
+            event_id=f"agent.call:{call_id}",
             agent=self._agent,
+            attempt_id=self._attempt_id,
+            call_id=call_id,
             model=self._model,
             tokens={"input": 0, "output": 0},
             cost_usd=0.0,
@@ -1021,6 +1046,12 @@ class AgentRuntime:
 
     async def run_action(self, request: AgentActionRequest) -> AgentRunResult:
         """Execute or resume an Action and return only ABI-owned frozen models."""
+        resume_key = (
+            "fresh"
+            if request.resume is None
+            else hashlib.sha256(request.resume.model_dump_json().encode()).hexdigest()[:12]
+        )
+        invocation_id = f"{request.thread_id}:{resume_key}"
         callback = _CostCallback(
             model=self._config.model,
             budget=self._budget,
@@ -1028,6 +1059,8 @@ class AgentRuntime:
             metrics=self._metrics,
             agent_name=request.agent_name,
             max_output_tokens=self._config.max_output_tokens,
+            attempt_id=request.thread_id,
+            invocation_id=invocation_id,
         )
         callbacks: list[BaseCallbackHandler] = [callback]
         if self._langfuse is not None:
@@ -1042,16 +1075,23 @@ class AgentRuntime:
         }
         self._events.event(
             "agent.run.start",
+            event_id=f"agent.run.start:{invocation_id}",
             agent=request.agent_name,
             thread_id=request.thread_id,
+            attempt_id=request.thread_id,
             max_iterations=request.max_iterations,
         )
 
         def finish(result: AgentRunResult) -> AgentRunResult:
             self._events.event(
                 "agent.run.end",
+                event_id=(
+                    f"agent.run.end:{invocation_id}:{result.outcome.kind}:"
+                    f"{result.stopped_reason}"
+                ),
                 agent=request.agent_name,
                 thread_id=request.thread_id,
+                attempt_id=request.thread_id,
                 outcome=result.outcome.kind,
                 stopped_reason=result.stopped_reason,
                 llm_calls=result.llm_calls,
@@ -1205,6 +1245,10 @@ class AgentRuntime:
                 if request.may_have_side_effects and callback.tool_log:
                     failure = Indeterminate(
                         operation_key=request.thread_id,
+                        error_code=classification,
+                        failure_signature=hashlib.sha256(
+                            f"{request.thread_id}:{classification}".encode()
+                        ).hexdigest(),
                         message=(
                             "The model provider timed out after a business tool started. "
                             "Reconcile the side effect before retrying."
@@ -1250,17 +1294,17 @@ class AgentRuntime:
             elif classification == "hitl_decision_count_mismatch":
                 counts = _hitl_mismatch_counts(error, request.resume)
                 supplied, pending = counts if counts is not None else ("unknown", "unknown")
-                failure = RepairRequired(
-                    defect_codes=("hitl_decision_count_mismatch",),
-                    message=(
+                failure = _integrity_repair(
+                    "hitl_decision_count_mismatch",
+                    (
                         f"Provided {supplied} HITL decisions for {pending} pending tools. "
                         "Provide one ordered approve/reject decision per pending tool."
                     ),
                 )
             elif classification == "checkpoint_not_resumable":
-                failure = RepairRequired(
-                    defect_codes=("checkpoint_not_resumable",),
-                    message=(
+                failure = _integrity_repair(
+                    "checkpoint_not_resumable",
+                    (
                         "This thread has no compatible checkpoint to resume. "
                         "Start a fresh Action invocation instead."
                     ),

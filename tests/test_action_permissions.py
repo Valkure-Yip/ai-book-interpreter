@@ -15,7 +15,10 @@ from abi.actions.builtins.inputs import (
     ChapterBatchInput,
     EmptyInput,
     ReviewBatchInput,
+    SpotcheckInput,
 )
+from abi.actions.effects import expand_expected_artifacts
+from abi.project.artifacts import ArtifactStore
 from abi.project.layout import BookProject
 from abi.tools.fs import make_fs_tools
 from abi.tools.gates import make_gate_tools
@@ -44,16 +47,30 @@ def test_action_receives_only_allowlisted_tools_and_paths() -> None:
 
 
 def test_filesystem_handler_rechecks_action_permissions(tmp_path: Path) -> None:
-    envelope = build_action_envelope("chapter.translate", ChapterBatchInput(chapters=("001",)))
-    tools = make_fs_tools(_context(tmp_path), permissions=envelope.permissions)
+    parameters = ChapterBatchInput(chapters=("001",))
+    envelope = build_action_envelope("chapter.translate", parameters)
+    project = BookProject(tmp_path)
+    store = ArtifactStore(project, None)
+    writer = store.writer("translate-001", 1)
+    manifest = expand_expected_artifacts("chapter.translate", "translate-001", parameters)
+    tools = make_fs_tools(
+        _context(tmp_path),
+        permissions=envelope.permissions,
+        writer=writer,
+        expected_artifacts={item.canonical_relpath: item for item in manifest.entries},
+    )
     write_file = next(tool for tool in tools if tool.name == "write_file")
 
     write_file.callable(path="chapters/translated/001.md", content="allowed")
     with pytest.raises(PermissionError, match="not allowed to write"):
         write_file.callable(path="glossary/terms.csv", content="forbidden")
 
-    assert (tmp_path / "chapters/translated/001.md").read_text(encoding="utf-8") == "allowed"
+    assert (
+        tmp_path / "state/staging/translate-001/1/chapters/translated/001.md"
+    ).read_text(encoding="utf-8") == "allowed"
+    assert not (tmp_path / "chapters/translated/001.md").exists()
     assert not (tmp_path / "glossary/terms.csv").exists()
+    store.close()
 
 
 @pytest.mark.parametrize("chapter", ("../001", "Chapter-01", "章节一", "001/other"))
@@ -68,7 +85,16 @@ def test_unknown_capability_cannot_receive_a_default_permission_set() -> None:
 
 
 def test_reviewers_cannot_write_canonical_translation_or_output() -> None:
-    envelope = build_action_envelope("review.spotcheck", ReviewBatchInput())
+    envelope = build_action_envelope(
+        "review.spotcheck",
+        SpotcheckInput(
+            round_id="round_001",
+            reviewers=("agent_a", "agent_b"),
+            chapters=("001",),
+            samples_per_agent=1,
+            seed=1,
+        ),
+    )
 
     assert envelope.permissions.can_read("chapters/final/001.md")
     assert not envelope.permissions.can_write("reviews/random_spotcheck/round_001/validation_report.json")
@@ -151,6 +177,8 @@ def test_publication_lint_gate_uses_typed_metadata_without_legacy_state(
         write_files=("output/publication_lint.json",),
     )
     context = SimpleNamespace(project=project, resolve=lambda path: project.root / path)
+    store = ArtifactStore(project, None)
+    writer = store.writer("lint-1", 1)
     tool = next(
         item
         for item in make_gate_tools(
@@ -159,11 +187,15 @@ def test_publication_lint_gate_uses_typed_metadata_without_legacy_state(
             runtime_metadata=GateRuntimeMetadata(
                 target_language="zh-Hans", publication_mode="public_domain"
             ),
+            writer=writer,
         )
         if item.name == "publication_lint"
     )
 
     assert tool.callable().startswith("PASS:")
+    assert writer.staged_path("output/publication_lint.json").is_file()
+    assert not project.publication_lint_report.exists()
+    store.close()
 
 
 def _release_gate_project(tmp_path: Path) -> BookProject:
@@ -205,8 +237,9 @@ def test_release_gate_uses_typed_mode_without_legacy_state(
         if item.name == "create_release"
     )
 
-    assert tool.callable(version="v0.0.1").startswith("PASS:")
-    assert tuple(project.release_dir.glob("*_v0.0.1.epub"))
+    with pytest.raises(PermissionError, match="deterministic built-in"):
+        tool.callable(version="v0.0.1")
+    assert not project.release_dir.exists()
 
 
 @pytest.mark.parametrize(

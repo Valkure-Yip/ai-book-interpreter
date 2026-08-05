@@ -45,7 +45,15 @@ CREATE TABLE IF NOT EXISTS actions (
     write_set_json TEXT NOT NULL,
     status TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
+    expected_manifest_json TEXT NOT NULL,
+    expected_manifest_digest TEXT NOT NULL,
+    expected_evidence_refs_json TEXT NOT NULL,
+    retry_policy_json TEXT NOT NULL,
+    retry_policy_fingerprint TEXT NOT NULL,
     failure_signature TEXT,
+    repair_class TEXT,
+    repair_source TEXT,
+    reason_code TEXT,
     committed_at TEXT,
     commit_signature TEXT,
     UNIQUE (run_id, action_id)
@@ -56,10 +64,67 @@ CREATE TABLE IF NOT EXISTS action_attempts (
     action_id TEXT NOT NULL REFERENCES actions(action_id),
     attempt INTEGER NOT NULL,
     status TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    expected_manifest_json TEXT NOT NULL,
+    expected_manifest_digest TEXT NOT NULL,
+    expected_evidence_refs_json TEXT NOT NULL,
+    retry_policy_json TEXT NOT NULL,
+    retry_policy_fingerprint TEXT NOT NULL,
+    retry_of_attempt INTEGER,
+    staging_relpath TEXT NOT NULL,
     failure_signature TEXT,
-    started_at TEXT NOT NULL,
+    repair_class TEXT,
+    repair_source TEXT,
+    reason_code TEXT,
+    started_at TEXT,
     finished_at TEXT,
-    UNIQUE (action_id, attempt)
+    UNIQUE (action_id, attempt),
+    UNIQUE (action_id, retry_of_attempt)
+);
+
+CREATE TABLE IF NOT EXISTS attempt_outcome_receipts (
+    action_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    canonical_outcome_json TEXT NOT NULL,
+    outcome_digest TEXT NOT NULL,
+    canonical_bundle_json TEXT,
+    bundle_digest TEXT,
+    evidence_refs_json TEXT NOT NULL,
+    error_code TEXT,
+    failure_signature TEXT,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (action_id, attempt),
+    FOREIGN KEY (action_id, attempt) REFERENCES action_attempts(action_id, attempt)
+);
+
+CREATE TABLE IF NOT EXISTS gate_receipts (
+    action_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    validator_id TEXT NOT NULL,
+    validator_version TEXT NOT NULL,
+    canonical_gate_decision_json TEXT NOT NULL,
+    gate_decision_digest TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    artifacts_json TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (action_id, attempt),
+    FOREIGN KEY (action_id, attempt) REFERENCES action_attempts(action_id, attempt)
+);
+
+CREATE TABLE IF NOT EXISTS repair_facts (
+    action_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    repair_class TEXT NOT NULL,
+    repair_source TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    defect_codes_json TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    message TEXT NOT NULL,
+    outcome_digest TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (action_id, attempt),
+    FOREIGN KEY (action_id, attempt) REFERENCES action_attempts(action_id, attempt)
 );
 
 CREATE TABLE IF NOT EXISTS artifacts (
@@ -80,10 +145,15 @@ CREATE TABLE IF NOT EXISTS promotion_intents (
     canonical_relpath TEXT NOT NULL,
     checksum TEXT NOT NULL,
     media_type TEXT NOT NULL,
+    evidence_role TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    bundle_digest TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     committed_at TEXT,
     UNIQUE (action_id, attempt, staged_relpath, canonical_relpath),
+    UNIQUE (action_id, attempt, ordinal),
     UNIQUE (canonical_relpath)
 );
 
@@ -104,6 +174,9 @@ CREATE TABLE IF NOT EXISTS incidents (
     error_code TEXT NOT NULL,
     subject TEXT,
     message TEXT NOT NULL,
+    repair_class TEXT,
+    repair_source TEXT,
+    reason_code TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     resolved_at TEXT
@@ -134,6 +207,7 @@ CREATE TABLE IF NOT EXISTS budget_entries (
 
 CREATE TABLE IF NOT EXISTS event_outbox (
     event_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
     event_name TEXT NOT NULL,
     aggregate_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,

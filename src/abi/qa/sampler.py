@@ -49,6 +49,93 @@ def _budget(stratum: Stratum, n: int) -> int:
     return _SAMPLE_IF_OVER
 
 
+def plan_random_review_passages(
+    project: BookProject,
+    *,
+    round_id: str,
+    reviewers: tuple[str, ...],
+    chapters: tuple[str, ...],
+    samples_per_agent: int,
+    seed: int,
+) -> tuple[GateResult, dict[str, bytes]]:
+    """Build an authorized spot-check sample set without writing any files."""
+    all_units = extract_units(project)
+    available = {unit.chapter for unit in all_units}
+    requested = set(chapters)
+    if available & requested != requested:
+        missing = sorted(requested - available)
+        return GateResult(False, f"spot-check chapters are missing: {missing}"), {}
+    units = [unit for unit in all_units if unit.chapter in requested]
+    if not units:
+        return GateResult(False, "no audit units found for authorized chapters"), {}
+    strata = stratify(units)
+    root = f"reviews/random_spotcheck/{round_id}"
+    outputs: dict[str, bytes] = {}
+    per_reviewer: dict[str, int] = {}
+    for reviewer_index, reviewer in enumerate(reviewers):
+        rng = random.Random(seed + reviewer_index)
+        picked: list[AuditUnit] = []
+        for stratum, pool in strata.items():
+            if not pool:
+                continue
+            count = _budget(stratum, len(pool))
+            if stratum == "paragraph":
+                count = min(count, samples_per_agent)
+            picked.extend(_sample(rng, pool, count))
+        picked.sort(key=lambda item: item.unit_id)
+        per_reviewer[reviewer] = len(picked)
+        lines = [
+            f"# Random spot-check {round_id} — {reviewer}",
+            "",
+            f"Score every sample 0-100. seed={seed + reviewer_index}.",
+            "",
+        ]
+        sample_index: list[dict[str, str]] = []
+        for unit in picked:
+            lines.extend(
+                (
+                    f"## {unit.unit_id}  [{unit.stratum}]  ({unit.chapter})",
+                    "",
+                    unit.text,
+                    "",
+                )
+            )
+            sample_index.append(
+                {
+                    "unit_id": unit.unit_id,
+                    "stratum": unit.stratum,
+                    "chapter": unit.chapter,
+                }
+            )
+        sample_root = f"{root}/samples/{reviewer}"
+        outputs[f"{sample_root}/samples.md"] = "\n".join(lines).encode()
+        outputs[f"{sample_root}/samples.json"] = json.dumps(
+            sample_index, ensure_ascii=False, indent=2, sort_keys=True
+        ).encode()
+
+    manifest = {
+        "round_id": round_id,
+        "seed": seed,
+        "reviewers": list(reviewers),
+        "chapters": list(chapters),
+        "samples_per_agent": samples_per_agent,
+        "population": {name: len(pool) for name, pool in strata.items()},
+        "total_units": len(units),
+        "per_reviewer": per_reviewer,
+    }
+    outputs[f"{root}/round_manifest.json"] = json.dumps(
+        manifest, ensure_ascii=False, indent=2, sort_keys=True
+    ).encode()
+    return (
+        GateResult(
+            True,
+            f"{round_id}: {len(units)} units, reviewers={list(reviewers)}",
+            details=manifest,
+        ),
+        outputs,
+    )
+
+
 def select_random_review_passages(
     project: BookProject,
     *,

@@ -43,7 +43,7 @@ def _find_java() -> str | None:
 
 def _jar_from_package() -> str | None:
     try:
-        from epubcheck.const import EPUBCHECK  # type: ignore
+        from epubcheck.const import EPUBCHECK
 
         if EPUBCHECK and Path(EPUBCHECK).exists():
             return str(EPUBCHECK)
@@ -96,6 +96,29 @@ def run_epubcheck(project: BookProject, epub_path: Path) -> GateResult:
     )
     res.write_json(project.root / "output/epubcheck_summary.json")
     return res
+
+
+def run_epubcheck_readonly(epub_path: Path) -> GateResult:
+    """Run EPUBCheck without creating any report file outside attempt staging."""
+    if not epub_path.is_file():
+        return GateResult(False, f"EPUB not found: {epub_path.name}")
+    java = _find_java()
+    jar = os.environ.get("ABI_EPUBCHECK_JAR") or _jar_from_package()
+    cli = shutil.which("epubcheck")
+    if jar and java:
+        code, output = _run([java, "-jar", jar, str(epub_path)])
+    elif cli:
+        code, output = _run([cli, str(epub_path)])
+    else:
+        return GateResult(False, "EPUBCheck not available")
+    fatal, errors, warnings = _parse_report(Path("/__abi_no_report__"), output)
+    ok = code == 0 and fatal == 0 and errors == 0
+    return GateResult(
+        ok,
+        f"EPUBCheck: {fatal} fatal, {errors} errors, {warnings} warnings (exit {code})",
+        hard_errors=[] if ok else _extract_messages(Path("/__abi_no_report__"), output),
+        details={"fatal": fatal, "errors": errors, "warnings": warnings, "exit_code": code},
+    )
 
 
 def _parse_report(json_out: Path, output: str) -> tuple[int, int, int]:

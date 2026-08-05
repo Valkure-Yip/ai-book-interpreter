@@ -21,7 +21,7 @@ def _refs(text: str) -> list[str]:
     return _MD_IMG_RE.findall(text) + _HTML_IMG_RE.findall(text)
 
 
-def asset_manifest_check(project: BookProject) -> GateResult:
+def asset_manifest_check(project: BookProject, *, write_report: bool = True) -> GateResult:
     errors: list[str] = []
     warnings: list[str] = []
     referenced: set[str] = set()
@@ -65,5 +65,6 @@ def asset_manifest_check(project: BookProject) -> GateResult:
         warnings=warnings,
         details={"referenced": sorted(referenced), "present": len(present)},
     )
-    res.write_json(project.asset_manifest_report)
+    if write_report:
+        res.write_json(project.asset_manifest_report)
     return res
