@@ -387,7 +387,7 @@ async def _controller_rig(
     complete_when: Callable[[RunSnapshot], bool] | None = None,
     max_cycles: int = 12,
     spec_options: dict[str, dict[str, object]] | None = None,
-    dispatcher_hook: Callable[[str, ActionOutcomeEnvelope], None] | None = None,
+    dispatcher_hook: Callable[[str, object], None] | None = None,
     committer_hook: Callable[[str, object], None] | None = None,
     semantic_repair_mappings: tuple[tuple[str, str], ...] = (),
     validators: dict[str, ValidatorFn] | None = None,
@@ -600,7 +600,7 @@ async def test_dispatcher_receipt_boundary_precedes_controller_hook(
     """Catch a controller-visible outcome escaping before its immutable receipt."""
     observed: list[str] = []
 
-    def crash(point: str, envelope: ActionOutcomeEnvelope) -> None:
+    def crash(point: str, _detail: object) -> None:
         observed.append(point)
         if point == crash_point:
             raise BoundaryCrash(point)
@@ -628,7 +628,11 @@ async def test_dispatcher_receipt_boundary_precedes_controller_hook(
             )
             assert envelope.action_id == action.action_id
             assert envelope.attempt == 1
-            assert observed == ["before_outcome_receipt", "after_action_output"]
+            assert observed == [
+                "before_outcome_receipt",
+                "after_outcome_receipt",
+                "after_action_output",
+            ]
         else:
             with pytest.raises(LedgerNotFoundError):
                 await rig.ledger.get_attempt_outcome(action.action_id, 1)
@@ -2380,6 +2384,7 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
             "action.authorized": 2,
             "action.committed": 1,
             "action.outcome": 2,
+            "action.resolved": 1,
             "action.started": 2,
             "incident.created": 1,
             "plan.authorized": 2,
@@ -2398,90 +2403,6 @@ async def test_concurrent_ticks_authorize_exactly_one_durable_probe_binding(
         ) == 2
         assert rig.executors["release.publish"].attempt_ids == [1]
         assert rig.executors["release.probe"].attempt_ids == [1]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("disposition", "reason_code"),
-    (
-        ("succeeded", "probe_resolution_pending"),
-        ("absent", "probe_resolution_pending"),
-        ("unknown", "probe_resolution_unknown"),
-    ),
-)
-async def test_indeterminate_dispatches_one_bound_probe_then_blocks_pending_task9(
-    tmp_path: Path, disposition: str, reason_code: str
-) -> None:
-    operation_key = "publish:external-1"
-    async with _controller_rig(
-        tmp_path,
-        definitions=(
-            (
-                "release.publish",
-                (
-                    Indeterminate(
-                        operation_key=operation_key,
-                        error_code="provider_timeout",
-                        failure_signature=canonical_failure_signature(
-                            "release.publish", "{}", "provider_timeout"
-                        ),
-                        message="remote result unknown",
-                    ),
-                ),
-            ),
-            (
-                "release.probe",
-                (
-                    ProbeResolution(
-                        operation_key=operation_key,
-                        disposition=disposition,
-                        evidence_refs=("external:release-1",),
-                        message="read-only provider evidence",
-                    ),
-                ),
-            ),
-        ),
-        patches=(_patch("publish", "release.publish"),),
-        spec_options={
-            "release.publish": {
-                "probe_capability": "release.probe",
-                "retryable_codes": ("provider_timeout",),
-            }
-        },
-        probe_capabilities=frozenset({"release.probe"}),
-    ) as rig:
-        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
-
-        actions = await rig.ledger.list_actions(rig.run_id)
-        original = next(item for item in actions if item.capability == "release.publish")
-        probe = next(item for item in actions if item.capability == "release.probe")
-        binding = ProbeActionInput.model_validate_json(probe.parameters_json)
-        assert binding == ProbeActionInput(
-            original_action_id=original.action_id,
-            original_attempt=1,
-            operation_key=operation_key,
-            probe_capability="release.probe",
-        )
-        assert rig.executors["release.publish"].attempt_ids == [1]
-        assert rig.executors["release.probe"].attempt_ids == [1]
-        assert await rig.ledger.attempt_numbers(original.action_id) == (1,)
-        assert await rig.ledger.attempt_numbers(probe.action_id) == (1,)
-        assert await rig.ledger.action_status(original.action_id) is ActionStatus.INDETERMINATE
-        assert await rig.ledger.action_status(probe.action_id) is ActionStatus.SUCCEEDED
-        receipt = await rig.ledger.get_attempt_outcome(probe.action_id, 1)
-        durable = ActionOutcomeEnvelope.model_validate_json(
-            receipt.canonical_outcome_json
-        )
-        assert isinstance(durable.outcome, ProbeResolution)
-        assert await rig.ledger.has_open_incident(reason_code)
-        assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
-
-        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
-        assert rig.executors["release.publish"].attempt_ids == [1]
-        assert rig.executors["release.probe"].attempt_ids == [1]
-        assert len(await rig.ledger.list_actions(rig.run_id)) == 2
-        await _assert_repair_incident_outbox_matches_rows(rig.ledger)
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -2543,6 +2464,106 @@ async def test_bound_probe_rejects_wrong_resolution_shape_as_integrity(
         assert classified.outcome.reason_code == "probe_resolution_conflict"
         assert rig.executors["release.publish"].attempt_ids == [1]
         assert rig.executors["release.probe"].attempt_ids == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "disposition",
+        "original_outcomes",
+        "expected_original_attempts",
+        "expected_run_status",
+    ),
+    (
+        ("succeeded", (None,), (1,), RunStatus.COMPLETED),
+        ("absent", (None, SuccessTemplate()), (1, 2), RunStatus.COMPLETED),
+        ("unknown", (None,), (1,), RunStatus.BLOCKED),
+    ),
+)
+async def test_indeterminate_runtime_dispatches_one_bound_probe_without_blind_reissue(
+    tmp_path: Path,
+    disposition: str,
+    original_outcomes: tuple[SuccessTemplate | None, ...],
+    expected_original_attempts: tuple[int, ...],
+    expected_run_status: RunStatus,
+) -> None:
+    operation_key = "publish:external-1"
+    indeterminate = Indeterminate(
+        operation_key=operation_key,
+        error_code="provider_timeout",
+        failure_signature=canonical_failure_signature(
+            "release.publish", "{}", "provider_timeout"
+        ),
+        message="remote result unknown",
+    )
+    planned_original: tuple[PlannedOutcome, ...] = tuple(
+        indeterminate if item is None else item for item in original_outcomes
+    )
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            ("release.publish", planned_original),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key=operation_key,
+                        disposition=disposition,
+                        evidence_refs=("external:release-1",),
+                        message="read-only provider evidence",
+                    ),
+                ),
+            ),
+        ),
+        patches=(_patch("publish", "release.publish"),),
+        spec_options={
+            "release.publish": {
+                "probe_capability": "release.probe",
+                "retryable_codes": ("provider_timeout",),
+            }
+        },
+        probe_capabilities=frozenset({"release.probe"}),
+        complete_when=_completed_capability("release.publish"),
+    ) as rig:
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+
+        actions = await rig.ledger.list_actions(rig.run_id)
+        original = next(item for item in actions if item.capability == "release.publish")
+        probes = tuple(item for item in actions if item.capability == "release.probe")
+        assert len(probes) == 1
+        probe = probes[0]
+        assert ProbeActionInput.model_validate_json(probe.parameters_json) == ProbeActionInput(
+            original_action_id=original.action_id,
+            original_attempt=1,
+            operation_key=operation_key,
+            probe_capability="release.probe",
+        )
+        assert tuple(rig.executors["release.publish"].attempt_ids) == (
+            expected_original_attempts
+        )
+        assert rig.executors["release.probe"].attempt_ids == [1]
+        assert await rig.ledger.attempt_numbers(original.action_id) == (
+            expected_original_attempts
+        )
+        assert await rig.ledger.attempt_numbers(probe.action_id) == (1,)
+        assert await rig.ledger.action_status(probe.action_id) is ActionStatus.SUCCEEDED
+        resolution = await rig.ledger.get_probe_resolution(original.action_id, 1)
+        assert resolution.disposition == disposition
+        assert (await rig.ledger.get_run(rig.run_id)).status is expected_run_status
+        if disposition == "absent":
+            assert await rig.ledger.attempt_status(
+                original.action_id, 1
+            ) is ActionStatus.RETRY_WAIT
+
+        calls_before_resume = (
+            tuple(rig.executors["release.publish"].attempt_ids),
+            tuple(rig.executors["release.probe"].attempt_ids),
+        )
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+        assert (
+            tuple(rig.executors["release.publish"].attempt_ids),
+            tuple(rig.executors["release.probe"].attempt_ids),
+        ) == calls_before_resume
 
 
 @pytest.mark.asyncio

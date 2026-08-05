@@ -601,6 +601,8 @@ class ArtifactStore:
                     await self._raise_checksum_conflict(
                         intent, "new canonical artifact has a different checksum"
                     )
+                if intent.ordinal == 0:
+                    self._invoke_test_hook("after_first_canonical_create", intent)
                 self._invoke_test_hook("after_canonical_written", intent)
                 self._assert_directory_binding(canonical_parent_fd, canonical_parts[:-1])
                 if not _named_inode_matches(canonical_parent_fd, canonical_parts[-1], canonical_stat):
@@ -609,6 +611,8 @@ class ArtifactStore:
                     os.fsync(canonical_parent_fd)
                 except OSError as exc:
                     await self._raise_write_incomplete(intent, exc)
+                if intent.ordinal == 0:
+                    self._invoke_test_hook("after_first_canonical_write", intent)
                 if crash_after == "after_canonical_write":
                     raise InjectedCrash("injected crash after canonical artifact write")
                 return await self._commit_existing(
@@ -669,6 +673,9 @@ class ArtifactStore:
                     f"promotion intent {intent.intent_id} became CONFLICT during commit; "
                     "inspect its incident and continue reconciliation"
                 ) from exc
+            self._invoke_test_hook(
+                "after_intent_commit_before_postcheck", committed
+            )
             if (
                 _sha256_fd(canonical_fd) != intent.checksum
                 or not _named_inode_matches(canonical_parent_fd, canonical_name, canonical_stat)

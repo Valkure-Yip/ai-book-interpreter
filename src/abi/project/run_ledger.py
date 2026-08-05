@@ -80,6 +80,16 @@ class _ProbeBindingConflict(RuntimeError):
     """Internal signal used to roll back before independent compensation."""
 
 
+class _ProbeResolutionConflict(RuntimeError):
+    """Internal signal that preserves the first resolution before compensation."""
+
+    def __init__(self, *, run_id: str, action_id: str, attempt: int) -> None:
+        self.run_id = run_id
+        self.action_id = action_id
+        self.attempt = attempt
+        super().__init__("probe resolution conflicts with the immutable first fact")
+
+
 class RunSeed(FrozenModel):
     """Immutable inputs for creating a durable run."""
 
@@ -273,6 +283,38 @@ class RepairFactRecord(FrozenModel):
     recorded_at: datetime
 
 
+class ProbeResolutionRequest(FrozenModel):
+    """Caller-bound facts required to resolve one indeterminate operation."""
+
+    original_action_id: str = Field(min_length=1)
+    original_attempt: int = Field(ge=1)
+    probe_action_id: str = Field(min_length=1)
+    probe_attempt: int = Field(ge=1)
+    operation_key: str = Field(min_length=1)
+    original_idempotency_key: str = Field(min_length=1)
+    retry_policy_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ProbeResolutionRecord(FrozenModel):
+    """Immutable durable fact produced by ``resolve_indeterminate``."""
+
+    original_action_id: str
+    original_attempt: int = Field(ge=1)
+    probe_action_id: str
+    probe_attempt: int = Field(ge=1)
+    operation_key: str
+    disposition: Literal["succeeded", "absent", "unknown"]
+    evidence_refs: tuple[str, ...]
+    message: str
+    original_idempotency_key: str
+    retry_policy: RetryPolicySpec
+    retry_policy_fingerprint: str
+    error_code: str
+    failure_signature: str
+    resolution_digest: str
+    resolved_at: datetime
+
+
 class _GateIdentityList(FrozenModel):
     items: tuple[GateArtifactIdentity, ...]
 
@@ -282,26 +324,40 @@ class _MetadataList(FrozenModel):
 
 
 Clock = Callable[[], datetime]
+LedgerHook = Callable[[str, object], None]
 
 
 class RunLedger:
     """The sole mutable business authority for a dynamic orchestration run."""
 
-    def __init__(self, db: aiosqlite.Connection, *, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        clock: Clock | None = None,
+        test_hook: LedgerHook | None = None,
+    ) -> None:
         self._db = db
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._test_hook = test_hook
         self._transaction_lock = asyncio.Lock()
 
     @classmethod
     @asynccontextmanager
-    async def open(cls, path: Path, *, clock: Clock | None = None) -> AsyncIterator[Self]:
+    async def open(
+        cls,
+        path: Path,
+        *,
+        clock: Clock | None = None,
+        test_hook: LedgerHook | None = None,
+    ) -> AsyncIterator[Self]:
         """Open and initialize a WAL-backed ledger at ``path``."""
         db = await aiosqlite.connect(path)
         db.row_factory = aiosqlite.Row
         try:
             await db.executescript(SCHEMA_SQL)
             await db.commit()
-            yield cls(db, clock=clock)
+            yield cls(db, clock=clock, test_hook=test_hook)
         finally:
             await db.close()
 
@@ -960,6 +1016,32 @@ class RunLedger:
             raise LedgerNotFoundError("attempt outcome receipt is absent; reconcile staging or block")
         return self._outcome_receipt_from_row(row)
 
+    async def get_probe_resolution(
+        self, original_action_id: str, original_attempt: int
+    ) -> ProbeResolutionRecord:
+        """Load the immutable external-operation resolution for one original attempt."""
+        row = await self._fetch_one(
+            "SELECT * FROM probe_resolutions WHERE original_action_id = ? "
+            "AND original_attempt = ?",
+            (original_action_id, original_attempt),
+        )
+        if row is None:
+            raise LedgerNotFoundError("probe resolution is absent")
+        return self._probe_resolution_from_row(row)
+
+    async def get_probe_resolution_for_probe(
+        self, probe_action_id: str, probe_attempt: int
+    ) -> ProbeResolutionRecord:
+        """Load the immutable resolution committed by one evidence-only probe."""
+        row = await self._fetch_one(
+            "SELECT * FROM probe_resolutions WHERE probe_action_id = ? "
+            "AND probe_attempt = ?",
+            (probe_action_id, probe_attempt),
+        )
+        if row is None:
+            raise LedgerNotFoundError("probe resolution is absent")
+        return self._probe_resolution_from_row(row)
+
     async def create_next_attempt(
         self, action_id: str, *, previous_attempt: int
     ) -> ActionAttemptRecord:
@@ -974,8 +1056,26 @@ class RunLedger:
             )
             existing = await cursor.fetchone()
             if existing is not None:
-                if int(existing["attempt"]) != next_attempt:
-                    raise LedgerConflictError("retry successor is not strictly consecutive")
+                exact_successor = (
+                    int(existing["attempt"]) == next_attempt
+                    and existing["parameters_json"] == previous["parameters_json"]
+                    and existing["expected_manifest_json"]
+                    == previous["expected_manifest_json"]
+                    and existing["expected_manifest_digest"]
+                    == previous["expected_manifest_digest"]
+                    and existing["expected_evidence_refs_json"]
+                    == previous["expected_evidence_refs_json"]
+                    and existing["retry_policy_json"] == previous["retry_policy_json"]
+                    and existing["retry_policy_fingerprint"]
+                    == previous["retry_policy_fingerprint"]
+                    and int(existing["retry_of_attempt"]) == previous_attempt
+                    and existing["staging_relpath"]
+                    == f"state/staging/{action_id}/{next_attempt}"
+                )
+                if not exact_successor:
+                    raise LedgerConflictError(
+                        "retry successor conflicts with its predecessor frozen facts"
+                    )
                 return self._attempt_from_row(existing)
             if _action_status(previous["status"], "action_attempts.status") is not ActionStatus.RETRY_WAIT:
                 raise LedgerTransitionError("only a durable RETRY_WAIT attempt can create a successor")
@@ -1163,6 +1263,10 @@ class RunLedger:
         validator_decision: GateDecision | None = None,
     ) -> RepairFactRecord:
         """Record one receipt-bound semantic repair or integrity block transaction."""
+        self._invoke_hook(
+            "before_repair_fact_commit",
+            {"action_id": action_id, "attempt": attempt},
+        )
         now = self._now()
         try:
             async with self.transaction() as db:
@@ -1358,6 +1462,10 @@ class RunLedger:
                     "preserve the first receipt and inspect the conflicting evidence."
                 ),
             )
+        self._invoke_hook(
+            "after_repair_fact_commit",
+            {"action_id": action_id, "attempt": attempt},
+        )
         row = await self._fetch_one(
             "SELECT * FROM repair_facts WHERE action_id = ? AND attempt = ?", (action_id, attempt)
         )
@@ -1381,44 +1489,92 @@ class RunLedger:
             )
         return await self.get_attempt(action_id, attempt)
 
-    async def complete_probe_pending(
-        self,
-        *,
-        probe_action_id: str,
-        probe_attempt: int,
-        original_action_id: str,
-        original_attempt: int,
-        operation_key: str,
-    ) -> ActionAttemptRecord:
-        """Evidence-only complete a probe while leaving original resolution to Task 9."""
+    async def resolve_indeterminate(
+        self, request: ProbeResolutionRequest
+    ) -> ProbeResolutionRecord:
+        """Atomically commit probe evidence and exactly one original-attempt route."""
+        try:
+            return await self._resolve_indeterminate_once(request)
+        except _ProbeResolutionConflict as exc:
+            await self._record_probe_resolution_conflict(exc)
+            raise LedgerConflictError(
+                "probe resolution conflicts with the immutable first fact"
+            ) from exc
+        except (LedgerTransitionError, ValidationError) as exc:
+            original = await self.get_action(request.original_action_id)
+            conflict = _ProbeResolutionConflict(
+                run_id=original.run_id,
+                action_id=request.original_action_id,
+                attempt=request.original_attempt,
+            )
+            await self._record_probe_resolution_conflict(conflict)
+            raise LedgerConflictError(
+                "probe resolution conflicts with durable binding or policy facts"
+            ) from exc
+
+    async def _resolve_indeterminate_once(
+        self, request: ProbeResolutionRequest
+    ) -> ProbeResolutionRecord:
+        """Run one serialized resolution transaction before any conflict compensation."""
         now = self._now()
         async with self.transaction() as db:
-            probe = await self._require_action(db, probe_action_id)
-            probe_attempt_row = await self._attempt_row(
-                db, probe_action_id, probe_attempt
+            cursor = await db.execute(
+                "SELECT pr.*, a.run_id AS original_run_id "
+                "FROM probe_resolutions AS pr "
+                "JOIN actions AS a ON a.action_id = pr.original_action_id "
+                "WHERE (pr.original_action_id = ? AND pr.original_attempt = ?) "
+                "OR (pr.probe_action_id = ? AND pr.probe_attempt = ?)",
+                (
+                    request.original_action_id,
+                    request.original_attempt,
+                    request.probe_action_id,
+                    request.probe_attempt,
+                ),
             )
-            original = await self._require_action(db, original_action_id)
+            prior_identity = await cursor.fetchone()
+            if prior_identity is not None and (
+                prior_identity["original_action_id"] != request.original_action_id
+                or int(prior_identity["original_attempt"])
+                != request.original_attempt
+                or prior_identity["probe_action_id"] != request.probe_action_id
+                or int(prior_identity["probe_attempt"]) != request.probe_attempt
+                or prior_identity["operation_key"] != request.operation_key
+                or prior_identity["original_idempotency_key"]
+                != request.original_idempotency_key
+                or prior_identity["retry_policy_fingerprint"]
+                != request.retry_policy_fingerprint
+            ):
+                raise _ProbeResolutionConflict(
+                    run_id=prior_identity["original_run_id"],
+                    action_id=prior_identity["original_action_id"],
+                    attempt=int(prior_identity["original_attempt"]),
+                )
+            probe = await self._require_action(db, request.probe_action_id)
+            probe_attempt_row = await self._attempt_row(
+                db, request.probe_action_id, request.probe_attempt
+            )
+            original = await self._require_action(db, request.original_action_id)
             original_attempt_row = await self._attempt_row(
-                db, original_action_id, original_attempt
+                db, request.original_action_id, request.original_attempt
             )
             if probe["run_id"] != original["run_id"]:
                 raise LedgerTransitionError("probe and original Action belong to different runs")
             cursor = await db.execute(
                 "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
-                (probe_action_id, probe_attempt),
+                (request.probe_action_id, request.probe_attempt),
             )
             probe_receipt = await cursor.fetchone()
             if probe_receipt is None:
-                raise LedgerTransitionError("probe completion requires its durable resolution receipt")
+                raise LedgerTransitionError("probe resolution requires its durable outcome receipt")
             probe_envelope = ActionOutcomeEnvelope.model_validate_json(
                 probe_receipt["canonical_outcome_json"]
             )
             if not isinstance(probe_envelope.outcome, ProbeResolution):
-                raise LedgerTransitionError("probe completion requires ProbeResolution")
+                raise LedgerTransitionError("probe resolution requires ProbeResolution")
             binding = ProbeActionInput.model_validate_json(probe["parameters_json"])
             cursor = await db.execute(
                 "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
-                (original_action_id, original_attempt),
+                (request.original_action_id, request.original_attempt),
             )
             original_receipt = await cursor.fetchone()
             if original_receipt is None:
@@ -1426,99 +1582,289 @@ class RunLedger:
             original_envelope = ActionOutcomeEnvelope.model_validate_json(
                 original_receipt["canonical_outcome_json"]
             )
+            cursor = await db.execute(
+                "SELECT * FROM probe_bindings WHERE original_action_id = ? "
+                "AND original_attempt = ?",
+                (request.original_action_id, request.original_attempt),
+            )
+            durable_binding = await cursor.fetchone()
+            policy = RetryPolicySpec.model_validate_json(
+                original_attempt_row["retry_policy_json"]
+            )
+            resolution_json = canonical_model_json(probe_envelope.outcome)
+            resolution_digest = sha256_canonical_json(resolution_json)
             exact_binding = (
                 isinstance(original_envelope.outcome, Indeterminate)
-                and binding.original_action_id == original_action_id
-                and binding.original_attempt == original_attempt
-                and binding.operation_key == operation_key
-                and probe_envelope.outcome.operation_key == operation_key
-                and original_envelope.outcome.operation_key == operation_key
+                and durable_binding is not None
+                and binding.original_action_id == request.original_action_id
+                and binding.original_attempt == request.original_attempt
+                and binding.operation_key == request.operation_key
+                and probe_envelope.outcome.operation_key == request.operation_key
+                and original_envelope.outcome.operation_key == request.operation_key
                 and binding.probe_capability == probe["capability"]
-                and _action_status(original["status"], "actions.status")
-                is ActionStatus.INDETERMINATE
-                and _action_status(original_attempt_row["status"], "action_attempts.status")
-                is ActionStatus.INDETERMINATE
+                and durable_binding["operation_key"] == request.operation_key
+                and durable_binding["probe_capability"] == probe["capability"]
+                and durable_binding["probe_action_id"] == request.probe_action_id
+                and original["idempotency_key"] == request.original_idempotency_key
+                and original["retry_policy_json"] == original_attempt_row["retry_policy_json"]
+                and original["retry_policy_fingerprint"]
+                == original_attempt_row["retry_policy_fingerprint"]
+                and original_attempt_row["retry_policy_fingerprint"]
+                == request.retry_policy_fingerprint
+                and original_receipt["error_code"]
+                == original_envelope.outcome.error_code
+                and original_receipt["failure_signature"]
+                == original_envelope.outcome.failure_signature
+                and tuple(json.loads(probe_receipt["evidence_refs_json"]))
+                == probe_envelope.outcome.evidence_refs
             )
             if not exact_binding:
+                if prior_identity is not None:
+                    raise _ProbeResolutionConflict(
+                        run_id=prior_identity["original_run_id"],
+                        action_id=prior_identity["original_action_id"],
+                        attempt=int(prior_identity["original_attempt"]),
+                    )
                 raise LedgerTransitionError("probe resolution conflicts with original binding")
+            assert isinstance(original_envelope.outcome, Indeterminate)
+            durable_values = {
+                "original_action_id": request.original_action_id,
+                "original_attempt": request.original_attempt,
+                "probe_action_id": request.probe_action_id,
+                "probe_attempt": request.probe_attempt,
+                "operation_key": request.operation_key,
+                "disposition": probe_envelope.outcome.disposition,
+                "evidence_refs_json": _dump_tuple(probe_envelope.outcome.evidence_refs),
+                "message": probe_envelope.outcome.message,
+                "original_idempotency_key": request.original_idempotency_key,
+                "retry_policy_json": original_attempt_row["retry_policy_json"],
+                "retry_policy_fingerprint": request.retry_policy_fingerprint,
+                "error_code": original_envelope.outcome.error_code,
+                "failure_signature": original_envelope.outcome.failure_signature,
+                "resolution_digest": resolution_digest,
+            }
+            cursor = await db.execute(
+                "SELECT * FROM probe_resolutions WHERE original_action_id = ? "
+                "AND original_attempt = ?",
+                (request.original_action_id, request.original_attempt),
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                if not all(prior[key] == value for key, value in durable_values.items()):
+                    raise _ProbeResolutionConflict(
+                        run_id=original["run_id"],
+                        action_id=prior["original_action_id"],
+                        attempt=int(prior["original_attempt"]),
+                    )
+                return self._probe_resolution_from_row(prior)
             probe_status = _action_status(probe["status"], "actions.status")
             attempt_status = _action_status(
                 probe_attempt_row["status"], "action_attempts.status"
             )
-            if probe_status is ActionStatus.SUCCEEDED:
-                if attempt_status is not ActionStatus.SUCCEEDED:
-                    raise LedgerConflictError("probe Action/attempt success states disagree")
-                return self._attempt_from_row(probe_attempt_row)
             if probe_status is not ActionStatus.RUNNING or attempt_status is not ActionStatus.RUNNING:
-                raise LedgerTransitionError("probe completion requires its RUNNING attempt")
-            reason_code = (
-                "probe_resolution_unknown"
-                if probe_envelope.outcome.disposition == "unknown"
-                else "probe_resolution_pending"
+                raise LedgerTransitionError("probe resolution requires its RUNNING attempt")
+            if (
+                _action_status(original["status"], "actions.status")
+                is not ActionStatus.INDETERMINATE
+                or _action_status(
+                    original_attempt_row["status"], "action_attempts.status"
+                )
+                is not ActionStatus.INDETERMINATE
+            ):
+                raise _ProbeResolutionConflict(
+                    run_id=original["run_id"],
+                    action_id=request.original_action_id,
+                    attempt=request.original_attempt,
+                )
+            await db.execute(
+                "INSERT INTO probe_resolutions (original_action_id, original_attempt, "
+                "probe_action_id, probe_attempt, operation_key, disposition, "
+                "evidence_refs_json, message, original_idempotency_key, retry_policy_json, "
+                "retry_policy_fingerprint, error_code, failure_signature, resolution_digest, "
+                "resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    *durable_values.values(),
+                    now,
+                ),
             )
+            self._invoke_hook("after_probe_resolution_insert", request)
             await db.execute(
                 "UPDATE action_attempts SET status = ?, finished_at = ? "
                 "WHERE action_id = ? AND attempt = ?",
-                (ActionStatus.SUCCEEDED.value, now, probe_action_id, probe_attempt),
+                (
+                    ActionStatus.SUCCEEDED.value,
+                    now,
+                    request.probe_action_id,
+                    request.probe_attempt,
+                ),
             )
             await db.execute(
                 "UPDATE actions SET status = ?, committed_at = ? WHERE action_id = ?",
-                (ActionStatus.SUCCEEDED.value, now, probe_action_id),
+                (ActionStatus.SUCCEEDED.value, now, request.probe_action_id),
             )
+            self._invoke_hook("after_probe_success", request)
             await self._insert_outbox(
                 db,
                 run_id=probe["run_id"],
                 event_name="action.outcome",
-                aggregate_id=probe_action_id,
+                aggregate_id=request.probe_action_id,
                 payload_json=json.dumps(
                     {
-                        "action_id": probe_action_id,
-                        "attempt": probe_attempt,
+                        "action_id": request.probe_action_id,
+                        "attempt": request.probe_attempt,
                         "classification": "probe_resolution",
                         "disposition": probe_envelope.outcome.disposition,
                     },
                     sort_keys=True,
                 ),
-                idempotency_key=f"action.outcome:{probe_action_id}:{probe_attempt}",
+                idempotency_key=(
+                    f"action.outcome:{request.probe_action_id}:{request.probe_attempt}"
+                ),
                 now=now,
             )
             await self._insert_outbox(
                 db,
                 run_id=probe["run_id"],
                 event_name="action.committed",
-                aggregate_id=probe_action_id,
+                aggregate_id=request.probe_action_id,
                 payload_json=json.dumps(
                     {
-                        "action_id": probe_action_id,
-                        "attempt": probe_attempt,
+                        "action_id": request.probe_action_id,
+                        "attempt": request.probe_attempt,
                         "evidence_only": True,
                     },
                     sort_keys=True,
                 ),
-                idempotency_key=f"action.committed:{probe_action_id}",
+                idempotency_key=f"action.committed:{request.probe_action_id}",
                 now=now,
             )
-            subject = f"probe:{probe_action_id}:{probe_attempt}"
-            await self._insert_incident(
+            disposition = probe_envelope.outcome.disposition
+            if disposition == "succeeded":
+                await db.execute(
+                    "UPDATE action_attempts SET status = ?, finished_at = ? "
+                    "WHERE action_id = ? AND attempt = ?",
+                    (
+                        ActionStatus.SUCCEEDED.value,
+                        now,
+                        request.original_action_id,
+                        request.original_attempt,
+                    ),
+                )
+                await db.execute(
+                    "UPDATE actions SET status = ?, committed_at = ? WHERE action_id = ?",
+                    (ActionStatus.SUCCEEDED.value, now, request.original_action_id),
+                )
+            elif disposition == "absent" and (
+                original_envelope.outcome.error_code in policy.retryable_codes
+                and request.original_attempt < policy.max_attempts
+            ):
+                await db.execute(
+                    "UPDATE action_attempts SET status = ?, finished_at = ? "
+                    "WHERE action_id = ? AND attempt = ?",
+                    (
+                        ActionStatus.RETRY_WAIT.value,
+                        now,
+                        request.original_action_id,
+                        request.original_attempt,
+                    ),
+                )
+                await db.execute(
+                    "UPDATE actions SET status = ? WHERE action_id = ?",
+                    (ActionStatus.RETRY_WAIT.value, request.original_action_id),
+                )
+            else:
+                reason_code = (
+                    "probe_resolution_unknown"
+                    if disposition == "unknown"
+                    else "probe_retry_exhausted"
+                    if request.original_attempt >= policy.max_attempts
+                    else "probe_retry_not_allowed"
+                )
+                subject = (
+                    f"probe-resolution:{request.original_action_id}:"
+                    f"{request.original_attempt}"
+                )
+                await self._insert_incident(
+                    db,
+                    run_id=probe["run_id"],
+                    error_code=reason_code,
+                    message=(
+                        "Probe evidence cannot safely authorize automatic retry; "
+                        "inspect durable provider and retry-policy facts."
+                    ),
+                    action_id=request.original_action_id,
+                    subject=subject,
+                    repair_class="integrity",
+                    repair_source="integrity_guard",
+                    reason_code=reason_code,
+                    now=now,
+                )
+                await db.execute(
+                    "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    (RunStatus.BLOCKED.value, now, probe["run_id"]),
+                )
+            self._invoke_hook("after_original_resolution", request)
+            await self._insert_outbox(
                 db,
                 run_id=probe["run_id"],
-                error_code=reason_code,
-                message=(
-                    "Probe evidence is durable; Task 9 atomic original-attempt resolution "
-                    "must consume it before the run can continue."
+                event_name="action.resolved",
+                aggregate_id=request.original_action_id,
+                payload_json=json.dumps(
+                    {
+                        "action_id": request.original_action_id,
+                        "attempt": request.original_attempt,
+                        "probe_action_id": request.probe_action_id,
+                        "probe_attempt": request.probe_attempt,
+                        "disposition": disposition,
+                    },
+                    sort_keys=True,
                 ),
-                action_id=original_action_id,
-                subject=subject,
+                idempotency_key=(
+                    f"action.resolved:{request.original_action_id}:"
+                    f"{request.original_attempt}"
+                ),
+                now=now,
+            )
+            self._invoke_hook("after_resolution_outbox", request)
+        row = await self._fetch_one(
+            "SELECT * FROM probe_resolutions WHERE original_action_id = ? "
+            "AND original_attempt = ?",
+            (request.original_action_id, request.original_attempt),
+        )
+        assert row is not None
+        return self._probe_resolution_from_row(row)
+
+    async def _record_probe_resolution_conflict(
+        self, conflict: _ProbeResolutionConflict
+    ) -> None:
+        """Block on a conflicting replay without changing the immutable first route."""
+        now = self._now()
+        async with self.transaction() as db:
+            await self._insert_incident(
+                db,
+                run_id=conflict.run_id,
+                error_code="probe_resolution_conflict",
+                message=(
+                    "A probe resolution replay conflicts with the immutable first fact; "
+                    "preserve both sources and inspect external evidence."
+                ),
+                action_id=conflict.action_id,
+                subject=(
+                    f"probe-resolution:{conflict.action_id}:{conflict.attempt}:conflict"
+                ),
                 repair_class="integrity",
                 repair_source="integrity_guard",
-                reason_code=reason_code,
+                reason_code="probe_resolution_conflict",
                 now=now,
             )
             await db.execute(
                 "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
-                (RunStatus.BLOCKED.value, now, probe["run_id"]),
+                (RunStatus.BLOCKED.value, now, conflict.run_id),
             )
-        return await self.get_attempt(probe_action_id, probe_attempt)
+
+    def _invoke_hook(self, point: str, detail: object) -> None:
+        if self._test_hook is not None:
+            self._test_hook(point, detail)
 
     async def attempt_status(self, action_id: str, attempt: int) -> ActionStatus:
         return (await self.get_attempt(action_id, attempt)).status
@@ -1858,8 +2204,30 @@ class RunLedger:
         return rows
 
     async def record_incident(
-        self, run_id: str, *, error_code: str, message: str, action_id: str | None = None
+        self,
+        run_id: str,
+        *,
+        error_code: str,
+        message: str,
+        action_id: str | None = None,
+        repair_class: RepairClass | None = None,
+        repair_source: RepairSource | None = None,
+        reason_code: str | None = None,
     ) -> IncidentRecord:
+        classification = (repair_class, repair_source, reason_code)
+        if any(value is not None for value in classification) and not all(
+            value is not None for value in classification
+        ):
+            raise ValueError(
+                "repair_class, repair_source, and reason_code must be supplied together"
+            )
+        if repair_class == "semantic" and repair_source not in {
+            "action_outcome",
+            "validator",
+        }:
+            raise ValueError("semantic incidents require action_outcome or validator source")
+        if repair_class == "integrity" and repair_source != "integrity_guard":
+            raise ValueError("integrity incidents require integrity_guard source")
         now = self._now()
         async with self.transaction() as db:
             await self._require_run(db, run_id)
@@ -1870,7 +2238,15 @@ class RunLedger:
                         f"action {action_id} belongs to another run; choose an action from run {run_id}"
                     )
             return await self._insert_incident(
-                db, run_id=run_id, error_code=error_code, message=message, action_id=action_id, now=now
+                db,
+                run_id=run_id,
+                error_code=error_code,
+                message=message,
+                action_id=action_id,
+                repair_class=repair_class,
+                repair_source=repair_source,
+                reason_code=reason_code,
+                now=now,
             )
 
     async def get_promotion_intent(self, intent_id: str) -> PromotionIntent:
@@ -2229,6 +2605,7 @@ class RunLedger:
                 IncidentView(
                     incident_id=row["incident_id"],
                     error_code=row["error_code"],
+                    subject=row["subject"],
                     message=row["message"],
                     action_id=row["action_id"],
                     repair_class=row["repair_class"],
@@ -2787,6 +3164,28 @@ class RunLedger:
             message=row["message"],
             outcome_digest=row["outcome_digest"],
             recorded_at=_parse_time(row["recorded_at"]),
+        )
+
+    @staticmethod
+    def _probe_resolution_from_row(row: aiosqlite.Row) -> ProbeResolutionRecord:
+        return ProbeResolutionRecord(
+            original_action_id=row["original_action_id"],
+            original_attempt=row["original_attempt"],
+            probe_action_id=row["probe_action_id"],
+            probe_attempt=row["probe_attempt"],
+            operation_key=row["operation_key"],
+            disposition=row["disposition"],
+            evidence_refs=tuple(json.loads(row["evidence_refs_json"])),
+            message=row["message"],
+            original_idempotency_key=row["original_idempotency_key"],
+            retry_policy=RetryPolicySpec.model_validate_json(
+                row["retry_policy_json"]
+            ),
+            retry_policy_fingerprint=row["retry_policy_fingerprint"],
+            error_code=row["error_code"],
+            failure_signature=row["failure_signature"],
+            resolution_digest=row["resolution_digest"],
+            resolved_at=_parse_time(row["resolved_at"]),
         )
 
 

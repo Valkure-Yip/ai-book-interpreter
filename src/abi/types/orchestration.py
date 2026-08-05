@@ -258,6 +258,7 @@ RepairSource = Literal["action_outcome", "validator", "integrity_guard"]
 class IncidentView(FrozenModel):
     incident_id: str
     error_code: str
+    subject: str | None = None
     message: str
     action_id: str | None = None
     repair_class: RepairClass | None = None

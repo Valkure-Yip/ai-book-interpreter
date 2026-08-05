@@ -110,10 +110,15 @@ class ActionRegistry:
                 )
             if probe is not None:
                 probe_spec = self._definitions[probe].spec
-                if probe_spec.write_set or probe_spec.may_have_side_effects:
+                if (
+                    probe_spec.effects
+                    or probe_spec.write_set
+                    or probe_spec.may_have_side_effects
+                ):
                     raise RegistryConfigurationError(
                         f"probe capability {probe} for {definition.spec.capability} must be "
-                        "read-only and side-effect-free; correct its ActionSpec before startup"
+                        "read-only, evidence-only, and side-effect-free; correct its "
+                        "ActionSpec before startup"
                     )
                 probe_definition = self._definitions[probe]
                 if probe_definition.input_model is not ProbeActionInput:

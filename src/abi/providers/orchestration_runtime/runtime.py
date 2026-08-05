@@ -13,6 +13,8 @@ from typing_extensions import TypedDict
 
 TickCallback = Callable[[str], Awaitable[bool]]
 ExhaustedCallback = Callable[[str, int], Awaitable[None]]
+RuntimeHook = Callable[[str, object], None]
+_CHECKPOINTS_RETAINED_PER_THREAD = 8
 
 
 class LoopState(TypedDict):
@@ -32,6 +34,7 @@ class DurableLoopRuntime:
         checkpoint_path: Path,
         max_cycles: int,
         on_exhausted: ExhaustedCallback | None = None,
+        test_hook: RuntimeHook | None = None,
     ) -> None:
         if max_cycles < 1:
             raise ValueError(
@@ -40,6 +43,7 @@ class DurableLoopRuntime:
         self._checkpoint_path = checkpoint_path
         self._max_cycles = max_cycles
         self._on_exhausted = on_exhausted
+        self._test_hook = test_hook
 
     async def run(self, *, run_id: str, tick: TickCallback) -> None:
         """Invoke the callback until it stops or the configured cycle limit is exhausted."""
@@ -54,6 +58,14 @@ class DurableLoopRuntime:
 
             async def cycle_node(state: LoopState) -> LoopState:
                 keep_running = await tick(state["run_id"])
+                self._invoke_hook(
+                    "before_graph_checkpoint",
+                    {
+                        "run_id": state["run_id"],
+                        "cycle": state["cycle"] + 1,
+                        "continue_run": keep_running,
+                    },
+                )
                 return {
                     "run_id": state["run_id"],
                     "cycle": state["cycle"] + 1,
@@ -75,6 +87,7 @@ class DurableLoopRuntime:
                 {"configurable": {"thread_id": run_id}},
             )
             result = cast(LoopState, raw_result)
+            await _compact_checkpoint_history(checkpointer, thread_id=run_id)
         if result["continue_run"] and result["cycle"] >= self._max_cycles:
             if self._on_exhausted is None:
                 raise RuntimeError(
@@ -82,6 +95,51 @@ class DurableLoopRuntime:
                     "callback that records a controller incident and blocks the run"
                 )
             await self._on_exhausted(run_id, self._max_cycles)
+
+    def _invoke_hook(self, point: str, detail: object) -> None:
+        if self._test_hook is not None:
+            self._test_hook(point, detail)
+
+
+async def _compact_checkpoint_history(
+    checkpointer: AsyncSqliteSaver, *, thread_id: str
+) -> None:
+    """Bound each loop namespace without touching another thread's recovery points."""
+    async with checkpointer.lock:
+        try:
+            await checkpointer.conn.execute("BEGIN IMMEDIATE")
+            cursor = await checkpointer.conn.execute(
+                "SELECT DISTINCT checkpoint_ns FROM checkpoints "
+                "WHERE thread_id = ? ORDER BY checkpoint_ns",
+                (thread_id,),
+            )
+            namespaces = tuple(row[0] for row in await cursor.fetchall())
+            await cursor.close()
+            stale: list[tuple[str, str]] = []
+            for namespace in namespaces:
+                cursor = await checkpointer.conn.execute(
+                    "SELECT checkpoint_ns, checkpoint_id FROM checkpoints "
+                    "WHERE thread_id = ? AND checkpoint_ns = ? "
+                    "ORDER BY checkpoint_id DESC LIMIT -1 OFFSET ?",
+                    (thread_id, namespace, _CHECKPOINTS_RETAINED_PER_THREAD),
+                )
+                stale.extend((row[0], row[1]) for row in await cursor.fetchall())
+                await cursor.close()
+            await checkpointer.conn.executemany(
+                "DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? "
+                "AND checkpoint_id = ?",
+                ((thread_id, row[0], row[1]) for row in stale),
+            )
+            await checkpointer.conn.executemany(
+                "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? "
+                "AND checkpoint_id = ?",
+                ((thread_id, row[0], row[1]) for row in stale),
+            )
+        except BaseException:
+            await checkpointer.conn.rollback()
+            raise
+        else:
+            await checkpointer.conn.commit()
 
 def _validated_checkpoint_path(path: Path) -> Path:
     """Reject aliases and non-file path components before opening local SQLite state."""

@@ -96,6 +96,30 @@ CREATE TABLE IF NOT EXISTS probe_bindings (
         REFERENCES action_attempts(action_id, attempt)
 );
 
+CREATE TABLE IF NOT EXISTS probe_resolutions (
+    original_action_id TEXT NOT NULL,
+    original_attempt INTEGER NOT NULL,
+    probe_action_id TEXT NOT NULL,
+    probe_attempt INTEGER NOT NULL,
+    operation_key TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    evidence_refs_json TEXT NOT NULL,
+    message TEXT NOT NULL,
+    original_idempotency_key TEXT NOT NULL,
+    retry_policy_json TEXT NOT NULL,
+    retry_policy_fingerprint TEXT NOT NULL,
+    error_code TEXT NOT NULL,
+    failure_signature TEXT NOT NULL,
+    resolution_digest TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (original_action_id, original_attempt),
+    UNIQUE (probe_action_id, probe_attempt),
+    FOREIGN KEY (original_action_id, original_attempt)
+        REFERENCES action_attempts(action_id, attempt),
+    FOREIGN KEY (probe_action_id, probe_attempt)
+        REFERENCES action_attempts(action_id, attempt)
+);
+
 CREATE TABLE IF NOT EXISTS attempt_outcome_receipts (
     action_id TEXT NOT NULL,
     attempt INTEGER NOT NULL,

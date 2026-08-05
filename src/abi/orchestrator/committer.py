@@ -240,7 +240,7 @@ class Committer:
         cost_usd: float,
     ) -> CommittedAction:
         promoted = []
-        for intent in intents:
+        for index, intent in enumerate(intents):
             if intent.status == "CONFLICT":
                 await self._integrity_conflict(
                     action,
@@ -257,6 +257,8 @@ class Committer:
             )
             promoted.append(promoted_intent)
             self._invoke_hook("after_intent_promotion", promoted_intent)
+            if index + 1 < len(intents):
+                self._invoke_hook("between_bundle_entries", promoted_intent)
         self._invoke_hook("after_all_intents_committed", tuple(promoted))
 
         committed_intents = await self._artifacts.verify_committed_bundle(

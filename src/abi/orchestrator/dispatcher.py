@@ -30,7 +30,7 @@ from abi.types.orchestration import (
 )
 from abi.types.tools import GateRuntimeMetadata
 
-DispatchHook = Callable[[str, ActionOutcomeEnvelope], None]
+DispatchHook = Callable[[str, object], None]
 
 
 class Dispatcher:
@@ -77,6 +77,8 @@ class Dispatcher:
         durable_attempt = await self._ledger.start_attempt(
             action.action_id, attempt=attempt
         )
+        if durable_attempt.attempt > 1:
+            self._invoke_hook("after_start_next_attempt", durable_attempt)
         try:
             resolved = self._registry.resolve_json(
                 action.capability, durable_attempt.parameters_json
@@ -193,6 +195,7 @@ class Dispatcher:
         envelope = self._classify_boundary(action, durable_attempt.attempt, envelope)
         self._invoke_hook("before_outcome_receipt", envelope)
         await self._ledger.record_attempt_outcome(self._receipt(envelope))
+        self._invoke_hook("after_outcome_receipt", envelope)
         self._invoke_hook("after_action_output", envelope)
         return envelope
     def _classify_boundary(
@@ -354,9 +357,9 @@ class Dispatcher:
             failure_signature=getattr(outcome, "failure_signature", None),
         )
 
-    def _invoke_hook(self, point: str, envelope: ActionOutcomeEnvelope) -> None:
+    def _invoke_hook(self, point: str, detail: object) -> None:
         if self._test_hook is not None:
-            self._test_hook(point, envelope)
+            self._test_hook(point, detail)
 
 
 def _stable_operation_key(action: ActionRecord, attempt: int) -> str:

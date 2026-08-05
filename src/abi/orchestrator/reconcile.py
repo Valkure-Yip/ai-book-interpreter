@@ -12,6 +12,7 @@ from abi.project.run_ledger import (
     LedgerError,
     LedgerNotFoundError,
     LedgerTransitionError,
+    ProbeResolutionRequest,
     RunLedger,
 )
 from abi.types.orchestration import (
@@ -89,6 +90,23 @@ class Reconciler:
             attempts = await self._ledger.attempt_numbers(action.action_id)
             if not attempts:
                 await self._ledger.set_run_status(run_id, RunStatus.BLOCKED)
+                continue
+            try:
+                resolution = await self._ledger.get_probe_resolution(
+                    action.action_id, attempts[-1]
+                )
+            except LedgerNotFoundError:
+                pass
+            else:
+                if resolution.disposition == "succeeded":
+                    continue
+            try:
+                await self._ledger.get_probe_resolution_for_probe(
+                    action.action_id, attempts[-1]
+                )
+            except LedgerNotFoundError:
+                pass
+            else:
                 continue
             try:
                 await self._artifacts.verify_committed_bundle(
@@ -240,12 +258,16 @@ class Reconciler:
                     raise LedgerTransitionError(
                         "probe capability is not the original ActionSpec binding"
                     )
-                await self._ledger.complete_probe_pending(
+                await self._ledger.resolve_indeterminate(
+                    ProbeResolutionRequest(
                     probe_action_id=action.action_id,
                     probe_attempt=attempt,
                     original_action_id=binding.original_action_id,
                     original_attempt=binding.original_attempt,
                     operation_key=binding.operation_key,
+                    original_idempotency_key=original.idempotency_key,
+                    retry_policy_fingerprint=original.retry_policy_fingerprint,
+                    )
                 )
             except (LedgerError, TypeError, ValueError):
                 await self._ledger.mark_bundle_conflict(

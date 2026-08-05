@@ -78,11 +78,19 @@ class DynamicController:
         """Perform one recoverable cycle and return whether the runtime should continue."""
         snapshot = await self._reconciler.reconcile(run_id)
         self._invoke_hook("after_reconcile", snapshot)
+        if any(
+            action.status is ActionStatus.RETRY_WAIT for action in snapshot.actions
+        ):
+            self._invoke_hook("after_retry_wait", snapshot)
         await self._projector.flush(run_id)
         if snapshot.status is not RunStatus.RUNNING:
             return False
         context = await self._snapshots.build(run_id)
         snapshot = context.policy_snapshot
+        semantic_repair_pending = any(
+            incident.repair_class == "semantic"
+            for incident in snapshot.incidents
+        )
 
         await self._reserve_due_retries(run_id)
         await self._authorize_pending_probes(run_id)
@@ -108,9 +116,13 @@ class DynamicController:
             plan = await self._ledger.pending_plan(run_id)
             authorization_snapshot = context.policy_snapshot
             if plan is None:
+                if semantic_repair_pending:
+                    self._invoke_hook("before_semantic_replan", context)
                 self._invoke_hook("before_planner", context)
                 patch = await self._planner.plan(context)
                 plan = await self._ledger.append_plan(run_id, patch)
+                if semantic_repair_pending:
+                    self._invoke_hook("after_semantic_replan", plan)
                 self._invoke_hook("after_plan_append", plan)
             else:
                 patch = plan.patch
@@ -128,7 +140,15 @@ class DynamicController:
                 )
                 await self._projector.flush(run_id)
                 return True
+            if semantic_repair_pending:
+                self._invoke_hook(
+                    "before_repair_action_authorization", decision.actions
+                )
             authorized = await self._ledger.authorize_actions(run_id, decision.actions)
+            if semantic_repair_pending:
+                self._invoke_hook(
+                    "after_repair_action_authorization", authorized
+                )
             self._invoke_hook("after_authorization", authorized)
             current = (await self._snapshots.build(run_id)).policy_snapshot
             snapshot = current
@@ -210,6 +230,9 @@ class DynamicController:
         snapshot: RunSnapshot,
         attempt: int,
     ) -> object | None:
+        if attempt > 1:
+            self._invoke_hook("before_start_next_attempt", (action, attempt))
+            self._invoke_hook("before_dispatch_next_attempt", (action, attempt))
         self._invoke_hook("before_dispatch", (action, attempt))
         try:
             return await self._dispatcher.execute(
