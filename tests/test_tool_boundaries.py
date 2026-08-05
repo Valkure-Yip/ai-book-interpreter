@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,14 +13,16 @@ import pytest
 from abi.providers.agent_runtime.tooling import to_langchain_tool
 from abi.tools.belt import build_belt
 from abi.tools.content import make_content_tools
+from abi.tools.subagent import make_subagent_tools
 from abi.types._base import FrozenModel
-from abi.types.orchestration import RunSnapshot, RunStatus
+from abi.types.orchestration import RunSnapshot, RunStatus, Succeeded
 from abi.types.tools import ToolBinding
 
 
 class _Project:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.graph_checkpoints = root / "state" / "graph-checkpoints.sqlite"
 
     def rel(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
@@ -79,3 +82,63 @@ async def test_provider_adapter_executes_sync_and_async_bindings() -> None:
 
     assert sync_tool.invoke({"value": "x"}) == "sync:x"
     assert await async_tool.ainvoke({"value": "y"}) == "async:y"
+
+
+@pytest.mark.asyncio
+async def test_provider_adapter_awaits_async_callable_objects_and_wrappers() -> None:
+    class AsyncEcho:
+        async def __call__(self, value: str) -> str:
+            await asyncio.sleep(0)
+            return f"object:{value}"
+
+    async def async_echo(value: str) -> str:
+        await asyncio.sleep(0)
+        return f"wrapped:{value}"
+
+    @functools.wraps(async_echo)
+    def wrapped_echo(value: str):  # type: ignore[no-untyped-def]
+        return async_echo(value)
+
+    object_tool = to_langchain_tool(
+        ToolBinding("object_echo", "Echo through async __call__.", _EchoInput, AsyncEcho())
+    )
+    wrapped_tool = to_langchain_tool(
+        ToolBinding("wrapped_echo", "Echo through a wrapped async call.", _EchoInput, wrapped_echo)
+    )
+
+    assert await object_tool.ainvoke({"value": "x"}) == "object:x"
+    assert await wrapped_tool.ainvoke({"value": "y"}) == "wrapped:y"
+
+
+@pytest.mark.asyncio
+async def test_review_subagent_uses_fresh_threads_unless_explicitly_resumed(
+    tmp_path: Path,
+) -> None:
+    requests: list[object] = []
+
+    class RecordingAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            return SimpleNamespace(
+                outcome=Succeeded(staging_relpath="state/staging/review.json")
+            )
+
+    context = _context(tmp_path)
+    context.services = SimpleNamespace(agent=RecordingAgent())
+    spawn = make_subagent_tools(context)[0].callable  # type: ignore[arg-type]
+
+    first = json.loads(await spawn(agent_label="agent_a", instructions="review round one"))
+    second = json.loads(await spawn(agent_label="agent_a", instructions="review round two"))
+    resumed = json.loads(
+        await spawn(
+            agent_label="agent_a",
+            instructions="continue round one",
+            resume_thread_id=first["thread_id"],
+        )
+    )
+
+    assert first["thread_id"] != second["thread_id"]
+    assert resumed["thread_id"] == first["thread_id"]
+    assert requests[0].resume is None  # type: ignore[union-attr]
+    assert requests[1].resume is None  # type: ignore[union-attr]
+    assert requests[2].resume.kind == "checkpoint"  # type: ignore[union-attr]

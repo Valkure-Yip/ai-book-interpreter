@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
-from abi.providers.agent_runtime.runner import AgentActionRequest, AgentRuntime
+from abi.providers.agent_runtime.runner import (
+    AgentActionRequest,
+    AgentRuntime,
+    CheckpointResume,
+    HitlResume,
+)
 
-__all__ = ["AgentActionRequest", "AgentRuntime"]
+__all__ = ["AgentActionRequest", "AgentRuntime", "CheckpointResume", "HitlResume"]

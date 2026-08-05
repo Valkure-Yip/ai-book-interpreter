@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
+import json
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import httpx
+import openai
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from pydantic import Field
 
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
 from abi.providers.observability.events import EventLogger, MetricsAggregator
@@ -28,6 +33,12 @@ def test_action_runtime_exposes_abi_owned_request_and_result_surface() -> None:
 
     assert hasattr(runner, "AgentActionRequest")
     assert hasattr(runner.AgentRuntime, "run_action")
+
+
+def test_agent_runtime_public_constructor_has_no_sdk_model_injection() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+
+    assert "model" not in inspect.signature(runner.AgentRuntime).parameters
 
 
 class _HistoryAwareModel(BaseChatModel):
@@ -173,10 +184,128 @@ class _SideEffectModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
+def _success_message(*, evidence: list[str] | None = None) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "ActionOutcomeEnvelope",
+                "args": {
+                    "outcome": {
+                        "kind": "succeeded",
+                        "staging_relpath": "state/staging/a1/1/result.json",
+                        "evidence_refs": evidence or [],
+                    }
+                },
+                "id": "outcome-success",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+class _RecordingOutcomeModel(BaseChatModel):
+    human_counts: list[int] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "recording-outcome-test-model"
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Any],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        return ChatResult(generations=[ChatGeneration(message=_success_message())])
+
+
+class _ResumeAfterToolModel(_RecordingOutcomeModel):
+    fail_once: bool = True
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        completed = any(isinstance(message, ToolMessage) and message.name == "once" for message in messages)
+        if not completed:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "once", "args": {}, "id": "once-call", "type": "tool_call"}
+                ],
+            )
+            return ChatResult(generations=[ChatGeneration(message=message)])
+        if self.fail_once:
+            self.fail_once = False
+            raise ConnectionError("provider failed after the durable tool result")
+        return ChatResult(
+            generations=[ChatGeneration(message=_success_message(evidence=["prior_tool_result"]))]
+        )
+
+
+class _FiniteLoopModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        completed = sum(
+            isinstance(message, ToolMessage) and message.name == "noop" for message in messages
+        )
+        if completed >= 4:
+            return ChatResult(generations=[ChatGeneration(message=_success_message())])
+        message = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "noop", "args": {}, "id": f"loop-{completed}", "type": "tool_call"}
+            ],
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _ApprovalModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        if any(isinstance(message, ToolMessage) for message in messages):
+            return ChatResult(generations=[ChatGeneration(message=_success_message())])
+        message = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "deliver", "args": {}, "id": "delivery-call", "type": "tool_call"}
+            ],
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
 def _runtime(tmp_path: Path, model: BaseChatModel, *, cap: float | None = None) -> Any:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     assert hasattr(runner, "AgentActionRequest")
-    return runner.AgentRuntime(
+    runtime = runner.AgentRuntime(
         config=LLMConfig(model="gpt-4o-mini"),
         api_key="test-key",
         budget=BudgetGate(cap),
@@ -185,8 +314,8 @@ def _runtime(tmp_path: Path, model: BaseChatModel, *, cap: float | None = None) 
         langfuse_handler=None,
         langfuse_status=LangfuseStatus(False, False, "", "test"),
         sem=asyncio.Semaphore(1),
-        model=model,
     )
+    return runner._set_model_for_testing(runtime, model)
 
 
 def _request(
@@ -196,6 +325,8 @@ def _request(
     thread_id: str = "run-1/a1/1",
     tools: tuple[ToolBinding, ...] = (),
     max_iterations: int = 2,
+    resume: object | None = None,
+    approval_tools: tuple[str, ...] = (),
 ) -> Any:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     assert hasattr(runner, "AgentActionRequest")
@@ -208,24 +339,168 @@ def _request(
         checkpoint_path=tmp_path / "graph-checkpoints.sqlite",
         max_iterations=max_iterations,
         may_have_side_effects=side_effects,
+        resume=resume,
+        approval_tools=approval_tools,
     )
 
 
 @pytest.mark.asyncio
-async def test_action_harness_resumes_only_the_same_sqlite_thread(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, _HistoryAwareModel())
+async def test_budget_pause_resumes_without_appending_a_human_message(tmp_path: Path) -> None:
+    model = _RecordingOutcomeModel(human_counts=[])
+    paused_runtime = _runtime(tmp_path, model, cap=0.0)
+    resumed_runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    resume = runner.CheckpointResume()
 
-    first = await runtime.run_action(_request(tmp_path))
-    second = await runtime.run_action(_request(tmp_path))
-    isolated = await runtime.run_action(_request(tmp_path, thread_id="run-1/a2/1"))
+    first = await paused_runtime.run_action(_request(tmp_path))
+    resumed = await resumed_runtime.run_action(_request(tmp_path, resume=resume))
+    isolated = await resumed_runtime.run_action(_request(tmp_path, thread_id="run-1/a2/1"))
 
     assert first.outcome.kind == "paused"
-    assert first.tool_calls == 0
-    assert second.outcome.kind == "succeeded"
-    assert second.outcome.evidence_refs == ("prior_tool_result",)
-    assert second.tool_calls == 0
-    assert isolated.outcome.kind == "paused"
+    assert resumed.outcome.kind == "succeeded"
+    assert isolated.outcome.kind == "succeeded"
+    assert model.human_counts == [1, 1]
     assert (tmp_path / "graph-checkpoints.sqlite").is_file()
+
+
+@pytest.mark.asyncio
+async def test_provider_crash_resume_does_not_replay_completed_side_effect(
+    tmp_path: Path,
+) -> None:
+    model = _ResumeAfterToolModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions = 0
+
+    def once() -> str:
+        nonlocal executions
+        executions += 1
+        return "durable result"
+
+    tool = ToolBinding("once", "Execute one idempotent side effect.", _NoopInput, once)
+    first = await runtime.run_action(_request(tmp_path, tools=(tool,), side_effects=True))
+    resumed = await runtime.run_action(
+        _request(tmp_path, tools=(tool,), side_effects=True, resume=runner.CheckpointResume())
+    )
+
+    assert first.outcome.kind == "retryable_failure"
+    assert resumed.outcome.kind == "succeeded"
+    assert resumed.outcome.evidence_refs == ("prior_tool_result",)
+    assert executions == 1
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_recursion_resume_keeps_one_human_turn_and_completed_tools(
+    tmp_path: Path,
+) -> None:
+    model = _FiniteLoopModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions = 0
+
+    def noop() -> str:
+        nonlocal executions
+        executions += 1
+        return "continue"
+
+    tool = ToolBinding("noop", "Continue the bounded test loop.", _NoopInput, noop)
+    first = await runtime.run_action(_request(tmp_path, tools=(tool,), max_iterations=1))
+    resumed = await runtime.run_action(
+        _request(
+            tmp_path,
+            tools=(tool,),
+            max_iterations=1,
+            resume=runner.CheckpointResume(),
+        )
+    )
+
+    assert first.outcome.error_code == "iteration_limit"
+    assert first.tool_calls == 4
+    assert resumed.outcome.kind == "succeeded"
+    assert executions == 4
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
+    tmp_path: Path,
+) -> None:
+    model = _ApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions = 0
+
+    def deliver() -> str:
+        nonlocal executions
+        executions += 1
+        return "delivered"
+
+    tool = ToolBinding("deliver", "Deliver after approval.", _NoopInput, deliver)
+    first = await runtime.run_action(
+        _request(tmp_path, tools=(tool,), side_effects=True, approval_tools=("deliver",))
+    )
+    resumed = await runtime.run_action(
+        _request(
+            tmp_path,
+            tools=(tool,),
+            side_effects=True,
+            approval_tools=("deliver",),
+            resume=runner.HitlResume(decision="approve"),
+        )
+    )
+
+    assert first.outcome.kind == "paused"
+    assert first.outcome.reason == "hitl"
+    assert resumed.outcome.kind == "succeeded"
+    assert executions == 1
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_hitl_reject_resumes_without_executing_the_business_tool(
+    tmp_path: Path,
+) -> None:
+    model = _ApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions = 0
+
+    def deliver() -> str:
+        nonlocal executions
+        executions += 1
+        return "delivered"
+
+    tool = ToolBinding("deliver", "Deliver after approval.", _NoopInput, deliver)
+    first = await runtime.run_action(
+        _request(tmp_path, tools=(tool,), side_effects=True, approval_tools=("deliver",))
+    )
+    rejected = await runtime.run_action(
+        _request(
+            tmp_path,
+            tools=(tool,),
+            side_effects=True,
+            approval_tools=("deliver",),
+            resume=runner.HitlResume(decision="reject", feedback="not authorized"),
+        )
+    )
+
+    assert first.outcome.kind == "paused"
+    assert rejected.outcome.kind == "succeeded"
+    assert executions == 0
+    assert set(model.human_counts) == {1}
+
+
+def test_resume_boundary_rejects_untyped_dicts(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="typed"):
+        _request(tmp_path, resume={"decision": "approve"})
+
+
+def test_hitl_resume_rejects_unsupported_decisions() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+
+    with pytest.raises(ValueError):
+        runner.HitlResume(decision="edit")
 
 
 @pytest.mark.asyncio
@@ -265,6 +540,7 @@ async def test_action_harness_maps_tool_side_effect_timeout_to_indeterminate(
 
     assert result.outcome.kind == "indeterminate"
     assert result.outcome.operation_key == "run-1/a1/1"
+    assert result.tool_calls == 1
     assert result.stopped_reason == "error"
 
 
@@ -279,7 +555,12 @@ async def test_action_harness_maps_tool_side_effect_timeout_to_indeterminate(
             "transient_provider_error",
         ),
         (TimeoutError("provider timed out"), False, "retryable_failure", "provider_timeout"),
-        (TimeoutError("delivery status unknown"), True, "indeterminate", None),
+        (
+            TimeoutError("provider timed out before any tool call"),
+            True,
+            "retryable_failure",
+            "provider_timeout",
+        ),
         (BudgetExceeded(0.0, 0.0, 0.1), False, "paused", None),
         (RuntimeError("unexpected"), False, "permanent_failure", "unclassified_exception"),
     ],
@@ -301,6 +582,43 @@ async def test_action_harness_classifies_failures_without_throwing(
     assert result.stopped_reason in {"paused", "error"}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "status_code"),
+    [
+        (openai.BadRequestError, 400),
+        (openai.AuthenticationError, 401),
+        (openai.PermissionDeniedError, 403),
+        (openai.NotFoundError, 404),
+    ],
+)
+async def test_openai_4xx_is_permanent_and_failed_call_is_observable_without_secrets(
+    tmp_path: Path,
+    error_type: type[Exception],
+    status_code: int,
+) -> None:
+    secret = "sk-secret-must-not-appear"
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://provider.invalid/v1/chat"),
+    )
+    error = error_type(secret, response=response, body={"api_key": secret})
+    runtime = _runtime(tmp_path, _ExplodingModel(error=error))
+
+    result = await runtime.run_action(_request(tmp_path))
+
+    assert result.outcome.kind == "permanent_failure"
+    assert result.outcome.error_code == "permanent_provider_error"
+    assert result.llm_calls == 1
+    assert runtime._metrics.snapshot()["llm_calls"] == 1
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in event_text.splitlines()]
+    failed_calls = [event for event in events if event["event"] == "agent.call"]
+    assert failed_calls[-1]["outcome"] == "error"
+    assert failed_calls[-1]["error_classification"] == "permanent_provider_error"
+    assert secret not in event_text
+
+
 def test_architecture_linter_reports_forbidden_sdk_import(tmp_path: Path) -> None:
     linter_path = Path("tools/lint/architecture.py")
     assert linter_path.exists(), "architecture linter must be executable repository code"
@@ -320,6 +638,20 @@ def test_architecture_linter_reports_forbidden_sdk_import(tmp_path: Path) -> Non
     assert [(item.rule, item.path, item.line) for item in violations] == [
         ("sdk-import-outside-providers", "tools/bad.py", 1)
     ]
+
+
+def test_architecture_linter_matches_only_exact_sdk_package_names(tmp_path: Path) -> None:
+    linter_path = Path("tools/lint/architecture.py")
+    spec = importlib.util.spec_from_file_location("architecture_linter_exact", linter_path)
+    assert spec is not None and spec.loader is not None
+    module_under_test = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module_under_test
+    spec.loader.exec_module(module_under_test)
+    module = tmp_path / "src/abi/tools/allowed.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("import langchainish\n", encoding="utf-8")
+
+    assert module_under_test.scan_tree(tmp_path / "src/abi") == ()
 
 
 def test_architecture_linter_cli_rejects_violation_with_repair_instruction(

@@ -26,7 +26,7 @@ def _is_provider_module(relative_path: Path) -> bool:
 
 def _is_forbidden_sdk(module: str) -> bool:
     top_level = module.split(".", 1)[0]
-    return top_level.startswith(_PROVIDER_SDKS)
+    return top_level in _PROVIDER_SDKS
 
 
 def scan_tree(root: Path) -> tuple[Violation, ...]:

@@ -11,10 +11,20 @@ from langchain_core.tools import BaseTool, StructuredTool
 from abi.types.tools import ToolBinding
 
 
+def _is_async_callable(function: Callable[..., object]) -> bool:
+    unwrapped = inspect.unwrap(function)
+    unwrapped_call = inspect.unwrap(type(function).__call__)
+    return inspect.iscoroutinefunction(unwrapped) or inspect.iscoroutinefunction(unwrapped_call)
+
+
 def to_langchain_tool(binding: ToolBinding) -> BaseTool:
     """Return the sole SDK representation of an ABI tool binding."""
-    if inspect.iscoroutinefunction(binding.callable):
-        coroutine = cast(Callable[..., Awaitable[Any]], binding.callable)
+    if _is_async_callable(binding.callable):
+
+        async def coroutine(*args: Any, **kwargs: Any) -> Any:
+            result = binding.callable(*args, **kwargs)
+            return await cast(Awaitable[Any], result)
+
         return StructuredTool.from_function(
             func=None,
             coroutine=coroutine,

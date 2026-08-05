@@ -49,7 +49,6 @@ def _build_transient_error_tuple() -> tuple[type[BaseException], ...]:
             "APIConnectionError",
             "RateLimitError",
             "InternalServerError",
-            "APIError",
         ):
             cls = getattr(openai, name, None)
             if isinstance(cls, type) and issubclass(cls, BaseException):
@@ -60,6 +59,29 @@ def _build_transient_error_tuple() -> tuple[type[BaseException], ...]:
 
 
 _TRANSIENT_LLM_ERRORS: tuple[type[BaseException], ...] = _build_transient_error_tuple()
+
+
+def _build_permanent_error_tuple() -> tuple[type[BaseException], ...]:
+    """Collect non-retryable OpenAI request/authentication error types."""
+    out: list[type[BaseException]] = []
+    try:
+        import openai
+
+        for name in (
+            "BadRequestError",
+            "AuthenticationError",
+            "PermissionDeniedError",
+            "NotFoundError",
+        ):
+            cls = getattr(openai, name, None)
+            if isinstance(cls, type) and issubclass(cls, BaseException):
+                out.append(cls)
+    except Exception:  # pragma: no cover
+        pass
+    return tuple(out)
+
+
+_PERMANENT_LLM_ERRORS: tuple[type[BaseException], ...] = _build_permanent_error_tuple()
 
 
 @dataclass
