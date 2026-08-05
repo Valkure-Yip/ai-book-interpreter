@@ -1302,6 +1302,8 @@ dict/Any。
 - **第三次定向复审修复：** scoped review 继续复现空行绕过 latest-round duplicate 检查。
   `a40d7776268bc3f28035f5d13769093a86adcdd7` 要求最后 8 个 physical lines 连续且精确匹配，并以最后
   explicit `round:` marker 界定最新轮；同一轮内的 FAIL/重复字段不能再由空行或后置 PASS 块掩盖。
+- **最终独立复审：** 第四次 scoped review 独立执行 35 个 adversarial cases，确认上述空行绕过关闭且
+  I1-I3 未回退；结论为 Critical 0 / Important 0 / Minor 0，Ready to merge: Yes。
 
 ## 20. 实现完成判据
 
