@@ -15,7 +15,7 @@ import aiosqlite
 from pydantic import Field, TypeAdapter, ValidationError
 
 from abi.project.artifact_paths import canonical_artifact_key
-from abi.project.ledger_schema import SCHEMA_SQL
+from abi.project.ledger_schema import LEDGER_SCHEMA_VERSION, SCHEMA_SQL
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
@@ -449,9 +449,20 @@ class RunLedger:
         test_hook: LedgerHook | None = None,
     ) -> AsyncIterator[Self]:
         """Open and initialize a WAL-backed ledger at ``path``."""
+        is_new = not path.exists()
         db = await aiosqlite.connect(path)
         db.row_factory = aiosqlite.Row
         try:
+            if not is_new:
+                cursor = await db.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                await cursor.close()
+                actual_version = int(row[0]) if row is not None else 0
+                if actual_version != LEDGER_SCHEMA_VERSION:
+                    raise LedgerError(
+                        "unsupported ledger schema version: "
+                        f"expected {LEDGER_SCHEMA_VERSION}, got {actual_version}"
+                    )
             await db.executescript(SCHEMA_SQL)
             await db.commit()
             yield cls(db, clock=clock, test_hook=test_hook)

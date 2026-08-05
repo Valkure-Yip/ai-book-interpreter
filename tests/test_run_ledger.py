@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,38 @@ from abi.types.orchestration import (
 
 def _run_seed() -> RunSeed:
     return RunSeed(run_id="run-1", budget_usd=5.0)
+
+
+@pytest.mark.asyncio
+async def test_ledger_initialization_records_and_reopens_exact_schema_version(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "run.db"
+
+    async with RunLedger.open(path):
+        pass
+
+    with sqlite3.connect(path) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (1,)
+
+    async with RunLedger.open(path):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_version", [0, 2])
+async def test_ledger_rejects_existing_unversioned_or_unknown_schema(
+    tmp_path: Path, schema_version: int
+) -> None:
+    path = tmp_path / "run.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE foreign_fact (value TEXT NOT NULL)")
+        db.execute(f"PRAGMA user_version = {schema_version}")
+        db.commit()
+
+    with pytest.raises(LedgerError, match="unsupported ledger schema version"):
+        async with RunLedger.open(path):
+            pass
 
 
 def _action(

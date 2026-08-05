@@ -1,6 +1,8 @@
 """SQLite schema for the durable orchestration business ledger."""
 
-SCHEMA_SQL = """
+LEDGER_SCHEMA_VERSION = 1
+
+SCHEMA_SQL = f"""
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -308,4 +310,6 @@ CREATE TABLE IF NOT EXISTS event_outbox (
     created_at TEXT NOT NULL,
     delivered_at TEXT
 );
+
+PRAGMA user_version = {LEDGER_SCHEMA_VERSION};
 """

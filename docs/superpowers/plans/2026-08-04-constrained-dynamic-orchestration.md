@@ -2360,7 +2360,7 @@ exactly attempts `1, 2`, and no `RUNNING`/`INDETERMINATE`/`REPAIR_REQUIRED` atte
 
 Run: `rg -n 'create_react_agent|HAPPY_PATH|STAGE_SEQUENCE|StageSpec|def set_state|def record_gate' src tests`
 
-Run: `rg -n '^(from|import) (langchain|langgraph|langfuse)' src/abi --glob '!providers/**'`
+Run: `rg -n '^(from|import) (langchain|langgraph|langfuse)' src/abi --glob '!src/abi/providers/**'`
 
 Run: `rg -n 'Succeeded\x28staging_relpath|ProbeR[e]sult' src tests docs/superpowers/plans/2026-08-04-constrained-dynamic-orchestration.md`
 

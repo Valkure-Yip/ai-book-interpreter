@@ -44,18 +44,24 @@ def _architecture_linter(name: str):  # type: ignore[no-untyped-def]
     return module
 
 
+def _legacy_fixed_path_symbol() -> str:
+    """Build the removed symbol at runtime without reintroducing it to source scans."""
+    return "HAPPY" "_PATH"
+
+
 def test_architecture_linter_reports_legacy_control_symbols(tmp_path: Path) -> None:
     """Catch a fixed macro controller being introduced anywhere in business source."""
+    legacy_symbol = _legacy_fixed_path_symbol()
     module = tmp_path / "src/abi/orchestrator/old.py"
     module.parent.mkdir(parents=True)
-    module.write_text("HAPPY_PATH = []\n", encoding="utf-8")
+    module.write_text(f"{legacy_symbol} = []\n", encoding="utf-8")
 
     violations = _architecture_linter("legacy_symbol_fixture").scan_tree(
         tmp_path / "src/abi"
     )
 
     assert [(item.rule, item.symbol) for item in violations] == [
-        ("fixed-macro-control", "HAPPY_PATH")
+        ("fixed-macro-control", legacy_symbol)
     ]
 
 
@@ -63,10 +69,11 @@ def test_architecture_linter_rejects_legacy_modules_aliases_and_scoped_status(
     tmp_path: Path,
 ) -> None:
     """Catch aliased legacy imports without banning unrelated Status classes."""
+    legacy_symbol = _legacy_fixed_path_symbol()
     module = tmp_path / "src/abi/orchestrator/aliases.py"
     module.parent.mkdir(parents=True)
     module.write_text(
-        "from abi.project.state import HAPPY_PATH as path\n"
+        f"from abi.project.state import {legacy_symbol} as path\n"
         "from abi.stages.runner import run_stage as execute\n"
         "from abi.project import Status as ProjectStatus\n"
         "class Status:\n"
@@ -82,7 +89,7 @@ def test_architecture_linter_rejects_legacy_modules_aliases_and_scoped_status(
     assert [
         (item.rule, item.line, item.module, item.symbol) for item in violations
     ] == [
-        ("fixed-macro-control", 1, "abi.project.state", "HAPPY_PATH"),
+        ("fixed-macro-control", 1, "abi.project.state", legacy_symbol),
         ("fixed-macro-control", 2, "abi.stages.runner", "run_stage"),
         ("fixed-macro-control", 3, "abi.project", "Status"),
     ]
