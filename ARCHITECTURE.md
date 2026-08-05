@@ -99,7 +99,7 @@ providers 是横切边界；业务层不得直接 import LangChain/LangGraph/Lan
 ```text
 state/run.db                    # run/plan/action/attempt/receipt/gate/intent/incident
 state/staging/{action}/{attempt}/ # executor 的唯一写入目标
-state/graph-checkpoints.sqlite  # Action harness 游标、消息与 interrupt；不是业务真相
+state/graph_checkpoints.sqlite  # Action harness 游标、消息与 interrupt；不是业务真相
 state/status_projection.json    # 可重建的人类视图
 events.jsonl / metrics.json     # 可观测投影，可重建且不授权 transition
 ```

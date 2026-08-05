@@ -8,7 +8,7 @@
 | 数据 | 位置 | 权威性 |
 | --- | --- | --- |
 | run、plan、Action、attempt、receipt、gate、intent、incident、human decision | `state/run.db` | 唯一业务真相 |
-| Action 消息、工具游标、interrupt | `state/graph-checkpoints.sqlite` | 仅恢复 provider runtime |
+| Action 消息、工具游标、interrupt | `state/graph_checkpoints.sqlite` | 仅恢复 provider runtime |
 | attempt 输出 | `state/staging/{action_id}/{attempt}/` | promotion 输入；由 receipt/intent 绑定 |
 | canonical 工件 | 书籍工程目录 | 只有 ledger checksum/receipt 绑定后才是 committed fact |
 | events、metrics、status projection | `events.jsonl` 等 | 可重建投影，不授权 transition |

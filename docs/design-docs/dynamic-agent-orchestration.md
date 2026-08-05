@@ -1,8 +1,7 @@
 # 受约束的动态 Agent 编排
 
-> **状态：实现已落地，Task 12 全量验证待完成。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
-> Task 11 已移除旧固定宏观控制源码并同步 L1 eval 与权威文档；最终 `Implemented` 状态仅由
-> Task 12 的全量验证记录确认。本文中的旧符号只保留在明确标注的旧设计、拒绝方案或迁移边界中。
+> **状态：Implemented。** 2026-08-06；书面设计于 2026-08-04 经用户确认，Task 12 的全量验证
+> 与完成证据见第 19.1 节。本文中的旧符号只保留在明确标注的旧设计、拒绝方案或迁移边界中。
 >
 > **协议修订：已批准、具有约束力。** 2026-08-05；artifact bundle、attempt-scoped staging、
 > staging-aware validation、multi-intent commit 与 typed probe resolution 是对 Tasks 1/4/7/8/9
@@ -803,7 +802,7 @@ retry policy JSON/fingerprint 一致。resolve 路由不得读取当前 catalog 
 
 ## 11. Checkpoint 与恢复
 
-`state/graph-checkpoints.sqlite` 保存 LangGraph 运行游标、Planner/agent 消息、待恢复 Action 与
+`state/graph_checkpoints.sqlite` 保存 LangGraph 运行游标、Planner/agent 消息、待恢复 Action 与
 interrupt。它不是业务真相。
 
 该路径由 ABI 在本地单进程内拥有。所有 runtime instance、线程和 event loop 共享 path-scoped
@@ -1249,6 +1248,39 @@ dict/Any。
   在实现阶段同步更新。
 - 旧 `project/state.py`、`prompts/stages.py`、`stages/runner.py` 和固定 orchestrator 在替代实现通过
   端到端测试后删除，不保留双运行模式。
+
+### 19.1 Task 12 实现完成证据（2026-08-06）
+
+- **提交范围：** 实现与协议提交从 `fa0bd60197656668ebd2479aa2a908296a44a739` 到
+  `3ce5c2b6731f704278663aa2695f58b947793b25`（含首尾）；相对 `main` 的 merge-base 为
+  `e7a807e218e8a3050e3d6bd345aa993d44b718f4`，`main...3ce5c2b` 共 52 个提交。
+- **持久化边界：** 业务真相固定为 `state/run.db`；LangGraph checkpoint 固定为
+  `state/graph_checkpoints.sqlite`。ledger schema version 为 `1`，由单一
+  `LEDGER_SCHEMA_VERSION = 1` 与 SQLite `PRAGMA user_version = 1` 共同标记；已有 v0 或未知版本
+  数据库在建表前 fail closed，不做隐式升级。
+- **锁定依赖（`uv.lock`）：** `langchain==1.3.14`、`langchain-core==1.5.3`、
+  `langchain-openai==1.4.1`、`langgraph==1.2.10`、`langgraph-checkpoint==4.1.1`、
+  `langgraph-checkpoint-sqlite==3.1.1`、`aiosqlite==0.22.1`、`langfuse==2.60.10`、
+  `pydantic==2.13.4`；验证工具为 `pytest==9.1.1`、`ruff==0.15.20`、`mypy==2.1.0`。
+- **全量自动化：** Python 3.12.11 fresh process 执行 `.venv/bin/pytest`，结果为
+  `667 passed, 22 warnings`，无失败或跳过；告警均为既有 `datetime.utcnow()` 弃用告警。
+  recovery/control/offline 独立集合为 `153 passed, 1 warning`。Ruff 全量通过。
+- **类型检查：** mypy 检查 98 个 source files；本方案修改文件为 0 errors。仅有 6 个未触碰的
+  基线 `type-arg` 错误：`src/abi/epub/result.py:16` 与
+  `src/abi/ir/builder.py:69,78,79,82,116`，均为裸 `dict` 缺少类型参数。
+- **边界扫描：** 固定宏观控制符号、provider 外 LangChain/LangGraph/Langfuse imports、旧单文件
+  `Succeeded`/旧 probe shape，以及 types 反向依赖 project artifact paths 四组扫描均无匹配
+  （`rg` exit 1 且无输出）。SDK scan 从仓库根使用
+  `--glob '!src/abi/providers/**'`；原 `!providers/**` 不能排除合法 provider 目录，已修正且未放宽边界。
+- **恢复与控制场景：** 已覆盖 outcome receipt 前后、gate receipt + 全 intents 原子事务前后、每项
+  promotion、统一 bundle postcheck、success ledger commit 与 graph checkpoint 前后；安全 staging
+  receipt 重建、unsafe/partial intent/canonical drift/conflict fail-closed、immutable conflict unblock 的
+  new plan/action/staging；普通 retry 与 probe `absent` 在 retry-wait、successor 创建、首次 dispatch、
+  `AUTHORIZED → RUNNING` 边界的唯一 attempt 2 与旧 attempt 不重入；side-effecting timeout 的
+  `INDETERMINATE` + 单一 bound probe，以及 `succeeded/absent/unknown` 三种 typed resolution、并发和冲突
+  replay；semantic repair fact/replan/authorization 全 crash matrix 的唯一 replacement action，integrity、
+  缺失/未知分类与 permanent failure 的阻断；HITL claim/start/continuation、public checkpoint inspection、
+  budget pause、outbox 去重/重启顺序、max-cycle 阻断，以及离线动态 replan/batching/commit 完成。
 
 ## 20. 实现完成判据
 

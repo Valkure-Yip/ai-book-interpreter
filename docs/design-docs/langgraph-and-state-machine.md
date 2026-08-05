@@ -97,7 +97,7 @@ flowchart LR
 | 层 | 位置 | 保存内容 | 权威性 |
 | --- | --- | --- | --- |
 | 业务控制平面 | `state/run.db` | run、plan、Action、attempt、receipts、gates、intents、incidents、human decisions | 唯一业务真相 |
-| 微观 Action 恢复 | `state/graph-checkpoints.sqlite` | messages、tool cursor、current tasks、interrupts、structured response | 只用于 Task 6 恢复 |
+| 微观 Action 恢复 | `state/graph_checkpoints.sqlite` | messages、tool cursor、current tasks、interrupts、structured response | 只用于 Task 6 恢复 |
 | 工件 | attempt staging + canonical workspace | 输入、译文、QA、EPUB、release evidence | 由 ledger receipt/checksum 绑定 |
 | 投影 | `events.jsonl`、`metrics.json`、`state/status_projection.json` | 可观测事件与人类视图 | 可从真相重建 |
 
