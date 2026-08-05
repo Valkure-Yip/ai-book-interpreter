@@ -15,6 +15,10 @@
 > 旧 attempt，再持久化创建严格递增、可首次派发的新 attempt。任何 Mermaid 或文字中的 retry
 > 都不得回接当前 `RUNNING` / `INDETERMINATE` / `REPAIR_REQUIRED` attempt。
 >
+> **Retry / manual recovery 区分修订：已批准、具有约束力。** 2026-08-05 fix round 3；
+> 自动 retry 的同 action/new attempt 路径不得被“仅人工/new plan”表述覆盖，manual recovery 也不得
+> 借 `create_next_attempt()` 绕过 `REPAIR_REQUIRED`、conflict、durable corruption 或 unknown probe。
+>
 > 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
 > [`agentic-pipeline.md`](./agentic-pipeline.md) 和
@@ -486,7 +490,8 @@ error code/failure signature 等 failure fields 和 `recorded_at`。同一 ident
 **不是** gate PASS、promotion authorization 或 Action success。controller 的 `after_action_output` hook 只
 能位于 receipt transaction 成功之后。
 
-如果进程恰在 executor return 与 outcome receipt transaction 之间崩溃，Reconciler 仍不得重跑 Action。
+如果进程恰在 executor return 与 outcome receipt transaction 之间崩溃，Reconciler 仍不得重跑同一
+`RUNNING` attempt 的 Action executor。
 它只能用 attempt-scoped no-follow 安全遍历、durable expected manifest 和确定性 canonical→staged 映射
 重建一个完全匹配的 `Succeeded` receipt：所有 expected regular files 必须存在、没有额外 leaf/目录/
 unsafe entry，media type/evidence role/metadata 来自 durable manifest，checksums 现场计算，evidence refs
@@ -523,9 +528,10 @@ next-attempt 创建后、首次 claim 前崩溃时，可恢复派发该 `AUTHORI
 即使崩溃发生在 claim 与 executor 调用之间，也仍遵守 at-most-once 边界，只能按 durable staging/receipt
 规则重建或阻断，不能再次调用 executor。
 
-这条自动 retry 路径不适用于 artifact conflict/integrity failure。`REPAIR_REQUIRED + BLOCKED` 的人工恢复
-仍必须显式选择/清理 canonical 冲突，并创建 new plan version、new action ID 和 new staging namespace；
-不得通过 `create_next_attempt()` 复活旧 conflict Action。
+这条自动 retry 路径不适用于 `REPAIR_REQUIRED`、artifact conflict/integrity failure、durable corruption
+或 unknown probe。它们禁止自动 retry；人工 resolve/unblock 后仍必须显式处理相应证据/冲突，并创建
+new plan version、new action ID 和 new staging namespace。不得通过 `create_next_attempt()` 复活旧
+conflict/corrupt/unknown Action。
 
 ## 8. Planner 与 PolicyEngine
 
@@ -702,10 +708,10 @@ LangGraph checkpoint
 | Action 尚为 `AUTHORIZED`、attempt 未启动 | 可以首次派发；`start_attempt` 先 durable manifest/policy snapshot |
 | 旧 attempt/Action=`RETRY_WAIT`、next attempt 尚不存在 | 调用 `create_next_attempt(action_id, old_attempt)`；同一事务唯一创建 attempt+1=`AUTHORIZED` 并冻结同一 authorized facts；重复/并发 tick 返回同一行 |
 | next attempt=`AUTHORIZED`、尚未 claim | 可以首次 claim/派发该明确 attempt；使用新的 attempt-scoped staging，绝不回到旧 attempt |
-| attempt=`RUNNING`、outcome receipt 缺失 | **不得重跑 Action**；仅按 durable expected manifest 安全扫描 staging 并精确重建 receipt；缺失/额外/unsafe 则进入 conflict lifecycle |
+| attempt=`RUNNING`、outcome receipt 缺失 | **不得重跑该 attempt 的 Action executor**；仅按 durable expected manifest 安全扫描 staging 并精确重建 receipt；缺失/额外/unsafe 则进入 conflict lifecycle |
 | outcome receipt 已 durable、controller 尚未路由 | 按 receipt discriminant 幂等路由；Succeeded 构造 staging-aware view/validator，failure/probe 只用 durable attempt policy/facts；`after_action_output` hook 位于 receipt 之后 |
 | validator 已返回但 gate receipt/intent tx 尚未 durable | 若全部 staging 仍安全存在，可重跑 validator且 canonical decision 必须相同；否则 fail closed，不把内存 PASS 当事实 |
-| gate receipt + 完整 intent 集已 durable、部分仍为 `PENDING` | 按第 12 节逐项 create-only 补完；不重跑 Action；staging 已清理的 `COMMITTED` 条目由 receipt+intent+canonical checksums 证明 |
+| gate receipt + 完整 intent 集已 durable、部分仍为 `PENDING` | 按第 12 节逐项 create-only 补完；不重跑该 attempt 的 Action executor；staging 已清理的 `COMMITTED` 条目由 receipt+intent+canonical checksums 证明 |
 | 只有部分 intent rows 或 receipt/intents identity 不一致 | durable corruption；进入 conflict lifecycle，不补插缺项、不复制 canonical |
 | 任一 bundle intent 为 `CONFLICT` | attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`；幂等 subject incident；继续只读对账其余 intents，禁止自动重跑/replan |
 | 全部 promotion 已 `COMMITTED` 但 Action 尚未成功 | 用 gate receipt + intents 对完整 canonical bundle 做统一后验；通过后在一个 SQLite 事务中提交 artifacts/evidence/attempt/action success |
@@ -717,8 +723,16 @@ LangGraph checkpoint
 | 外部条件缺失 | `BLOCKED`；条件修复后恢复 |
 
 业务事实提供 exactly-once commit。executor 可能被 runtime 调用一次，但一旦 attempt 已是 `RUNNING`，
-Reconciler 不会自动再次调用它；恢复依赖 stable `action_id + plan_version + attempt + idempotency_key`、
-durable manifest/policy snapshot 和 receipts。新的执行只能来自人工处理后的新 plan version/new action ID。
+Reconciler 不会自动再次调用**同一 attempt**；恢复依赖 stable
+`action_id + plan_version + attempt + idempotency_key`、durable manifest/policy snapshot 和 receipts。
+后续 executor 执行只有两类合法来源：
+
+- 自动 retry：仅限 `RetryableFailure` 或 durable policy 允许的 `ProbeResolution.absent`。旧 attempt/Action
+  先转 `RETRY_WAIT`，再幂等 `create_next_attempt()`；保持同一 `action_id`，使用严格递增的 attempt 和
+  `state/staging/{action_id}/{next_attempt}`，不需要人工处理或 new plan；
+- manual recovery：`REPAIR_REQUIRED`、`CONFLICT`、durable corruption 或 unknown probe 均禁止自动 retry。
+  只有人工 resolve/unblock 后才能创建 new plan version、new action ID 和 new staging namespace；旧 attempt
+  永不重入。
 
 ## 12. 工件隔离与提交
 
@@ -788,7 +802,7 @@ Committer 对一个普通成功 bundle 按以下顺序处理，顺序是 binding
 跨文件原子性。第 8 步统一后验与第 9 步 success transaction 之间仍有不可消除的 FS/SQLite 窗口，
 协议不隐瞒也不宣称原子。第 3–9 步任一点崩溃时 attempt 保持 `RUNNING`。启动 Reconciler 按
 `run_id/action_id/attempt` 加载完整 bundle 与全部 intents，恢复未完成 promotions，并在完整 bundle 达标后
-调用同一个统一后验和 success transaction；它不得重新执行 Action。
+调用同一个统一后验和 success transaction；它不得重新执行该 action/attempt 的 executor。
 
 若已有部分 intents `COMMITTED` 且其 staged 文件已安全清理，Reconciler 不再要求 staged residue，也不
 重跑 validator；它使用 durable gate receipt 的 ordered staged checksums/identity、相应 intents 和 canonical
@@ -908,7 +922,8 @@ ProbeResolver 同时校验它是原 ActionSpec 唯一绑定的 probe capability�
 probe capability、原状态已经改变或 operation key 不同一律 fail closed 并留下 incident。`unknown` 不是
 pause 成功：原 attempt 保持 `INDETERMINATE`，run 明确进入 `BLOCKED` 等待人工或新的外部证据。允许的
 `absent` 只终结原 attempt/Action 为 `RETRY_WAIT`；下一 attempt 必须通过第 7.7 节的显式 ledger 事务创建，
-不能由重复 resolution 或重复 controller tick 隐式递增。
+不能由重复 resolution 或重复 controller tick 隐式递增。`unknown` 不得进入该自动 retry 路径；只有人工
+resolve/unblock 后创建 new plan version、new action ID 和 new staging namespace，才能产生后续执行。
 
 ## 14. 并发与调度
 
@@ -1003,7 +1018,8 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 
 - 已提交 Action 不重复；
 - 未提交 staging bundle 可验证并保留；本协议不自动清理 staging；
-- `before_outcome_receipt` 从安全 staging+durable manifest 精确重建或阻断，绝不重跑 Action；
+- `before_outcome_receipt` 从安全 staging+durable manifest 精确重建或阻断，绝不重跑同一 attempt 的
+  Action executor；
 - `after_outcome_receipt`、gate receipt/all-intents transaction、每个 copy/postcheck、统一 bundle 后验和
   success transaction 边界崩溃后均 receipt-driven 恢复；
 - 部分 intents、任一 `CONFLICT` 或完整性失败进入 immutable conflict lifecycle，不自动 retry/replan；
@@ -1093,7 +1109,8 @@ dict/Any。
    SQLite 事务中 durable，之后才允许 promote。
 7. 完整 bundle 的所有 intents `COMMITTED` 后通过统一 canonical 后验，才在一个 SQLite 事务中提交
    artifacts/gates/success；文档和实现均不声称文件系统多文件或跨介质原子。
-8. 崩溃恢复按 run/action/attempt 和 receipts 对账、不重跑 Action；任一 conflict/integrity failure 触发
+8. 崩溃恢复按 run/action/attempt 和 receipts 对账、不重跑同一 attempt 的 Action executor；任一
+   conflict/integrity failure 触发
    immutable `REPAIR_REQUIRED + BLOCKED` lifecycle，人工只能用新 plan/action/staging 继续。
 9. `PermanentFailure`、`RepairRequired`、带 durable error code 的 `Indeterminate`、三种
    `ProbeResolution`、预算暂停和 HITL 都有

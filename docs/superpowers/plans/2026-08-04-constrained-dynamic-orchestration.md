@@ -23,6 +23,11 @@
 > terminate the old attempt as `RETRY_WAIT`, then idempotently create a strictly increasing
 > `AUTHORIZED` next attempt with a fresh staging namespace before its first dispatch. No diagram or
 > implementation step may route retry back into the current attempt.
+>
+> **Retry/manual-recovery distinction fix round 3 (2026-08-05):** Automatic retry keeps the
+> authorized action ID and creates attempt+1 without human intervention or a new plan. Only
+> `REPAIR_REQUIRED`, conflict, durable corruption, and unknown-probe recovery require human
+> resolve/unblock followed by a new plan version, action ID, and staging namespace.
 
 ## Global Constraints
 
@@ -49,6 +54,7 @@
 - Validator PASS becomes durable only when one SQLite transaction creates the `gate_receipt` and the complete promotion-intent set. No canonical copy precedes that transaction.
 - Before success, Committer performs a unified postcheck of every committed canonical entry against receipts/intents; post-success reconciliation continues the same checks and blocks the run on drift.
 - Any intent conflict, partial intent set, receipt mismatch, or integrity failure atomically moves attempt/Action to `REPAIR_REQUIRED`, blocks the run, preserves all evidence/files, and requires a new plan version/new action ID/new staging namespace after manual resolution.
+- `REPAIR_REQUIRED`, any conflict/durable corruption, and an unknown probe disposition are never eligible for `create_next_attempt()`; after human resolve/unblock, any further execution uses a new plan version, new action ID, and new staging namespace. This manual path is distinct from allowed automatic retry.
 - `ProbeResolution` is a separate evidence-only outcome. It atomically resolves the original `INDETERMINATE` attempt through the ledger; ordinary `Succeeded` never implicitly resolves an external operation.
 - Unclassified failures are `PermanentFailure`, except possible external side effects, which are `Indeterminate` and must be probed before retry.
 - Translation Actions receive only source text, five to eight style rules, and matched terminology; QA, EPUB, and release rules are excluded.
@@ -1800,7 +1806,7 @@ rule and must call neither attempt 1 nor attempt 2 again. It may not demote atte
 For every boundary, use a two-entry bundle and assert: all intent rows existed before the first
 canonical copy; outcome receipt existed before `after_action_output`; gate receipt and all intents
 appeared in one transaction; the attempt stayed `RUNNING` until the complete success transaction; resume grouped
-by run/action/attempt and did not rerun the Action; exactly one bundle/gate/success fact was
+by run/action/attempt and did not rerun that attempt's Action executor; exactly one bundle/gate/success fact was
 committed; and staged residue became non-authoritative only after each corresponding intent reached
 `COMMITTED`. At `before_outcome_receipt`, resume must rebuild the exact receipt from safe staging +
 durable expected manifest without executor calls. Add incomplete, extra, symlink, and unsafe staging
@@ -1888,7 +1894,9 @@ resolve transaction and prove it rolls back probe evidence, probe success, and o
 together. For allowed `absent`, assert resolve terminates the original attempt/Action as
 `RETRY_WAIT` but creates no next attempt. Replaying resolution still creates none; only subsequent
 concurrent controller calls to `create_next_attempt(original_action_id, original_attempt)` may
-produce the single `AUTHORIZED` attempt+1.
+produce the single `AUTHORIZED` attempt+1. For `unknown`, assert `create_next_attempt()` is rejected
+and no executor runs until human resolve/unblock authorizes a new plan version/action ID/staging
+namespace.
 
 - [ ] **Step 3: Run recovery tests and confirm red results**
 
@@ -1925,7 +1933,9 @@ insert the immutable resolution/outbox facts, then apply exactly one original ro
   outcome-receipt error code, and attempt count allow; otherwise run → `BLOCKED` with an incident.
   The resolve transaction does not create or dispatch the successor.
 - `unknown`: leave original attempt/Action `INDETERMINATE`; run → `BLOCKED` with an incident that
-  requests human/external evidence.
+  requests human/external evidence. It is ineligible for automatic retry or `create_next_attempt()`;
+  any later executor work requires human resolve/unblock and a new plan version/action ID/staging
+  namespace.
 
 An exact replay returns the stored resolution. Any conflicting resolution/evidence/key/policy fact
 fails closed and preserves the first durable fact. After either an ordinary retryable receipt route
@@ -1943,8 +1953,9 @@ run/action/attempt and their durable manifest/policy snapshot; missing/conflicti
 missing/conflicting gate receipt + complete intent sets; pending/committed intents; unified
 canonical bundle postcheck; success rows missing graph progress; post-success canonical drift;
 indeterminate operations through bound probe Actions; outbox delivery. A missing outcome receipt
-never causes Action redispatch: exact safe reconstruction or `REPAIR_REQUIRED + BLOCKED` only. A
-partial intent set is corruption, not a repair invitation. An intent conflict stops further sibling
+never causes that same attempt's Action executor to be redispatched: exact safe reconstruction or
+`REPAIR_REQUIRED + BLOCKED` only. A partial intent set is corruption, not a repair invitation. An
+intent conflict stops further sibling
 promotion but permits read-only evidence collection. Emit `action.reconciled` for every correction,
 preserve original receipts/intents/files/history, and never auto-create the replacement plan/action.
 Creating an automatic retry successor is not a replacement plan: it is allowed only from
