@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import inspect
 import json
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -19,6 +20,7 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.errors import GraphRecursionError
 from pydantic import Field
 
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
@@ -114,6 +116,18 @@ class _ExplodingModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         raise self.error
+
+
+class _ValueErrorWithStatus(ValueError):
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _GraphRecursionErrorWithStatus(GraphRecursionError):
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class _NoopInput(FrozenModel):
@@ -397,6 +411,7 @@ def _request(
     max_iterations: int = 2,
     resume: object | None = None,
     approval_tools: tuple[str, ...] = (),
+    checkpoint_path: Path | None = None,
 ) -> Any:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     assert hasattr(runner, "AgentActionRequest")
@@ -406,7 +421,7 @@ def _request(
         tools=tools,
         agent_name="test-action",
         thread_id=thread_id,
-        checkpoint_path=tmp_path / "graph-checkpoints.sqlite",
+        checkpoint_path=checkpoint_path or tmp_path / "graph-checkpoints.sqlite",
         max_iterations=max_iterations,
         may_have_side_effects=side_effects,
         resume=resume,
@@ -641,7 +656,8 @@ async def test_hitl_resumes_multiple_tools_with_ordered_decisions(
 
 @pytest.mark.asyncio
 async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, _TwoApprovalModel(human_counts=[]))
+    model = _TwoApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     tools = (
         ToolBinding("deliver_a", "First delivery.", _NoopInput, lambda: "a"),
@@ -652,21 +668,34 @@ async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -
         "side_effects": True,
         "approval_tools": ("deliver_a", "deliver_b"),
     }
-    await runtime.run_action(_request(tmp_path, **request_args))
+    paused = await runtime.run_action(_request(tmp_path, **request_args))
+    real_create_agent = runner.create_agent
+    graph_creations = 0
 
-    result = await runtime.run_action(
-        _request(
-            tmp_path,
-            **request_args,
-            resume=runner.HitlResume(
-                decisions=(runner.HitlDecision(decision="approve"),)
-            ),
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
+
+        result = await runtime.run_action(
+            _request(
+                tmp_path,
+                **request_args,
+                resume=runner.HitlResume(
+                    decisions=(runner.HitlDecision(decision="approve"),)
+                ),
+            )
         )
-    )
 
+    assert paused.outcome.kind == "paused"
     assert result.outcome.kind == "repair_required"
     assert result.outcome.defect_codes == ("hitl_decision_count_mismatch",)
     assert "two" in result.outcome.message.lower() or "2" in result.outcome.message
+    assert graph_creations == 0
+    assert model.human_counts == [1]
 
 
 @pytest.mark.asyncio
@@ -678,6 +707,10 @@ async def test_action_harness_maps_real_graph_recursion_limit(tmp_path: Path) ->
 
     assert result.outcome.kind == "retryable_failure"
     assert result.outcome.error_code == "iteration_limit"
+    assert result.outcome.message == (
+        "The Action reached its iteration limit. Resume from the checkpoint with a "
+        "higher bounded limit."
+    )
     assert result.stopped_reason == "iteration_limit"
 
 
@@ -689,6 +722,9 @@ async def test_action_harness_maps_budget_callback_to_pause(tmp_path: Path) -> N
 
     assert result.outcome.kind == "paused"
     assert result.outcome.reason == "budget"
+    assert result.outcome.message == (
+        "The Action budget is exhausted. Increase the budget before resuming."
+    )
     assert result.stopped_reason == "paused"
 
 
@@ -706,6 +742,10 @@ async def test_action_harness_maps_tool_side_effect_timeout_to_indeterminate(
 
     assert result.outcome.kind == "indeterminate"
     assert result.outcome.operation_key == "run-1/a1/1"
+    assert result.outcome.message == (
+        "The model provider timed out after a business tool started. Reconcile the "
+        "side effect before retrying."
+    )
     assert result.tool_calls == 1
     assert result.stopped_reason == "error"
 
@@ -729,6 +769,9 @@ async def test_invalid_tool_arguments_do_not_count_as_side_effect_start(
 
     assert result.outcome.kind == "retryable_failure"
     assert result.outcome.error_code == "provider_timeout"
+    assert result.outcome.message == (
+        "The model provider timed out before completion. Retry the Action."
+    )
     assert result.tool_calls == 0
     assert result.tool_log == ()
     assert executions == 0
@@ -739,20 +782,30 @@ async def test_invalid_tool_arguments_do_not_count_as_side_effect_start(
     ("error", "side_effects", "kind", "error_code"),
     [
         (
-            ConnectionError("provider unavailable"),
+            ConnectionError("connection-sensitive-payload"),
             False,
             "retryable_failure",
             "transient_provider_error",
         ),
-        (TimeoutError("provider timed out"), False, "retryable_failure", "provider_timeout"),
         (
-            TimeoutError("provider timed out before any tool call"),
+            TimeoutError("timeout-sensitive-payload-before-model"),
+            False,
+            "retryable_failure",
+            "provider_timeout",
+        ),
+        (
+            TimeoutError("timeout-sensitive-payload-before-tool"),
             True,
             "retryable_failure",
             "provider_timeout",
         ),
         (BudgetExceeded(0.0, 0.0, 0.1), False, "paused", None),
-        (RuntimeError("unexpected"), False, "permanent_failure", "unclassified_exception"),
+        (
+            RuntimeError("unknown-sensitive-payload"),
+            False,
+            "permanent_failure",
+            "unclassified_exception",
+        ),
     ],
 )
 async def test_action_harness_classifies_failures_without_throwing(
@@ -769,6 +822,7 @@ async def test_action_harness_classifies_failures_without_throwing(
     assert result.outcome.kind == kind
     if error_code is not None:
         assert result.outcome.error_code == error_code
+    assert str(error) not in result.outcome.message
     assert result.stopped_reason in {"paused", "error"}
 
 
@@ -892,6 +946,35 @@ async def test_http_status_precedes_openai_exception_subclass_for_outcome_and_ev
     assert secret not in result.outcome.message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        _ValueErrorWithStatus("value-error-secret", status_code=503),
+        _GraphRecursionErrorWithStatus("recursion-error-secret", status_code=503),
+    ],
+)
+async def test_provider_status_precedes_control_exception_types_and_matches_event(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    runtime = _runtime(tmp_path, _ExplodingModel(error=error))
+
+    result = await runtime.run_action(_request(tmp_path))
+
+    assert result.outcome.kind == "retryable_failure"
+    assert result.outcome.error_code == "transient_provider_error"
+    assert result.outcome.message == (
+        "The model provider is temporarily unavailable. Retry the Action."
+    )
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in event_text.splitlines()]
+    failed_calls = [event for event in events if event["event"] == "agent.call"]
+    assert failed_calls[-1]["error_classification"] == result.outcome.error_code
+    assert str(error) not in event_text
+    assert str(error) not in result.outcome.message
+
+
 def test_action_request_rejects_duplicate_tool_names_before_checkpoint_work(
     tmp_path: Path,
 ) -> None:
@@ -969,6 +1052,7 @@ async def test_checkpoint_resume_on_new_thread_returns_repair_instruction(
     assert result.llm_calls == 0
     assert result.tool_calls == 0
     assert graph_creations == 0
+    assert not (tmp_path / "graph-checkpoints.sqlite").exists()
 
 
 @pytest.mark.asyncio
@@ -1027,6 +1111,258 @@ async def test_missing_hitl_resume_is_rejected_before_graph_model_or_tool_work(
     assert result.tool_log == ()
     assert handler_calls == 0
     assert graph_creations == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkpoint_state", ["completed", "budget"])
+async def test_hitl_resume_rejects_non_hitl_checkpoint_before_graph_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_state: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    model = _RecordingOutcomeModel(human_counts=[])
+    first_runtime = _runtime(
+        tmp_path,
+        model,
+        cap=0.0 if checkpoint_state == "budget" else None,
+    )
+    first = await first_runtime.run_action(_request(tmp_path))
+    runtime = _runtime(tmp_path, model)
+    real_create_agent = runner.create_agent
+    graph_creations = 0
+
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            resume=runner.HitlResume(
+                decisions=(runner.HitlDecision(decision="approve"),)
+            ),
+        )
+    )
+
+    assert first.outcome.kind == ("paused" if checkpoint_state == "budget" else "succeeded")
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert result.tool_log == ()
+    assert graph_creations == 0
+    assert model.human_counts == ([] if checkpoint_state == "budget" else [1])
+
+
+@pytest.mark.asyncio
+async def test_hitl_resume_rejects_pending_tool_removed_from_approval_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    model = _ApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    handler_calls = 0
+
+    def deliver() -> str:
+        nonlocal handler_calls
+        handler_calls += 1
+        return "delivered"
+
+    tool = ToolBinding("deliver", "Deliver after approval.", _NoopInput, deliver)
+    paused = await runtime.run_action(
+        _request(tmp_path, tools=(tool,), approval_tools=("deliver",))
+    )
+    real_create_agent = runner.create_agent
+    graph_creations = 0
+
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            tools=(tool,),
+            approval_tools=(),
+            resume=runner.HitlResume(
+                decisions=(runner.HitlDecision(decision="approve"),)
+            ),
+        )
+    )
+
+    assert paused.outcome.kind == "paused"
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("hitl_tool_not_allowed",)
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert handler_calls == 0
+    assert graph_creations == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_kind", ["checkpoint", "hitl"])
+async def test_missing_resume_database_does_not_create_parent_or_connect_saver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_kind: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    runtime = _runtime(tmp_path, _ExplodingModel(error=AssertionError("model must not run")))
+    checkpoint_path = tmp_path / "absent-checkpoints" / "state" / "graph.sqlite"
+    missing_parent = tmp_path / "absent-checkpoints"
+    real_from_conn_string = runner.AsyncSqliteSaver.from_conn_string
+    saver_connections = 0
+
+    def tracked_from_conn_string(path: str) -> Any:
+        nonlocal saver_connections
+        saver_connections += 1
+        return real_from_conn_string(path)
+
+    monkeypatch.setattr(
+        runner.AsyncSqliteSaver, "from_conn_string", tracked_from_conn_string
+    )
+    resume: object
+    if resume_kind == "checkpoint":
+        resume = runner.CheckpointResume()
+    else:
+        resume = runner.HitlResume(
+            decisions=(runner.HitlDecision(decision="approve"),)
+        )
+
+    result = await runtime.run_action(
+        _request(tmp_path, checkpoint_path=checkpoint_path, resume=resume)
+    )
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert saver_connections == 0
+    assert not checkpoint_path.exists()
+    assert not missing_parent.exists()
+
+
+@pytest.mark.asyncio
+async def test_fresh_invocation_may_create_checkpoint_parent_and_database(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    checkpoint_path = tmp_path / "fresh-checkpoints" / "state" / "graph.sqlite"
+
+    result = await runtime.run_action(
+        _request(tmp_path, checkpoint_path=checkpoint_path)
+    )
+
+    assert result.outcome.kind == "succeeded"
+    assert checkpoint_path.is_file()
+
+
+def _sqlite_read_error(
+    error_type: type[sqlite3.Error], sqlite_errorcode: int, secret: str
+) -> sqlite3.Error:
+    error = error_type(secret)
+    error.sqlite_errorcode = sqlite_errorcode
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "kind", "checkpoint_code"),
+    [
+        (
+            _sqlite_read_error(
+                sqlite3.OperationalError, sqlite3.SQLITE_BUSY, "locked-secret"
+            ),
+            "retryable_failure",
+            "checkpoint_busy",
+        ),
+        (
+            _sqlite_read_error(
+                sqlite3.OperationalError, sqlite3.SQLITE_LOCKED, "busy-secret"
+            ),
+            "retryable_failure",
+            "checkpoint_busy",
+        ),
+        (
+            TimeoutError("checkpoint-timeout-secret"),
+            "retryable_failure",
+            "checkpoint_read_timeout",
+        ),
+        (
+            _sqlite_read_error(
+                sqlite3.DatabaseError, sqlite3.SQLITE_CORRUPT, "corrupt-secret"
+            ),
+            "repair_required",
+            "checkpoint_corrupt",
+        ),
+        (
+            _sqlite_read_error(
+                sqlite3.DatabaseError, sqlite3.SQLITE_NOTADB, "malformed-secret"
+            ),
+            "repair_required",
+            "checkpoint_corrupt",
+        ),
+        (
+            PermissionError("checkpoint-permission-secret"),
+            "repair_required",
+            "checkpoint_permission_denied",
+        ),
+    ],
+)
+async def test_checkpoint_read_failures_are_control_results_without_graph_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    kind: str,
+    checkpoint_code: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "graph-checkpoints.sqlite"
+    checkpoint_path.touch()
+    model = _ExplodingModel(error=AssertionError("model must not run"))
+    runtime = _runtime(tmp_path, model)
+    real_create_agent = runner.create_agent
+    graph_creations = 0
+
+    async def failing_get_tuple(self: Any, config: Any) -> Any:
+        raise error
+
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    monkeypatch.setattr(runner.AsyncSqliteSaver, "aget_tuple", failing_get_tuple)
+    monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=checkpoint_path,
+            resume=runner.CheckpointResume(),
+        )
+    )
+
+    assert result.outcome.kind == kind
+    if kind == "retryable_failure":
+        assert result.outcome.error_code == checkpoint_code
+    else:
+        assert result.outcome.defect_codes == (checkpoint_code,)
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert result.tool_log == ()
+    assert graph_creations == 0
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert str(error) not in result.outcome.message
+    assert str(error) not in event_text
 
 
 @pytest.mark.asyncio
