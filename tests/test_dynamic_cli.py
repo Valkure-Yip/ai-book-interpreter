@@ -283,6 +283,34 @@ def test_inspect_prints_ledger_facts_and_next_safe_recovery(tmp_path: Path) -> N
         assert expected in result.stdout
 
 
+def test_inspect_exposes_current_public_hitl_ids_and_copyable_approve_command(
+    tmp_path: Path,
+) -> None:
+    """Catch a PAUSED_HITL run whose public interrupt is only discoverable in SQLite."""
+    project_root = asyncio.run(_seed_hitl_pause(tmp_path))
+
+    report = asyncio.run(lifecycle.inspect_run(project_root=project_root))
+    assert len(report.current_hitl_interrupts) == 1
+    current = report.current_hitl_interrupts[0]
+    assert current.run_id == "hitl-run"
+    assert current.action_id == "hitl-action"
+    assert current.attempt == 1
+    assert current.interrupt_id == "public-interrupt-1"
+    assert current.claim_status == "UNCLAIMED"
+    assert current.continuation_sequence is None
+    assert current.approve_command.endswith(
+        "public-interrupt-1 --decision approve"
+    )
+    assert "INTERRUPT_ID" not in report.next_safe_recovery
+
+    rendered = CliRunner().invoke(app, ["inspect", str(project_root)])
+    assert rendered.exit_code == 0, rendered.output
+    assert "public-interrupt-1" in rendered.stdout
+    assert "UNCLAIMED" in rendered.stdout
+    assert current.approve_command in rendered.stdout
+    assert "INTERRUPT_ID" not in rendered.stdout
+
+
 async def _run_status(project_root: Path) -> RunStatus:
     async with RunLedger.open(project_root / "state/run.db") as ledger:
         (run,) = await ledger.list_runs()
@@ -925,8 +953,10 @@ async def test_approve_recovers_claim_and_resumes_sequential_interrupt_history(
         )
     async with RunLedger.open(project_root / "state/run.db") as ledger:
         claimed = await ledger.get_interrupt_decision("public-interrupt-1")
-    assert claimed.status == "CLAIMED"
+    assert claimed.status == "STARTED"
     assert claimed.decisions == ("approve",)
+    assert claimed.resume_invocation_id
+    assert claimed.resume_started_at is not None
 
     await lifecycle.approve_interrupt(
         project_root=project_root,
@@ -968,6 +998,154 @@ async def test_approve_recovers_claim_and_resumes_sequential_interrupt_history(
         ActionOutcomeEnvelope.model_validate_json(continuations[1].canonical_outcome_json).outcome,
         PermanentFailure,
     )
+
+
+@pytest.mark.asyncio
+async def test_started_hitl_replay_blocks_old_pending_without_second_resume(
+    tmp_path: Path,
+) -> None:
+    """Catch an approved side effect being re-entered before its next checkpoint."""
+    project_root = await _seed_hitl_pause(tmp_path)
+    calls = 0
+
+    class _Continuation:
+        async def resume_hitl(self, request):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("approved tool started before checkpoint advanced")
+
+        async def inspect_hitl(self, request):  # type: ignore[no-untyped-def]
+            return lifecycle.HitlRecoveryInspection(disposition="not_started")
+
+    request = lifecycle.InterruptDecisionRequest(
+        run_id="hitl-run",
+        action_id="hitl-action",
+        attempt=1,
+        interrupt_id="public-interrupt-1",
+        decisions=("approve",),
+        feedback=(None,),
+    )
+    continuation = _Continuation()
+    with pytest.raises(RuntimeError, match="tool started"):
+        await lifecycle.approve_interrupt(
+            project_root=project_root,
+            request=request,
+            continuation=continuation,
+        )
+    async with RunLedger.open(project_root / "state/run.db") as ledger:
+        started = await ledger.get_interrupt_decision("public-interrupt-1")
+    assert started.status == "STARTED"
+
+    with pytest.raises(LedgerTransitionError, match=r"indeterminate|blind resume"):
+        await lifecycle.approve_interrupt(
+            project_root=project_root,
+            request=request,
+            continuation=continuation,
+        )
+    async with RunLedger.open(project_root / "state/run.db") as ledger:
+        run = await ledger.get_run("hitl-run")
+        incidents = await ledger.list_incidents("hitl-run", open_only=True)
+    assert calls == 1
+    assert run.status is RunStatus.BLOCKED
+    assert incidents[-1].error_code == "hitl_continuation_indeterminate"
+    assert incidents[-1].repair_class == "integrity"
+    assert incidents[-1].repair_source == "integrity_guard"
+    assert incidents[-1].reason_code == "hitl_resume_indeterminate"
+
+    recovery = await lifecycle.unblock(
+        project_root=project_root,
+        request=lifecycle.UnblockRequest(
+            reason="operator verified the external side effect and chose a new Action identity",
+            evidence_refs=("operator-side-effect-check-1",),
+            source_action_id="hitl-action",
+        ),
+    )
+    assert recovery.replacement_action_id is not None
+    assert recovery.staging_relpath == (
+        f"state/staging/{recovery.replacement_action_id}/1"
+    )
+    async with RunLedger.open(project_root / "state/run.db") as ledger:
+        old_action = await ledger.get_action("hitl-action")
+        old_attempt = await ledger.get_attempt("hitl-action", 1)
+        old_receipt = await ledger.get_attempt_outcome("hitl-action", 1)
+        old_claim = await ledger.get_interrupt_decision("public-interrupt-1")
+        continuations = await ledger.list_hitl_continuation_receipts(
+            "hitl-action", 1
+        )
+        replacement = await ledger.get_action(recovery.replacement_action_id)
+    assert old_action.status is ActionStatus.INDETERMINATE
+    assert old_attempt.status is ActionStatus.INDETERMINATE
+    assert isinstance(
+        ActionOutcomeEnvelope.model_validate_json(
+            old_receipt.canonical_outcome_json
+        ).outcome,
+        Paused,
+    )
+    assert old_claim.status == "STARTED"
+    assert continuations == ()
+    assert replacement.status is ActionStatus.AUTHORIZED
+
+
+@pytest.mark.asyncio
+async def test_resolved_hitl_replay_routes_cached_outcome_after_reconcile_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch a continuation receipt becoming RESOLVED but never reaching Task 8."""
+    project_root = await _seed_hitl_pause(tmp_path)
+    resumes = 0
+    reconciliations = 0
+    real_reconcile = lifecycle._reconcile_effective_outcome
+
+    class _Continuation:
+        async def resume_hitl(self, request):  # type: ignore[no-untyped-def]
+            nonlocal resumes
+            resumes += 1
+            return ActionOutcomeEnvelope(
+                action_id=request.action_id,
+                attempt=request.attempt,
+                outcome=PermanentFailure(
+                    error_code="operator_rejected",
+                    message="cached outcome still requires deterministic routing",
+                ),
+            )
+
+    async def crash_once(project, ledger, run):  # type: ignore[no-untyped-def]
+        nonlocal reconciliations
+        reconciliations += 1
+        if reconciliations == 1:
+            raise RuntimeError("crash after continuation commit")
+        await real_reconcile(project, ledger, run)
+
+    monkeypatch.setattr(lifecycle, "_reconcile_effective_outcome", crash_once)
+    request = lifecycle.InterruptDecisionRequest(
+        run_id="hitl-run",
+        action_id="hitl-action",
+        attempt=1,
+        interrupt_id="public-interrupt-1",
+        decisions=("reject",),
+        feedback=(None,),
+    )
+    continuation = _Continuation()
+    with pytest.raises(RuntimeError, match="continuation commit"):
+        await lifecycle.approve_interrupt(
+            project_root=project_root,
+            request=request,
+            continuation=continuation,
+        )
+
+    replay = await lifecycle.approve_interrupt(
+        project_root=project_root,
+        request=request,
+        continuation=continuation,
+    )
+    async with RunLedger.open(project_root / "state/run.db") as ledger:
+        action = await ledger.get_action("hitl-action")
+        run = await ledger.get_run("hitl-run")
+    assert isinstance(replay.outcome, PermanentFailure)
+    assert resumes == 1
+    assert reconciliations == 2
+    assert action.status is ActionStatus.PERMANENT_FAILED
+    assert run.status is RunStatus.BLOCKED
 
 
 @pytest.mark.asyncio

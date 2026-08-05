@@ -279,7 +279,9 @@ class InterruptDecisionRecord(FrozenModel):
     decisions: tuple[Literal["approve", "reject"], ...] = Field(min_length=1)
     feedback: tuple[str | None, ...]
     decision_digest: str
-    status: Literal["CLAIMED", "RESOLVED"]
+    status: Literal["CLAIMED", "STARTED", "RESOLVED"]
+    resume_invocation_id: str | None = None
+    resume_started_at: datetime | None = None
     continuation_sequence: int | None = Field(default=None, ge=1)
     created_at: datetime
     claimed_at: datetime
@@ -1254,6 +1256,42 @@ class RunLedger:
             created = True
         return await self.get_interrupt_decision(interrupt_id), created
 
+    async def start_hitl_resume(
+        self, interrupt_id: str
+    ) -> tuple[InterruptDecisionRecord, bool]:
+        """Durably mark the one provider invocation before it may start side effects."""
+        now = self._now()
+        started = False
+        async with self.transaction() as db:
+            cursor = await db.execute(
+                "SELECT * FROM interrupts WHERE interrupt_id = ?", (interrupt_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LedgerNotFoundError("HITL resume has no durable decision claim")
+            record = self._interrupt_decision_from_row(row)
+            invocation_id = (
+                f"hitl-resume:{record.thread_id}:{record.interrupt_id}:"
+                f"{record.decision_digest}"
+            )
+            if record.status == "RESOLVED":
+                raise LedgerTransitionError(
+                    "resolved HITL decision cannot start another provider invocation"
+                )
+            if record.status == "STARTED":
+                if record.resume_invocation_id != invocation_id:
+                    raise LedgerConflictError(
+                        "HITL resume invocation identity conflicts with its durable decision"
+                    )
+                return record, False
+            await db.execute(
+                "UPDATE interrupts SET status = 'STARTED', resume_invocation_id = ?, "
+                "resume_started_at = ? WHERE interrupt_id = ? AND status = 'CLAIMED'",
+                (invocation_id, now, interrupt_id),
+            )
+            started = True
+        return await self.get_interrupt_decision(interrupt_id), started
+
     async def record_hitl_continuation(
         self, interrupt_id: str, envelope: ActionOutcomeEnvelope
     ) -> HitlContinuationReceiptRecord:
@@ -1286,8 +1324,8 @@ class RunLedger:
                         "HITL continuation conflicts with its immutable first receipt"
                     )
                 return record
-            if claim["status"] != "CLAIMED":
-                raise LedgerTransitionError("HITL continuation requires a CLAIMED durable decision")
+            if claim["status"] != "STARTED":
+                raise LedgerTransitionError("HITL continuation requires a STARTED durable decision")
             cursor = await db.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence "
                 "FROM hitl_continuation_receipts WHERE action_id = ? AND attempt = ?",
@@ -1333,6 +1371,79 @@ class RunLedger:
         return (await self.list_hitl_continuation_receipts(envelope.action_id, envelope.attempt))[
             -1
         ]
+
+    async def block_hitl_resume_indeterminate(
+        self, interrupt_id: str, *, message: str
+    ) -> IncidentRecord:
+        """Atomically preserve an uncertain started resume and block blind re-entry."""
+        now = self._now()
+        reason_code = "hitl_resume_indeterminate"
+        error_code = "hitl_continuation_indeterminate"
+        subject = f"hitl-resume:{interrupt_id}"
+        async with self.transaction() as db:
+            cursor = await db.execute(
+                "SELECT * FROM interrupts WHERE interrupt_id = ?", (interrupt_id,)
+            )
+            claim = await cursor.fetchone()
+            if claim is None:
+                raise LedgerNotFoundError("indeterminate HITL resume has no durable claim")
+            if claim["status"] != "STARTED":
+                raise LedgerTransitionError(
+                    "only a STARTED unresolved HITL resume can become indeterminate"
+                )
+            await self._require_action(db, claim["action_id"])
+            await self._attempt_row(
+                db, claim["action_id"], int(claim["attempt"])
+            )
+            await db.execute(
+                "UPDATE action_attempts SET status = ?, repair_class = 'integrity', "
+                "repair_source = 'integrity_guard', reason_code = ? "
+                "WHERE action_id = ? AND attempt = ?",
+                (
+                    ActionStatus.INDETERMINATE.value,
+                    reason_code,
+                    claim["action_id"],
+                    claim["attempt"],
+                ),
+            )
+            await db.execute(
+                "UPDATE actions SET status = ?, repair_class = 'integrity', "
+                "repair_source = 'integrity_guard', reason_code = ? WHERE action_id = ?",
+                (
+                    ActionStatus.INDETERMINATE.value,
+                    reason_code,
+                    claim["action_id"],
+                ),
+            )
+            await db.execute(
+                "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                (RunStatus.BLOCKED.value, now, claim["run_id"]),
+            )
+            cursor = await db.execute(
+                "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? "
+                "AND error_code = ? AND subject = ? AND status = 'OPEN'",
+                (
+                    claim["run_id"],
+                    claim["action_id"],
+                    error_code,
+                    subject,
+                ),
+            )
+            prior = await cursor.fetchone()
+            if prior is not None:
+                return self._incident_from_row(prior)
+            return await self._insert_incident(
+                db,
+                run_id=claim["run_id"],
+                error_code=error_code,
+                message=message,
+                action_id=claim["action_id"],
+                subject=subject,
+                repair_class="integrity",
+                repair_source="integrity_guard",
+                reason_code=reason_code,
+                now=now,
+            )
 
     async def get_probe_resolution(
         self, original_action_id: str, original_attempt: int
@@ -3020,18 +3131,19 @@ class RunLedger:
                     f"run {run_id} is {current_status.value}, not integrity BLOCKED or PAUSED_BUDGET; "
                     "inspect the next safe recovery instruction"
                 )
-            if request.source_action_id is None or not request.canonical_resolutions:
+            if request.source_action_id is None:
                 raise LedgerTransitionError(
-                    "integrity unblock requires a source Action and explicit canonical resolution evidence"
+                    "integrity unblock requires a source Action and explicit operator evidence"
                 )
             action = await self._require_action(db, request.source_action_id)
             if action["run_id"] != run_id:
                 raise LedgerTransitionError(
                     "unblock source Action belongs to another run; inspect the blocked run"
                 )
+            action_status = _action_status(action["status"], "actions.status")
             if (
-                _action_status(action["status"], "actions.status")
-                is not ActionStatus.REPAIR_REQUIRED
+                action_status
+                not in {ActionStatus.REPAIR_REQUIRED, ActionStatus.INDETERMINATE}
                 or action["repair_class"] != "integrity"
                 or action["repair_source"] != "integrity_guard"
                 or not action["reason_code"]
@@ -3043,7 +3155,7 @@ class RunLedger:
             cursor = await db.execute(
                 "SELECT * FROM action_attempts WHERE action_id = ? AND status = ? "
                 "ORDER BY attempt DESC LIMIT 1",
-                (request.source_action_id, ActionStatus.REPAIR_REQUIRED.value),
+                (request.source_action_id, action_status.value),
             )
             attempt = await cursor.fetchone()
             if (
@@ -3077,9 +3189,13 @@ class RunLedger:
             resolution_paths = tuple(
                 sorted(item.canonical_relpath for item in request.canonical_resolutions)
             )
-            if not conflict_paths or tuple(sorted(conflict_paths)) != resolution_paths:
+            if conflict_paths and tuple(sorted(conflict_paths)) != resolution_paths:
                 raise LedgerTransitionError(
                     "canonical resolution evidence must exactly cover every CONFLICT intent"
+                )
+            if not conflict_paths and resolution_paths:
+                raise LedgerTransitionError(
+                    "side-effect evidence recovery has no canonical conflict to resolve"
                 )
 
             cursor = await db.execute(
@@ -3708,6 +3824,12 @@ class RunLedger:
             feedback=payload.feedback,
             decision_digest=row["decision_digest"],
             status=row["status"],
+            resume_invocation_id=row["resume_invocation_id"],
+            resume_started_at=(
+                None
+                if row["resume_started_at"] is None
+                else _parse_time(row["resume_started_at"])
+            ),
             continuation_sequence=(
                 None if row["continuation_sequence"] is None else int(row["continuation_sequence"])
             ),

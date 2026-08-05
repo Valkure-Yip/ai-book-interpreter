@@ -61,9 +61,9 @@ CLI 服务与业务权限边界如下：
 | --- | --- |
 | `make-book` | scaffold、放置输入、创建唯一 run、驱动到 terminal/safe stop |
 | `resume` | 复用唯一 durable run，不能隐式创建第二个 run |
-| `inspect` | 只读 run/plan/action/receipt/gate/intent/incident/budget，并给下一安全动作 |
+| `inspect` | 只读 run/plan/action/receipt/gate/intent/incident/budget，暴露当前 effective pause 的 public ID、sequence、claim 状态与可复制的精确 `approve` 命令 |
 | `approve` | 由 public interrupt ID 解析当前 effective pause，记录 ordered decision 后恢复 Task 6 checkpoint |
-| `unblock` | budget pause 可直接恢复；integrity conflict 必须有显式 reason/evidence/canonical disposition，并创建 new plan/action/staging |
+| `unblock` | budget pause 可直接恢复；integrity conflict 必须有显式 reason/evidence/canonical disposition；HITL indeterminate 必须有副作用证据；两者都创建 new plan/action/staging |
 | `cancel` | 非 completed run 幂等取消；completed 不能被重新打开 |
 
 `inspect`、`cancel`、`unblock` 和 `approve` 不把 projection 当真相，也不直接翻转业务状态。它们调用
@@ -112,6 +112,10 @@ Task 6 把 provider interrupt 立即转换为 ABI-owned `PendingHitlInterrupt`�
 tool reviews/arguments/description/allowed decisions。第一版只允许小写 `approve` / `reject`；unsupported
 decision 在模型或工具启动前被拒绝。
 
+需要审批的工具不是由 harness 推断，也不是“所有工具默认审批”。`ActionRegistry` 为每个能力显式声明
+`approval_tools`，且启动时验证它是 `tool_allowlist` 的子集；fresh invocation 与 resume 使用同一份冻结策略。
+当前默认目录只有 `output.finalize` 的 `write_file` 进入 HITL，其余注册工具按各自最小权限自主执行。
+
 初始 `Paused` attempt outcome receipt 永远不改写。`approve` 必须先在一个 ledger 事务中验证：
 
 - run 正处于 `PAUSED_HITL`；
@@ -120,15 +124,18 @@ decision 在模型或工具启动前被拒绝。
 - ordered decisions/feedback 数量及允许集合有效；
 - claim 同时绑定原始 pause digest。
 
-事务产生 `interrupts.status=CLAIMED`。Task 6 用稳定
-`thread_id={run_id}/{action_id}/{attempt}` 和 public `HitlResume` 恢复后，RunLedger 追加独立的
-`hitl_continuation_receipts`，按同 attempt 的 sequence 排序，再把 claim 置为 `RESOLVED`。相同已解决
-decision 重放返回缓存 receipt 且不调用 checkpoint；不同 decision 与 stale/wrong identity 都 fail closed。
+事务先产生 `interrupts.status=CLAIMED`。紧接着，RunLedger 在调用 provider 前持久化
+`STARTED(resume_invocation_id, resume_started_at)`；invocation ID 由 thread、interrupt 与 decision digest
+确定性派生。Task 6 再用稳定 `thread_id={run_id}/{action_id}/{attempt}` 和 public `HitlResume` 恢复。
+返回后 RunLedger 追加独立的 `hitl_continuation_receipts`，按同 attempt 的 sequence 排序，再把 claim 置为
+`RESOLVED`。相同已解决 decision 重放返回缓存 receipt，但仍幂等重跑 Task 8 reconciliation；它不再次
+调用 checkpoint。不同 decision 与 stale/wrong identity 都 fail closed。
 
 ```mermaid
 flowchart TD
     P["attempt_outcome_receipts<br/>immutable Paused"] --> D["interrupt CLAIMED<br/>public ID + ordered decision<br/>+ original pause digest"]
-    D --> H["Task 6 resume / inspect<br/>same run/action/attempt/thread"]
+    D --> S["durable STARTED<br/>stable resume invocation ID"]
+    S --> H["Task 6 resume / inspect<br/>same run/action/attempt/thread"]
     H --> C["append continuation receipt<br/>sequence 1..n"]
     C --> E["effective outcome API<br/>latest continuation wins"]
     P --> E
@@ -142,24 +149,29 @@ Reconciler、Committer、retry successor 与 semantic repair 都必须使用它�
 `Succeeded` 仍完整经过 Task 8 gate/intent/promotion/postcheck/commit，不能由 CLI 或 lifecycle 直接宣布
 成功。
 
-## 6. `CLAIMED` 崩溃恢复：只允许三分支
+## 6. `CLAIMED / STARTED` 崩溃恢复：先标记，再裁决
 
-SQLite claim 与 LangGraph checkpoint 不存在跨介质原子事务。若进程在 provider 返回后、continuation
+SQLite marker 与 LangGraph checkpoint 不存在跨介质原子事务。若进程在 `STARTED` 后、continuation
 receipt 追加前崩溃，重放不能盲目 `resume`。Task 6 inspector 只调用公共 `agent.aget_state(config)`，解析
 typed `StateSnapshot.tasks` / `structured_response`；它不调用 `ainvoke`、模型、工具，也不读取 saver blob。
 
 ```mermaid
 flowchart TD
-    S["replay durable CLAIMED"] --> I["inspect Task 6 public StateSnapshot"]
+    C["replay durable CLAIMED"] --> S["persist STARTED"]
+    S --> I["inspect Task 6 public StateSnapshot"]
     I --> D{"disposition"}
     D -- "typed terminal outcome<br/>or next Paused" --> A["reconstruct + append receipt<br/>zero resume"]
-    D -- "exact interrupt still pending<br/>definitively not started" --> F["allow first resume"]
-    D -- "started / missing / unknown / error" --> B["record integrity incident + BLOCKED<br/>no blind re-entry"]
+    D -- "old pending / missing / unknown / error" --> B["attempt/action INDETERMINATE<br/>integrity_guard incident + BLOCKED"]
     A --> E["effective outcome → Task 8 routing"]
-    F --> E
 ```
 
-这三分支支持同一 attempt/thread 的连续 interrupts：上一 continuation 可以是携带第二个 public ID 的新
+`CLAIMED` 只表示决定已被 ledger 接受；只有同一进程把它原子推进为 `STARTED` 后才允许第一次 provider
+调用。`STARTED` 后即使 inspector 报告旧 interrupt 仍 pending，也不能证明工具尚未产生副作用，因此必须
+保守阻断。人工 `unblock` 不复活旧 attempt：无 canonical conflict 时提交 typed side-effect evidence 与
+reason 即可；存在 promotion conflict 时仍必须精确覆盖全部 canonical dispositions。两条路径都创建新的
+plan version、Action ID 与 staging namespace，并保留旧 pause、claim、attempt 和 receipt。
+
+terminal、next pause 与不确定阻断三类裁决支持同一 attempt/thread 的连续 interrupts：上一 continuation 可以是携带第二个 public ID 的新
 `Paused`；新的 ordered decision 产生下一个 sequence，而历史 pause 与 continuation 都保留。
 
 ## 7. 宏观恢复矩阵
@@ -171,11 +183,12 @@ flowchart TD
 | outcome receipt durable、未路由 | 按 effective outcome discriminant 幂等路由 |
 | retry 被 frozen policy 允许 | 旧 attempt/action → `RETRY_WAIT`，显式创建 attempt+1 + new staging |
 | semantic repair 已映射 | 保留旧事实，run 保持 `RUNNING`，new plan/action/staging |
-| integrity conflict / unknown side effect | 保留所有证据，run `BLOCKED`；人工 resolve/unblock 后 new identity |
+| integrity conflict / unknown side effect / HITL STARTED indeterminate | 原 action/attempt `INDETERMINATE`，保留证据，run `BLOCKED`；人工 resolve/unblock 后 new identity |
 | gate + intents durable、promotion 部分完成 | 逐项对账补完；不重跑 executor |
 | run `PAUSED_BUDGET` | 提高预算并记录 evidence 后恢复 |
 | run `PAUSED_HITL` | 走 §5 append-only continuation 协议 |
-| HITL claim 崩溃 | 只走 §6 inspector 三分支 |
+| HITL `CLAIMED` 崩溃 | 先持久化 `STARTED`，然后执行第一次 provider 调用 |
+| HITL `STARTED` 崩溃 | 只走 §6 inspector；除可重建 terminal/next pause 外全部 integrity block |
 | run `COMPLETED` | terminal success；cancel/unblock/resume 不得重开 |
 
 ## 8. 相关源码入口

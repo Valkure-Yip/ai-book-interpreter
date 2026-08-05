@@ -25,8 +25,9 @@
 >
 > **HITL continuation 修订：已批准、具有约束力。** 2026-08-06；初始 `Paused` outcome receipt
 > 永远不可改写。每次人工决定先把 public interrupt、ordered decisions 与初始 pause digest 原子绑定为
-> `CLAIMED`，再追加独立 continuation receipt；业务路由只通过 effective outcome 选择最新 continuation。
-> `CLAIMED` 崩溃恢复只能使用 Task 6 public checkpoint inspector 的三分支裁决，禁止盲目重入。
+> `CLAIMED`，再在 provider 调用前持久化 `STARTED` invocation marker，最后追加独立 continuation receipt
+> 并转为 `RESOLVED`；业务路由只通过 effective outcome 选择最新 continuation。`STARTED` 崩溃恢复只能
+> 使用 Task 6 public checkpoint inspector 裁决；旧 pending 不能证明未执行，必须 fail closed。
 >
 > 本文定义 ABI 当前宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定阶段链。LangGraph 的具体分层与 checkpoint/HITL 恢复协议见
@@ -310,6 +311,7 @@ class ActionSpec(BaseModel):
     effects: tuple[EffectSpec, ...]
     expected_evidence: tuple[EvidenceSpec, ...]
     tool_allowlist: tuple[str, ...]
+    approval_tools: tuple[str, ...]
     skill_refs: tuple[str, ...]
     read_set: tuple[str, ...]
     write_set: tuple[str, ...]
@@ -322,7 +324,9 @@ class ActionSpec(BaseModel):
 Registry 启动时校验 capability 唯一、schema 可序列化、validator 存在、工具与 skill 引用有效、
 read/write 集合合法。每个会产出工件的 ActionDefinition 还必须注册确定性的 effect expander，把已解析
 参数展开为 `ExpectedArtifactManifest`；manifest 不能含目录或 glob，且必须落在 write set 内。Registry
-校验失败时进程拒绝启动。probe capability 的附加只读约束见 7.4 节。
+校验失败时进程拒绝启动。`approval_tools` 必须是 `tool_allowlist` 的显式子集，fresh 与 resume 使用同一
+冻结值；不允许 harness 把“所有工具”隐式升级为审批。当前默认目录只为 `output.finalize.write_file`
+启用 HITL。probe capability 的附加只读约束见 7.4 节。
 
 ### 7.2 `PlanPatch`
 
@@ -672,27 +676,34 @@ interrupt 与 parallel partial resume 都不会被历史写入误判。pause/suc
 
 人工决定不改写该 `Paused` receipt。`approve` 先在一个 RunLedger 事务中精确校验 run/action/attempt、
 当前 effective `Paused`、public interrupt ID、ordered decisions/feedback，并把初始 pause digest 一并冻结到
-`interrupts` 的 `CLAIMED` 行。Task 6 以同一
-`thread_id={run_id}/{action_id}/{attempt}` 恢复后，RunLedger 追加
+`interrupts` 的 `CLAIMED` 行。随后 RunLedger 在 provider 调用前把它持久化为
+`STARTED(resume_invocation_id, resume_started_at)`；Task 6 再以同一
+`thread_id={run_id}/{action_id}/{attempt}` 恢复。返回后 RunLedger 追加
 `hitl_continuation_receipts(sequence=1..n)` 并把 claim 标记为 `RESOLVED`；原 receipt 保持 byte-for-byte
-不变。相同决定重放直接返回缓存 continuation，零次 checkpoint resume；不同决定 fail closed。
+不变。相同决定重放返回缓存 continuation，零次 checkpoint resume，但仍幂等执行 Task 8 reconciliation；
+不同决定 fail closed。
 Controller、Reconciler、Committer、retry 与 repair 都只通过 RunLedger 的 effective-outcome API 读取
 “初始 receipt 或最新 continuation”，因此 Succeeded 仍完整经过 Task 8 的 gate、全 intents、promotion、
 统一后验和 commit authority，failure/repair 也不会绕过既有路由。
 
-若进程在 `CLAIMED` 后崩溃，恢复只调用 Task 6 的 public checkpoint inspector，不读取 saver 私有表：
+若进程在 `STARTED` 后崩溃，恢复只调用 Task 6 的 public checkpoint inspector，不读取 saver 私有表：
 
 ```mermaid
 flowchart TD
-    C["durable CLAIMED<br/>pause digest + ordered decision"] --> I["inspect public StateSnapshot<br/>零模型调用 · 零工具调用"]
+    C["durable CLAIMED<br/>pause digest + ordered decision"] --> S["durable STARTED<br/>stable invocation ID"]
+    S --> I["inspect public StateSnapshot<br/>零模型调用 · 零工具调用"]
     I --> O{"checkpoint disposition"}
     O -- "typed outcome / next Paused" --> A["重建并追加 continuation receipt<br/>不 resume"]
-    O -- "definitively not started" --> R["允许首次 resume<br/>随后追加 receipt"]
-    O -- "started or unknown" --> B["integrity BLOCKED<br/>禁止盲目重入"]
+    O -- "old pending / missing / unknown / error" --> B["原 action/attempt INDETERMINATE<br/>integrity_guard BLOCKED"]
     A --> E["effective outcome"]
-    R --> E
     E --> T["Task 8 Reconciler / Committer routing"]
 ```
+
+`STARTED` 后旧 interrupt 仍 pending 只说明 checkpoint 没有可确认的下一结果，不能排除已批准工具在崩溃前
+产生了副作用，因此不得再次 resume。人工 unblock 必须提交 typed side-effect evidence 与 reason，并创建
+new plan/action/staging；若同时存在 canonical conflicts，仍需提供与冲突 intent 精确一一对应的 disposition。
+`inspect` 直接显示当前 effective pause 的 public interrupt ID、sequence、claim 状态和可复制的完整
+`abi approve ...` 命令，不输出无法执行的占位符。
 
 Skills 按 Action 渐进加载。翻译 Action 仍只得到原文、5–8 条文体规则和命中术语；QA、EPUB 和
 release 规则不能混入翻译上下文。
@@ -732,7 +743,8 @@ event_outbox
   在 executor 启动前取得 immutable snapshot。
 - attempt outcome receipt 唯一绑定 action/attempt 和 canonical outcome/bundle/failure facts；它不是 PASS。
 - `interrupts` 唯一绑定 public interrupt、run/action/attempt/thread、初始 pause digest 与 ordered
-  decisions/feedback；状态只能 `CLAIMED → RESOLVED`。`hitl_continuation_receipts` 是按 attempt/sequence
+  decisions/feedback；状态只能 `CLAIMED → STARTED → RESOLVED`，`STARTED` 还冻结稳定 invocation ID 与
+  时间。`hitl_continuation_receipts` 是按 attempt/sequence
   追加的 typed outcome 链，不能 update/delete 初始 pause。effective outcome 是确定性查询规则，不是另一个
   可写真相表。
 - gate receipt 与完整 promotion-intent 集在同一事务中创建；它不是 success，也不能在部分 intent 集上重放。
@@ -828,6 +840,8 @@ LangGraph checkpoint
 | gate FAIL 未映射、repair classification 缺失/未知，或存在 integrity/外部副作用不确定性 | 按 `repair_class=integrity`（未知时 reason=`repair_class_unknown`）保留证据并令 run=`BLOCKED`；只允许人工 resolve/unblock 后 new plan/action/staging |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
 | 需要人工判断 | `PAUSED_HITL`；以 interrupt/Command 恢复 |
+| HITL decision=`CLAIMED` | 原子写 `STARTED` marker 后才允许第一次 provider resume |
+| HITL decision=`STARTED` 且无可重建的新 outcome | 原 action/attempt=`INDETERMINATE`、run=`BLOCKED`；人工凭副作用证据创建 new plan/action/staging，禁止重发旧 resume |
 | 原 Action 为 `INDETERMINATE` | 只授权其绑定的 evidence-only probe；用 `ProbeResolution` 原子解析，禁止重发原操作 |
 | 外部条件缺失 | `BLOCKED`；条件修复后恢复 |
 

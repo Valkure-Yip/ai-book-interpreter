@@ -278,6 +278,16 @@ class ActionRegistry:
                     f"tool {tool_name} for {spec.capability} is not registered; "
                     "register the tool before startup"
                 )
+        if len(spec.approval_tools) != len(set(spec.approval_tools)):
+            raise RegistryConfigurationError(
+                f"approval tools for {spec.capability} must be unique and ordered"
+            )
+        unknown_approval_tools = set(spec.approval_tools) - set(spec.tool_allowlist)
+        if unknown_approval_tools:
+            unknown = ", ".join(sorted(unknown_approval_tools))
+            raise RegistryConfigurationError(
+                f"approval tools for {spec.capability} are outside its tool allowlist: {unknown}"
+            )
         for skill_ref in spec.skill_refs:
             if skill_ref not in self._skill_refs:
                 raise RegistryConfigurationError(

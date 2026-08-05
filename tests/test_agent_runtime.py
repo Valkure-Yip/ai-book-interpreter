@@ -13,6 +13,7 @@ import sys
 import threading
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -29,11 +30,16 @@ from langgraph.types import Command, Interrupt, PregelTask, StateSnapshot, inter
 from pydantic import Field
 from typing_extensions import TypedDict
 
+from abi.actions.builtins import build_action_registry
+from abi.actions.contracts import ActionExecutionContext
+from abi.project import ScaffoldRequest, scaffold_project
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
 from abi.providers.observability.events import EventLogger, MetricsAggregator
 from abi.providers.observability.langfuse_client import LangfuseStatus
+from abi.tools.context import ToolContext
 from abi.types._base import FrozenModel
-from abi.types.run import LLMConfig
+from abi.types.orchestration import Paused, RunSnapshot, RunStatus
+from abi.types.run import LLMConfig, RunConfig
 from abi.types.tools import ToolBinding
 
 
@@ -372,6 +378,39 @@ class _ApprovalModel(_RecordingOutcomeModel):
             ],
         )
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _FinalManifestApprovalModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        if any(isinstance(message, ToolMessage) for message in messages):
+            return ChatResult(generations=[ChatGeneration(message=_success_message())])
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_file",
+                                "args": {
+                                    "path": "output/final_manifest.md",
+                                    "content": "# Final evidence\n",
+                                },
+                                "id": "final-manifest-write",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        )
 
 
 class _SequentialApprovalModel(_RecordingOutcomeModel):
@@ -715,6 +754,54 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
     assert resumed.outcome.kind == "succeeded"
     assert executions == 1
     assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_default_output_finalize_reaches_real_hitl_from_registry_policy(
+    tmp_path: Path,
+) -> None:
+    """Catch default catalog Actions that discard their explicit approval policy."""
+    project = scaffold_project(
+        ScaffoldRequest(
+            target_root=tmp_path,
+            book_slug="hitl-default",
+            source_lang="en",
+            target_lang="zh-hans",
+            source_target="en-zh-hans",
+        ),
+        root=tmp_path / "project",
+    )
+    runtime = _runtime(tmp_path, _FinalManifestApprovalModel(human_counts=[]))
+    services = SimpleNamespace(agent=runtime)
+    registry = build_action_registry(
+        tool_context=ToolContext(
+            project=project,
+            services=services,  # type: ignore[arg-type]
+            config=RunConfig(),
+        )
+    )
+    resolved = registry.resolve_json("output.finalize", "{}")
+    assert resolved.definition.spec.approval_tools == ("write_file",)
+
+    envelope = await resolved.definition.executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            action_id="finalize-action",
+            attempt=1,
+            source_lang="en",
+            target_lang="zh-hans",
+            source_target="en-zh-hans",
+            book_slug="hitl-default",
+        ),
+        resolved.parameters,
+    )
+
+    assert isinstance(envelope.outcome, Paused)
+    (pending,) = envelope.outcome.pending_hitl_interrupts
+    assert [review.tool_name for review in pending.action_reviews] == ["write_file"]
+    assert not (project.root / "state/staging/finalize-action/1/output/final_manifest.md").exists()
 
 
 @pytest.mark.asyncio

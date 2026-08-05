@@ -66,6 +66,7 @@ class ActionEnvelope(FrozenModel):
     capability: str
     parameters: FrozenModel
     tools: tuple[ActionToolRef, ...]
+    approval_tools: tuple[str, ...] = ()
     permissions: ActionPathPermissions
     gate_permissions: ActionPathPermissions | None = None
     skill_refs: tuple[str, ...]
@@ -94,6 +95,7 @@ class _Builtin:
     read_set: tuple[str, ...]
     write_set: tuple[str, ...]
     estimated_cost: float
+    approval_tools: tuple[str, ...] = ()
 
 
 _QUALITY_SKILLS = (
@@ -338,6 +340,7 @@ _BUILTINS = (
         ("output", "reviews", "metadata"),
         ("output/final_manifest.md",),
         0.10,
+        ("write_file",),
     ),
     _Builtin(
         "retrospective.capture",
@@ -480,6 +483,7 @@ def build_action_envelope(capability: str, parameters: FrozenModel) -> ActionEnv
         capability=capability,
         parameters=parameters,
         tools=tuple(ActionToolRef(name=name) for name in item.tools),
+        approval_tools=item.approval_tools,
         permissions=permissions,
         gate_permissions=gate_permissions,
         skill_refs=item.skills,
@@ -687,7 +691,7 @@ class AgentActionExecutor:
                 max_iterations=40,
                 may_have_side_effects=False,
                 resume=resume,
-                approval_tools=(tuple(tool.name for tool in tools) if resume is not None else ()),
+                approval_tools=envelope.approval_tools,
             )
             if inspect_only:
                 return await self._tool_context.services.agent.inspect_hitl_checkpoint(request)
@@ -973,6 +977,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
             effects=(EffectSpec(name="artifact.produced", artifact_pattern=item.effect),),
             expected_evidence=(EvidenceSpec(name=item.evidence),),
             tool_allowlist=item.tools,
+            approval_tools=item.approval_tools,
             skill_refs=item.skills,
             read_set=item.read_set,
             write_set=item.write_set,

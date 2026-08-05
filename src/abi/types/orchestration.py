@@ -102,6 +102,7 @@ class ActionSpec(FrozenModel):
     effects: tuple[EffectSpec, ...] = ()
     expected_evidence: tuple[EvidenceSpec, ...] = ()
     tool_allowlist: tuple[str, ...] = ()
+    approval_tools: tuple[str, ...] = ()
     skill_refs: tuple[str, ...] = ()
     read_set: tuple[str, ...] = ()
     write_set: tuple[str, ...] = ()

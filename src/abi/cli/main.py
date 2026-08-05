@@ -165,6 +165,24 @@ def inspect_cmd(
     console.print(f"Gates: {len(report.gate_receipts)} durable PASS receipt(s)")
     console.print(f"Outcome receipts: {len(report.outcome_receipts)}")
     console.print(f"Promotion intents: {len(report.promotion_intents)}")
+    if report.current_hitl_interrupts:
+        interrupts = Table(title="Current HITL interrupts")
+        interrupts.add_column("Interrupt ID")
+        interrupts.add_column("Action / attempt")
+        interrupts.add_column("Claim")
+        interrupts.add_column("Sequence")
+        interrupts.add_column("Approve command")
+        for item in report.current_hitl_interrupts:
+            interrupts.add_row(
+                item.interrupt_id,
+                f"{item.action_id}:{item.attempt}",
+                item.claim_status,
+                "initial" if item.continuation_sequence is None else str(item.continuation_sequence),
+                item.approve_command,
+            )
+        console.print(interrupts)
+        for item in report.current_hitl_interrupts:
+            console.print(item.approve_command, soft_wrap=True)
     console.print("Open incidents")
     for incident in report.open_incidents:
         console.print(f"  - {incident.error_code}: {incident.message}")

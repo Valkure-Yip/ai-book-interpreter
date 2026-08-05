@@ -257,6 +257,8 @@ CREATE TABLE IF NOT EXISTS interrupts (
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     claimed_at TEXT NOT NULL,
+    resume_invocation_id TEXT,
+    resume_started_at TEXT,
     continuation_sequence INTEGER,
     resolved_at TEXT
 );

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -33,6 +34,8 @@ from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     CanonicalResolutionEvidence,
+    Paused,
+    PendingHitlInterrupt,
     RunResult,
     RunSnapshot,
     RunStatus,
@@ -78,8 +81,23 @@ class RunInspection(FrozenModel):
     gate_receipts: tuple[GateReceiptRecord, ...]
     promotion_intents: tuple[PromotionIntent, ...]
     open_incidents: tuple[IncidentRecord, ...]
+    current_hitl_interrupts: tuple[CurrentHitlInterrupt, ...] = ()
     budget_spent_usd: float
     next_safe_recovery: str
+
+
+class CurrentHitlInterrupt(FrozenModel):
+    """One public interrupt discoverable from the current effective Paused outcome."""
+
+    run_id: str
+    action_id: str
+    attempt: int = Field(ge=1)
+    thread_id: str
+    interrupt_id: str
+    pending: PendingHitlInterrupt
+    continuation_sequence: int | None = Field(default=None, ge=1)
+    claim_status: Literal["UNCLAIMED", "CLAIMED", "STARTED", "RESOLVED"]
+    approve_command: str
 
 
 class InterruptDecisionRequest(FrozenModel):
@@ -551,6 +569,9 @@ async def inspect_run(*, project_root: Path) -> RunInspection:
         promotion_intents = await ledger.promotion_intents(run.run_id)
         open_incidents = await ledger.list_incidents(run.run_id, open_only=True)
         spent = await ledger.budget_spent_usd(run.run_id)
+        current_hitl_interrupts = await _current_hitl_interrupts(
+            project, ledger, run, outcome_receipts
+        )
     return RunInspection(
         run=run,
         snapshot=snapshot,
@@ -559,9 +580,72 @@ async def inspect_run(*, project_root: Path) -> RunInspection:
         gate_receipts=gate_receipts,
         promotion_intents=promotion_intents,
         open_incidents=open_incidents,
+        current_hitl_interrupts=current_hitl_interrupts,
         budget_spent_usd=spent,
-        next_safe_recovery=_next_recovery(project, run.status, open_incidents),
+        next_safe_recovery=_next_recovery(
+            project, run.status, open_incidents, current_hitl_interrupts
+        ),
     )
+
+
+async def _current_hitl_interrupts(
+    project: BookProject,
+    ledger: RunLedger,
+    run: RunRecord,
+    receipts: tuple[AttemptOutcomeReceiptRecord, ...],
+) -> tuple[CurrentHitlInterrupt, ...]:
+    current: list[CurrentHitlInterrupt] = []
+    for receipt in receipts:
+        effective = await ledger.get_effective_attempt_outcome(
+            receipt.action_id, receipt.attempt
+        )
+        envelope = ActionOutcomeEnvelope.model_validate_json(
+            effective.canonical_outcome_json
+        )
+        if not isinstance(envelope.outcome, Paused) or envelope.outcome.reason != "hitl":
+            continue
+        for pending in envelope.outcome.pending_hitl_interrupts:
+            try:
+                claim = await ledger.get_interrupt_decision(pending.interrupt_id)
+            except LedgerNotFoundError:
+                claim_status = "UNCLAIMED"
+            else:
+                claim_status = claim.status
+            decisions = [
+                (
+                    "approve"
+                    if "approve" in review.allowed_decisions
+                    else review.allowed_decisions[0]
+                )
+                for review in pending.action_reviews
+            ]
+            command = " ".join(
+                [
+                    "abi",
+                    "approve",
+                    shlex.quote(str(project.root)),
+                    shlex.quote(pending.interrupt_id),
+                    *[
+                        token
+                        for decision in decisions
+                        for token in ("--decision", decision)
+                    ],
+                ]
+            )
+            current.append(
+                CurrentHitlInterrupt(
+                    run_id=run.run_id,
+                    action_id=receipt.action_id,
+                    attempt=receipt.attempt,
+                    thread_id=f"{run.run_id}/{receipt.action_id}/{receipt.attempt}",
+                    interrupt_id=pending.interrupt_id,
+                    pending=pending,
+                    continuation_sequence=effective.sequence,
+                    claim_status=claim_status,
+                    approve_command=command,
+                )
+            )
+    return tuple(current)
 
 
 async def approve_interrupt(
@@ -592,7 +676,11 @@ async def approve_interrupt(
                 request.action_id, request.attempt
             )
             receipt = next(item for item in receipts if item.interrupt_id == request.interrupt_id)
-            return ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
+            envelope = ActionOutcomeEnvelope.model_validate_json(
+                receipt.canonical_outcome_json
+            )
+            await _reconcile_effective_outcome(project, ledger, run)
+            return envelope
 
         continuation_request = HitlContinuationRequest(
             run_id=request.run_id,
@@ -618,26 +706,28 @@ async def approve_interrupt(
             )
             boundary = owned_continuation
         try:
-            if newly_claimed:
+            if newly_claimed or claim.status == "CLAIMED":
+                _, newly_started = await ledger.start_hitl_resume(
+                    request.interrupt_id
+                )
+                if not newly_started:
+                    raise LedgerTransitionError(
+                        "HITL resume already started; inspect before any provider re-entry"
+                    )
                 envelope = await boundary.resume_hitl(continuation_request)
             else:
                 inspection = await boundary.inspect_hitl(continuation_request)
                 if inspection.disposition == "outcome":
                     assert inspection.outcome is not None
                     envelope = inspection.outcome
-                elif inspection.disposition == "not_started":
-                    envelope = await boundary.resume_hitl(continuation_request)
                 else:
-                    await ledger.record_incident(
-                        request.run_id,
-                        error_code="hitl_continuation_indeterminate",
+                    await ledger.block_hitl_resume_indeterminate(
+                        request.interrupt_id,
                         message=(
                             "A claimed HITL checkpoint could not prove whether its approved tool "
                             "started; inspect side-effect evidence before any continuation."
                         ),
-                        action_id=request.action_id,
                     )
-                    await ledger.set_run_status(request.run_id, RunStatus.BLOCKED)
                     raise LedgerTransitionError(
                         "HITL continuation is indeterminate; run blocked before blind resume"
                     )
@@ -681,11 +771,14 @@ def _next_recovery(
     project: BookProject,
     status: RunStatus,
     incidents: tuple[IncidentRecord, ...],
+    current_hitl_interrupts: tuple[CurrentHitlInterrupt, ...] = (),
 ) -> str:
     if status is RunStatus.RUNNING:
         return f"abi resume {project.root}"
     if status is RunStatus.PAUSED_HITL:
-        return f"abi approve {project.root} INTERRUPT_ID --decision approve|reject"
+        if current_hitl_interrupts:
+            return current_hitl_interrupts[0].approve_command
+        return "No current public HITL interrupt; inspect durable outcome bindings"
     if status is RunStatus.PAUSED_BUDGET:
         return f"abi unblock {project.root} --reason REASON --evidence-ref BUDGET_CHANGE"
     if status is RunStatus.BLOCKED and any(
