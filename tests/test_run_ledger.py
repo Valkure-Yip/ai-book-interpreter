@@ -112,8 +112,158 @@ async def test_commit_success_is_exactly_once(tmp_path: Path) -> None:
 
         assert first == second
         assert first.artifacts[0].media_type == "application/json"
+        assert first.artifacts[0].relpath == "source/a1.json"
         assert await ledger.count_committed_actions("a1") == 1
         assert await ledger.count_outbox_events("action.committed", "a1") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "relpath",
+    (
+        "chapters/final/./001.md",
+        "CHAPTERS/FINAL/001.md",
+        "chapters/final/\u212a.md",
+    ),
+    ids=("dot-alias", "uppercase", "unicode-casefold"),
+)
+async def test_commit_success_rejects_nonportable_relpath_before_transaction(
+    tmp_path: Path, relpath: str
+) -> None:
+    """Catch SuccessCommit bypassing canonical validation after it waits for BEGIN."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        commit = _success_commit("a1", "abc")
+        invalid = commit.model_copy(
+            update={
+                "artifacts": (
+                    commit.artifacts[0].model_copy(update={"relpath": relpath}),
+                )
+            }
+        )
+        await ledger._transaction_lock.acquire()
+        try:
+            with pytest.raises(ValueError):
+                await asyncio.wait_for(ledger.commit_success(invalid), timeout=0.2)
+        finally:
+            ledger._transaction_lock.release()
+
+        action = await ledger.get_action("a1")
+        attempt = await ledger.get_attempt("a1", 1)
+        snapshot = await ledger.load_snapshot("run-1")
+        assert action.status is ActionStatus.RUNNING
+        assert action.committed_at is None
+        assert attempt.status is ActionStatus.RUNNING
+        assert attempt.finished_at is None
+        assert await ledger.count_artifacts_for("a1") == 0
+        assert snapshot.gate_evidence == ()
+        assert snapshot.incidents == ()
+        assert snapshot.remaining_budget_usd == 5.0
+        assert await ledger.count_outbox_events("action.committed", "a1") == 0
+
+
+@pytest.mark.asyncio
+async def test_commit_success_rejects_duplicate_valid_canonical_key_before_transaction(
+    tmp_path: Path,
+) -> None:
+    """Catch duplicate detection using raw relpaths or running only after BEGIN."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        commit = SuccessCommit(
+            action_id="a1",
+            attempt=1,
+            artifacts=(
+                ArtifactCommit(
+                    artifact_id="artifact-a1-first",
+                    relpath="chapters/final/001.md",
+                    sha256="abc",
+                    producer_action_id="a1",
+                    media_type="text/markdown",
+                ),
+                ArtifactCommit(
+                    artifact_id="artifact-a1-second",
+                    relpath="chapters/final/001.md",
+                    sha256="def",
+                    producer_action_id="a1",
+                    media_type="text/markdown",
+                ),
+            ),
+            gate_evidence=(
+                GateEvidence(
+                    evidence_id="gate-a1",
+                    gate="chapter",
+                    passed=True,
+                    validator_version="1",
+                    artifact_checksums=("abc", "def"),
+                ),
+            ),
+        )
+        await ledger._transaction_lock.acquire()
+        try:
+            with pytest.raises(LedgerTransitionError, match="repeats a canonical artifact path"):
+                await asyncio.wait_for(ledger.commit_success(commit), timeout=0.2)
+        finally:
+            ledger._transaction_lock.release()
+
+        assert (await ledger.get_action("a1")).status is ActionStatus.RUNNING
+        assert (await ledger.get_attempt("a1", 1)).status is ActionStatus.RUNNING
+        assert await ledger.count_artifacts_for("a1") == 0
+
+
+@pytest.mark.asyncio
+async def test_one_invalid_relpath_rejects_entire_multi_artifact_commit_without_facts(
+    tmp_path: Path,
+) -> None:
+    """Catch one invalid artifact leaving attempt, validation, budget, or artifact facts behind."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_authorized_action(ledger)
+        commit = SuccessCommit(
+            action_id="a1",
+            attempt=1,
+            artifacts=(
+                ArtifactCommit(
+                    artifact_id="artifact-a1-valid",
+                    relpath="chapters/final/001.md",
+                    sha256="abc",
+                    producer_action_id="a1",
+                    media_type="text/markdown",
+                ),
+                ArtifactCommit(
+                    artifact_id="artifact-a1-invalid",
+                    relpath="CHAPTERS/FINAL/002.md",
+                    sha256="def",
+                    producer_action_id="a1",
+                    media_type="text/markdown",
+                ),
+            ),
+            gate_evidence=(
+                GateEvidence(
+                    evidence_id="gate-a1",
+                    gate="chapter",
+                    passed=True,
+                    validator_version="1",
+                    artifact_checksums=("abc", "def"),
+                ),
+            ),
+            cost_usd=0.5,
+        )
+
+        with pytest.raises(ValueError):
+            await ledger.commit_success(commit)
+
+        action = await ledger.get_action("a1")
+        attempt = await ledger.get_attempt("a1", 1)
+        snapshot = await ledger.load_snapshot("run-1")
+        assert action.status is ActionStatus.RUNNING
+        assert action.committed_at is None
+        assert attempt.status is ActionStatus.RUNNING
+        assert attempt.finished_at is None
+        assert await ledger.count_artifacts_for("a1") == 0
+        assert snapshot.artifacts == ()
+        assert snapshot.gate_evidence == ()
+        assert snapshot.incidents == ()
+        assert snapshot.remaining_budget_usd == 5.0
+        assert await ledger.count_outbox_events("action.committed", "a1") == 0
 
 
 @pytest.mark.asyncio

@@ -375,6 +375,7 @@ class RunLedger:
         )
 
     async def commit_success(self, commit: SuccessCommit) -> CommittedAction:
+        commit = _canonical_success_commit(commit)
         now = self._now()
         conflict = False
         try:
@@ -1059,10 +1060,6 @@ def _validate_success_fact_set(commit: SuccessCommit) -> None:
         raise LedgerTransitionError(
             "success commit repeats an artifact ID; repair the artifact manifest and retry the commit"
         )
-    if len({artifact.relpath for artifact in commit.artifacts}) != len(commit.artifacts):
-        raise LedgerTransitionError(
-            "success commit repeats a canonical artifact path; repair the artifact manifest and retry the commit"
-        )
     if any(artifact.producer_action_id != commit.action_id for artifact in commit.artifacts):
         raise LedgerTransitionError(
             "success commit contains another action's artifact; repair the artifact manifest and retry the commit"
@@ -1082,6 +1079,25 @@ def _validate_success_fact_set(commit: SuccessCommit) -> None:
                 f"gate {evidence.gate} checksums do not match the committed artifacts; "
                 "re-run the validator against the exact artifact set"
             )
+
+
+def _canonical_success_commit(commit: SuccessCommit) -> SuccessCommit:
+    """Validate canonical keys before any transaction and return only those keys."""
+    validated = commit.model_copy(
+        update={
+            "artifacts": tuple(
+                artifact.model_copy(
+                    update={"relpath": canonical_artifact_key(artifact.relpath)}
+                )
+                for artifact in commit.artifacts
+            )
+        }
+    )
+    if len({artifact.relpath for artifact in validated.artifacts}) != len(validated.artifacts):
+        raise LedgerTransitionError(
+            "success commit repeats a canonical artifact path; repair the artifact manifest and retry the commit"
+        )
+    return validated
 
 
 def _commit_signature(commit: SuccessCommit, *, idempotency_key: str) -> str:
