@@ -21,19 +21,25 @@ from abi.project.run_ledger import (
     LedgerTransitionError,
     RunLedger,
 )
+from abi.providers.orchestration_runtime import runtime as runtime_module
 from abi.providers.orchestration_runtime.runtime import (
     DurableLoopRuntime,
     _compact_checkpoint_history,
 )
 from abi.types.orchestration import (
+    ActionOutcomeEnvelope,
     ActionStatus,
     Indeterminate,
+    PermanentFailure,
     ProbeResolution,
     RepairRequired,
     RetryableFailure,
+    RetryPolicySpec,
     RunStatus,
     Succeeded,
     canonical_failure_signature,
+    canonical_model_json,
+    sha256_canonical_json,
 )
 from tests.test_dynamic_controller import (
     BoundaryCrash,
@@ -114,6 +120,133 @@ async def test_create_next_attempt_rejects_unknown_persisted_status(
             await ledger.create_next_attempt("a1", previous_attempt=1)
 
         assert await ledger.attempt_numbers("a1") == (1,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "attempt_policy_json",
+        "attempt_policy_fingerprint",
+        "action_frozen_facts",
+        "max_attempts_exhausted",
+        "error_not_retryable",
+        "missing_receipt",
+        "wrong_receipt_kind",
+        "indeterminate_without_absent_resolution",
+    ),
+)
+async def test_create_next_attempt_revalidates_durable_retry_authority(
+    tmp_path: Path, corruption: str
+) -> None:
+    """Catch a stale RETRY_WAIT bit authorizing a successor after its facts drift."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        await ledger.record_attempt_outcome(_retry_receipt())
+        await ledger.route_retry_from_receipt("a1", attempt=1)
+
+        if corruption == "attempt_policy_json":
+            await ledger._db.execute(
+                "UPDATE action_attempts SET retry_policy_json = ? "
+                "WHERE action_id = 'a1' AND attempt = 1",
+                ("not-json",),
+            )
+        elif corruption == "attempt_policy_fingerprint":
+            await ledger._db.execute(
+                "UPDATE action_attempts SET retry_policy_fingerprint = ? "
+                "WHERE action_id = 'a1' AND attempt = 1",
+                ("f" * 64,),
+            )
+        elif corruption == "action_frozen_facts":
+            await ledger._db.execute(
+                "UPDATE actions SET parameters_json = ? WHERE action_id = 'a1'",
+                ('{"drift":true}',),
+            )
+        elif corruption == "max_attempts_exhausted":
+            policy = RetryPolicySpec(
+                max_attempts=1,
+                retryable_codes=("provider_timeout",),
+            )
+            policy_json = canonical_model_json(policy)
+            fingerprint = sha256_canonical_json(policy_json)
+            await ledger._db.execute(
+                "UPDATE action_attempts SET retry_policy_json = ?, "
+                "retry_policy_fingerprint = ? WHERE action_id = 'a1' AND attempt = 1",
+                (policy_json, fingerprint),
+            )
+            await ledger._db.execute(
+                "UPDATE actions SET retry_policy_json = ?, retry_policy_fingerprint = ? "
+                "WHERE action_id = 'a1'",
+                (policy_json, fingerprint),
+            )
+        elif corruption == "missing_receipt":
+            await ledger._db.execute(
+                "DELETE FROM attempt_outcome_receipts "
+                "WHERE action_id = 'a1' AND attempt = 1"
+            )
+        else:
+            if corruption == "error_not_retryable":
+                outcome = RetryableFailure(
+                    error_code="different_error", message="not registered"
+                )
+            elif corruption == "wrong_receipt_kind":
+                outcome = PermanentFailure(
+                    error_code="permanent", message="never retry"
+                )
+            else:
+                error_code = "provider_timeout"
+                outcome = Indeterminate(
+                    operation_key="operation:unresolved",
+                    error_code=error_code,
+                    failure_signature=canonical_failure_signature(
+                        "report.build", "{}", error_code
+                    ),
+                    message="no durable absent resolution exists",
+                )
+            envelope_json = canonical_model_json(
+                ActionOutcomeEnvelope(action_id="a1", attempt=1, outcome=outcome)
+            )
+            await ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET canonical_outcome_json = ?, "
+                "outcome_digest = ?, error_code = ?, failure_signature = ? "
+                "WHERE action_id = 'a1' AND attempt = 1",
+                (
+                    envelope_json,
+                    sha256_canonical_json(envelope_json),
+                    getattr(outcome, "error_code", None),
+                    getattr(outcome, "failure_signature", None),
+                ),
+            )
+        await ledger._db.commit()
+
+        with pytest.raises(LedgerConflictError):
+            await ledger.create_next_attempt("a1", previous_attempt=1)
+
+        assert await ledger.attempt_numbers("a1") == (1,)
+
+
+@pytest.mark.asyncio
+async def test_existing_retry_successor_replay_revalidates_predecessor_authority(
+    tmp_path: Path,
+) -> None:
+    """Catch the existing-successor fast path bypassing later predecessor corruption."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        await ledger.record_attempt_outcome(_retry_receipt())
+        await ledger.route_retry_from_receipt("a1", attempt=1)
+        successor = await ledger.create_next_attempt("a1", previous_attempt=1)
+        await ledger._db.execute(
+            "DELETE FROM attempt_outcome_receipts WHERE action_id = 'a1' AND attempt = 1"
+        )
+        await ledger._db.commit()
+
+        with pytest.raises(LedgerConflictError):
+            await ledger.create_next_attempt("a1", previous_attempt=1)
+
+        assert await ledger.get_attempt("a1", 2) == successor
+        assert await ledger.attempt_numbers("a1") == (1, 2)
 
 
 @pytest.mark.asyncio
@@ -409,6 +542,158 @@ async def test_checkpoint_compaction_isolated_by_namespace_and_thread(
 
 
 @pytest.mark.asyncio
+async def test_crashing_loop_compacts_checkpoint_roots_and_preserves_pending_thread(
+    tmp_path: Path,
+) -> None:
+    """Catch graph exceptions bypassing retention and leaving orphan parent/write rows."""
+    checkpoint_path = tmp_path / "crashing-checkpoints.sqlite"
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        await saver.setup()
+        pending_config: RunnableConfig = {
+            "configurable": {
+                "thread_id": "pending-hitl-run",
+                "checkpoint_ns": "hitl",
+            }
+        }
+        pending_checkpoint = empty_checkpoint()
+        pending_checkpoint["channel_values"] = {"pending": True}
+        pending_config = await saver.aput(
+            pending_config,
+            pending_checkpoint,
+            {"source": "loop", "step": 1, "parents": {}},
+            {},
+        )
+        await saver.aput_writes(
+            pending_config,
+            (("pending-review", {"approved": False}),),
+            task_id="hitl-review",
+        )
+
+    with sqlite3.connect(checkpoint_path) as db:
+        pending_checkpoints_before = tuple(
+            db.execute(
+                "SELECT * FROM checkpoints WHERE thread_id = ? ORDER BY checkpoint_id",
+                ("pending-hitl-run",),
+            )
+        )
+        pending_writes_before = tuple(
+            db.execute(
+                "SELECT * FROM writes WHERE thread_id = ? ORDER BY checkpoint_id, task_id, idx",
+                ("pending-hitl-run",),
+            )
+        )
+
+    def crash(point: str, _detail: object) -> None:
+        if point == "before_graph_checkpoint":
+            raise BoundaryCrash(point)
+
+    runtime = DurableLoopRuntime(
+        checkpoint_path=checkpoint_path,
+        max_cycles=1,
+        test_hook=crash,
+    )
+    for _ in range(12):
+        with pytest.raises(BoundaryCrash, match="before_graph_checkpoint"):
+            await runtime.run(run_id="crashing-run", tick=_stop_after_one_tick)
+
+    with sqlite3.connect(checkpoint_path) as db:
+        counts = tuple(
+            db.execute(
+                "SELECT checkpoint_ns, COUNT(*) FROM checkpoints WHERE thread_id = ? "
+                "GROUP BY checkpoint_ns ORDER BY checkpoint_ns",
+                ("crashing-run",),
+            )
+        )
+        retained_roots = tuple(
+            db.execute(
+                "SELECT checkpoint_ns, parent_checkpoint_id FROM checkpoints AS retained "
+                "WHERE thread_id = ? AND checkpoint_id = ("
+                "SELECT checkpoint_id FROM checkpoints AS candidate "
+                "WHERE candidate.thread_id = retained.thread_id "
+                "AND candidate.checkpoint_ns = retained.checkpoint_ns "
+                "ORDER BY checkpoint_id ASC LIMIT 1) ORDER BY checkpoint_ns",
+                ("crashing-run",),
+            )
+        )
+        orphan_parents = int(
+            db.execute(
+                "SELECT COUNT(*) FROM checkpoints AS child "
+                "LEFT JOIN checkpoints AS parent ON parent.thread_id = child.thread_id "
+                "AND parent.checkpoint_ns = child.checkpoint_ns "
+                "AND parent.checkpoint_id = child.parent_checkpoint_id "
+                "WHERE child.thread_id = ? AND child.parent_checkpoint_id IS NOT NULL "
+                "AND parent.checkpoint_id IS NULL",
+                ("crashing-run",),
+            ).fetchone()[0]
+        )
+        orphan_writes = int(
+            db.execute(
+                "SELECT COUNT(*) FROM writes AS w LEFT JOIN checkpoints AS c "
+                "ON c.thread_id = w.thread_id AND c.checkpoint_ns = w.checkpoint_ns "
+                "AND c.checkpoint_id = w.checkpoint_id "
+                "WHERE w.thread_id = ? AND c.checkpoint_id IS NULL",
+                ("crashing-run",),
+            ).fetchone()[0]
+        )
+        pending_checkpoints_after = tuple(
+            db.execute(
+                "SELECT * FROM checkpoints WHERE thread_id = ? ORDER BY checkpoint_id",
+                ("pending-hitl-run",),
+            )
+        )
+        pending_writes_after = tuple(
+            db.execute(
+                "SELECT * FROM writes WHERE thread_id = ? ORDER BY checkpoint_id, task_id, idx",
+                ("pending-hitl-run",),
+            )
+        )
+
+    assert counts and all(int(count) <= 8 for _, count in counts)
+    assert retained_roots and all(parent is None for _, parent in retained_roots)
+    assert orphan_parents == 0
+    assert orphan_writes == 0
+    assert pending_checkpoints_after == pending_checkpoints_before
+    assert pending_writes_after == pending_writes_before
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_cleanup_failure_never_masks_graph_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch best-effort cleanup replacing the graph's original business failure."""
+
+    async def cleanup_failure(
+        _checkpointer: AsyncSqliteSaver, *, thread_id: str
+    ) -> None:
+        raise RuntimeError(f"cleanup exploded for {thread_id}")
+
+    def crash(point: str, _detail: object) -> None:
+        if point == "before_graph_checkpoint":
+            raise BoundaryCrash(point)
+
+    monkeypatch.setattr(
+        runtime_module, "_compact_checkpoint_history", cleanup_failure
+    )
+    runtime = DurableLoopRuntime(
+        checkpoint_path=tmp_path / "cleanup-failure.sqlite",
+        max_cycles=1,
+        test_hook=crash,
+    )
+
+    with pytest.raises(BoundaryCrash, match="before_graph_checkpoint") as caught:
+        await runtime.run(run_id="crashing-run", tick=_stop_after_one_tick)
+
+    assert any(
+        "cleanup exploded for crashing-run" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+
+
+async def _stop_after_one_tick(_run_id: str) -> bool:
+    return False
+
+
+@pytest.mark.asyncio
 async def test_after_outcome_receipt_is_a_distinct_durable_crash_boundary(
     tmp_path: Path,
 ) -> None:
@@ -620,16 +905,106 @@ async def test_two_entry_internal_promotion_boundaries_resume_exactly_once(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "boundary", ("after_first_canonical_create", "after_first_canonical_write")
-)
-async def test_two_entry_first_canonical_io_boundary_has_exact_recovery_semantics(
-    tmp_path: Path, boundary: str
+async def test_first_canonical_create_crash_preserves_partial_evidence_and_blocks(
+    tmp_path: Path,
 ) -> None:
-    """Recover both high-level boundaries only after the first copy has complete bytes."""
+    """Catch the O_EXCL-create hook firing only after a complete canonical copy."""
     enabled = True
 
     def crash(point: str, detail: object) -> None:
+        if (
+            enabled
+            and point == "after_first_canonical_create"
+            and getattr(detail, "ordinal", None) == 0
+        ):
+            raise BoundaryCrash(point)
+
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.multi", (SuccessTemplate(),)),),
+        patches=(),
+    ) as rig:
+        rig.store._test_hook = crash
+        action, snapshot = await _authorize_one(rig, "work.multi")
+        envelope = await rig.dispatcher.execute(
+            run_id=rig.run_id,
+            action=action,
+            snapshot=snapshot,
+            attempt=1,
+        )
+        assert isinstance(envelope.outcome, Succeeded)
+        receipt_before = await rig.ledger.get_attempt_outcome(action.action_id, 1)
+        staged_before = tuple(
+            (tmp_path / entry.staged_relpath).read_bytes()
+            for entry in envelope.outcome.artifact_bundle.entries
+        )
+
+        with pytest.raises(BoundaryCrash, match="after_first_canonical_create"):
+            await rig.committer.commit(
+                run_id=rig.run_id,
+                action=action,
+                attempt=1,
+                outcome=envelope.outcome,
+            )
+
+        first = tmp_path / "reports/a.json"
+        second = tmp_path / "reports/b.json"
+        gate_before, intents_before = await rig.ledger.get_gate_receipt_and_intents(
+            action.action_id, 1
+        )
+        assert first.read_bytes() == b""
+        assert not second.exists()
+        assert tuple(intent.status for intent in intents_before) == (
+            "PENDING",
+            "PENDING",
+        )
+
+        enabled = False
+        rig.store._test_hook = None
+        await rig.reconciler.reconcile(rig.run_id)
+
+        final = await rig.ledger.load_snapshot(rig.run_id)
+        receipt_after = await rig.ledger.get_attempt_outcome(action.action_id, 1)
+        gate_after, intents_after = await rig.ledger.get_gate_receipt_and_intents(
+            action.action_id, 1
+        )
+        assert final.status is RunStatus.BLOCKED
+        assert await rig.ledger.action_status(action.action_id) is ActionStatus.REPAIR_REQUIRED
+        assert await rig.ledger.attempt_status(action.action_id, 1) is ActionStatus.REPAIR_REQUIRED
+        assert await rig.ledger.count_artifacts_for(action.action_id) == 0
+        assert rig.executors["work.multi"].attempt_ids == [1]
+        assert receipt_after == receipt_before
+        assert gate_after == gate_before
+        assert tuple(
+            intent.model_dump(exclude={"status", "committed_at"})
+            for intent in intents_after
+        ) == tuple(
+            intent.model_dump(exclude={"status", "committed_at"})
+            for intent in intents_before
+        )
+        assert {intent.status for intent in intents_after} == {"CONFLICT"}
+        assert tuple(
+            (tmp_path / entry.staged_relpath).read_bytes()
+            for entry in envelope.outcome.artifact_bundle.entries
+        ) == staged_before
+        assert first.read_bytes() == b""
+        assert not second.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary",
+    ("after_first_canonical_copy_verified", "after_first_canonical_write"),
+)
+async def test_two_entry_first_canonical_write_and_verified_boundaries_resume_successfully(
+    tmp_path: Path, boundary: str
+) -> None:
+    """Recover after complete bytes are written, with verification as a later boundary."""
+    enabled = True
+    observed_hooks: list[str] = []
+
+    def crash(point: str, detail: object) -> None:
+        observed_hooks.append(point)
         if (
             enabled
             and point == boundary
@@ -671,6 +1046,10 @@ async def test_two_entry_first_canonical_io_boundary_has_exact_recovery_semantic
         assert tuple(intent.status for intent in interrupted) == ("PENDING", "PENDING")
         assert not second.exists()
         assert first.read_bytes() == staged_before[0]
+        if boundary == "after_first_canonical_write":
+            assert "after_first_canonical_copy_verified" not in observed_hooks
+        else:
+            assert "after_first_canonical_write" in observed_hooks
 
         enabled = False
         rig.store._test_hook = None

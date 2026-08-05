@@ -582,6 +582,8 @@ class ArtifactStore:
                 try:
                     canonical_stat = os.fstat(canonical_fd)
                     os.fsync(canonical_parent_fd)
+                    if intent.ordinal == 0:
+                        self._invoke_test_hook("after_first_canonical_create", intent)
                     if crash_after == "after_canonical_create":
                         raise InjectedCrash("injected crash after canonical file creation")
                     source_fd = self._open_staged_file(intent.action_id, intent.attempt, staged_parts)
@@ -594,6 +596,10 @@ class ArtifactStore:
                             _write_all(canonical_fd, chunk)
                     finally:
                         os.close(source_fd)
+                    if intent.ordinal == 0:
+                        self._invoke_test_hook(
+                            "after_first_canonical_write", intent
+                        )
                     os.fsync(canonical_fd)
                 except OSError as exc:
                     await self._raise_write_incomplete(intent, exc)
@@ -602,7 +608,9 @@ class ArtifactStore:
                         intent, "new canonical artifact has a different checksum"
                     )
                 if intent.ordinal == 0:
-                    self._invoke_test_hook("after_first_canonical_create", intent)
+                    self._invoke_test_hook(
+                        "after_first_canonical_copy_verified", intent
+                    )
                 self._invoke_test_hook("after_canonical_written", intent)
                 self._assert_directory_binding(canonical_parent_fd, canonical_parts[:-1])
                 if not _named_inode_matches(canonical_parent_fd, canonical_parts[-1], canonical_stat):
@@ -611,8 +619,6 @@ class ArtifactStore:
                     os.fsync(canonical_parent_fd)
                 except OSError as exc:
                     await self._raise_write_incomplete(intent, exc)
-                if intent.ordinal == 0:
-                    self._invoke_test_hook("after_first_canonical_write", intent)
                 if crash_after == "after_canonical_write":
                     raise InjectedCrash("injected crash after canonical artifact write")
                 return await self._commit_existing(

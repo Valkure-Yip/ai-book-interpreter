@@ -82,10 +82,20 @@ class DurableLoopRuntime:
             builder.add_edge(START, "cycle")
             builder.add_conditional_edges("cycle", route_cycle, ["cycle", END])
             graph = builder.compile(checkpointer=checkpointer)
-            raw_result = await graph.ainvoke(
-                {"run_id": run_id, "cycle": 0, "continue_run": True},
-                {"configurable": {"thread_id": run_id}},
-            )
+            try:
+                raw_result = await graph.ainvoke(
+                    {"run_id": run_id, "cycle": 0, "continue_run": True},
+                    {"configurable": {"thread_id": run_id}},
+                )
+            except BaseException as graph_exc:
+                try:
+                    await _compact_checkpoint_history(checkpointer, thread_id=run_id)
+                except BaseException as cleanup_exc:
+                    graph_exc.add_note(
+                        "checkpoint history cleanup also failed: "
+                        f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                    )
+                raise
             result = cast(LoopState, raw_result)
             await _compact_checkpoint_history(checkpointer, thread_id=run_id)
         if result["continue_run"] and result["cycle"] >= self._max_cycles:
@@ -134,6 +144,17 @@ async def _compact_checkpoint_history(
                 "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? "
                 "AND checkpoint_id = ?",
                 ((thread_id, row[0], row[1]) for row in stale),
+            )
+            await checkpointer.conn.executemany(
+                "UPDATE checkpoints SET parent_checkpoint_id = NULL "
+                "WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ("
+                "SELECT checkpoint_id FROM checkpoints AS retained "
+                "WHERE retained.thread_id = ? AND retained.checkpoint_ns = ? "
+                "ORDER BY checkpoint_id ASC LIMIT 1)",
+                (
+                    (thread_id, namespace, thread_id, namespace)
+                    for namespace in namespaces
+                ),
             )
         except BaseException:
             await checkpointer.conn.rollback()

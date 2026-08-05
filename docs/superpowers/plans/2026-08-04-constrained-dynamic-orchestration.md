@@ -1910,10 +1910,22 @@ async def test_crash_boundaries_do_not_duplicate_business_facts(
         await rig.run()
     rig.disable_crash()
     await rig.resume()
-    assert await rig.ledger.count_committed_actions("a1") == 1
-    assert await rig.ledger.count_artifacts_for("a1") == 2
+    if boundary == "after_first_canonical_create":
+        assert await rig.ledger.action_status("a1") is ActionStatus.REPAIR_REQUIRED
+        assert await rig.ledger.run_status() is RunStatus.BLOCKED
+        assert await rig.ledger.count_artifacts_for("a1") == 0
+        assert await rig.canonical_bytes("reports/a.json") == b""
+    else:
+        assert await rig.ledger.count_committed_actions("a1") == 1
+        assert await rig.ledger.count_artifacts_for("a1") == 2
     assert await rig.executor.call_count("a1") == 1
 ```
+
+`after_first_canonical_create` is the true post-`O_EXCL`/pre-copy authority row and therefore
+fails closed while preserving the partial canonical, staging, receipts, and intents. The true
+post-copy/pre-fsync boundary is `after_first_canonical_write`. Also test
+`after_first_canonical_copy_verified` after file fsync and checksum as an additional successful
+recovery boundary; it is not an extra authority-matrix row.
 
 Add a separate retry-transition matrix for both ordinary `RetryableFailure` and allowed probe
 `absent`:

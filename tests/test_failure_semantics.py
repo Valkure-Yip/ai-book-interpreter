@@ -799,6 +799,186 @@ async def test_probe_resolution_replay_preserves_first_fact_and_blocks_conflict(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "corruption",
+    (
+        "malformed_probe_evidence",
+        "probe_wrong_action",
+        "probe_wrong_attempt",
+        "original_wrong_action",
+        "original_wrong_attempt",
+        "probe_digest_mismatch",
+        "original_digest_mismatch",
+        "probe_evidence_mismatch",
+        "original_error_mismatch",
+        "original_failure_mismatch",
+    ),
+)
+async def test_probe_resolution_durable_receipt_corruption_fails_closed(
+    tmp_path: Path, corruption: str
+) -> None:
+    """Catch malformed or column-divergent receipts authorizing an external resolution."""
+    operation_key = "publish:receipt-corruption-1"
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "release.publish",
+                (
+                    Indeterminate(
+                        operation_key=operation_key,
+                        error_code="provider_timeout",
+                        failure_signature=canonical_failure_signature(
+                            "release.publish", "{}", "provider_timeout"
+                        ),
+                        message="remote result unknown",
+                    ),
+                ),
+            ),
+            (
+                "release.probe",
+                (
+                    ProbeResolution(
+                        operation_key=operation_key,
+                        disposition="succeeded",
+                        evidence_refs=("external:release-1",),
+                        message="remote release exists",
+                    ),
+                ),
+            ),
+        ),
+        patches=(),
+        spec_options={
+            "release.publish": {
+                "probe_capability": "release.probe",
+                "retryable_codes": ("provider_timeout",),
+            }
+        },
+        probe_capabilities=frozenset({"release.probe"}),
+    ) as rig:
+        original, snapshot = await _authorize_one(rig, "release.publish")
+        await rig.dispatcher.execute(
+            run_id=rig.run_id,
+            action=original,
+            snapshot=snapshot,
+            attempt=1,
+        )
+        await rig.reconciler.reconcile(rig.run_id)
+        await rig.controller._authorize_pending_probes(rig.run_id)
+        probe = next(
+            action
+            for action in await rig.ledger.list_actions(rig.run_id)
+            if action.capability == "release.probe"
+        )
+        await rig.dispatcher.execute(
+            run_id=rig.run_id,
+            action=probe,
+            snapshot=await rig.ledger.load_snapshot(rig.run_id),
+            attempt=1,
+        )
+        request = ProbeResolutionRequest(
+            original_action_id=original.action_id,
+            original_attempt=1,
+            probe_action_id=probe.action_id,
+            probe_attempt=1,
+            operation_key=operation_key,
+            original_idempotency_key=original.idempotency_key,
+            retry_policy_fingerprint=original.retry_policy_fingerprint,
+        )
+
+        target_action = (
+            probe.action_id if corruption.startswith("probe_") or corruption.startswith("malformed_probe")
+            else original.action_id
+        )
+        receipt = await rig.ledger._fetch_one(
+            "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = 1",
+            (target_action,),
+        )
+        assert receipt is not None
+        if corruption == "malformed_probe_evidence":
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET evidence_refs_json = ? "
+                "WHERE action_id = ? AND attempt = 1",
+                ("not-json", probe.action_id),
+            )
+        elif corruption.endswith("wrong_action") or corruption.endswith("wrong_attempt"):
+            envelope = ActionOutcomeEnvelope.model_validate_json(
+                receipt["canonical_outcome_json"]
+            )
+            changed = envelope.model_copy(
+                update={
+                    "action_id": (
+                        "wrong-action"
+                        if corruption.endswith("wrong_action")
+                        else envelope.action_id
+                    ),
+                    "attempt": (
+                        2
+                        if corruption.endswith("wrong_attempt")
+                        else envelope.attempt
+                    ),
+                }
+            )
+            changed_json = canonical_model_json(changed)
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET canonical_outcome_json = ?, "
+                "outcome_digest = ? WHERE action_id = ? AND attempt = 1",
+                (
+                    changed_json,
+                    sha256_canonical_json(changed_json),
+                    target_action,
+                ),
+            )
+        elif corruption.endswith("digest_mismatch"):
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET outcome_digest = ? "
+                "WHERE action_id = ? AND attempt = 1",
+                ("f" * 64, target_action),
+            )
+        elif corruption == "probe_evidence_mismatch":
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET evidence_refs_json = ? "
+                "WHERE action_id = ? AND attempt = 1",
+                (json.dumps(("external:different",)), probe.action_id),
+            )
+        elif corruption == "original_error_mismatch":
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET error_code = ? "
+                "WHERE action_id = ? AND attempt = 1",
+                ("different_error", original.action_id),
+            )
+        else:
+            await rig.ledger._db.execute(
+                "UPDATE attempt_outcome_receipts SET failure_signature = ? "
+                "WHERE action_id = ? AND attempt = 1",
+                ("f" * 64, original.action_id),
+            )
+        await rig.ledger._db.commit()
+
+        with pytest.raises(LedgerConflictError):
+            await rig.ledger.resolve_indeterminate(request)
+
+        assert await rig.ledger._count(
+            "SELECT COUNT(*) FROM probe_resolutions", ()
+        ) == 0
+        assert await rig.ledger.action_status(original.action_id) is ActionStatus.INDETERMINATE
+        assert await rig.ledger.action_status(probe.action_id) is ActionStatus.RUNNING
+        final = await rig.ledger.load_snapshot(rig.run_id)
+        assert final.status is RunStatus.BLOCKED
+        incidents = tuple(
+            incident
+            for incident in final.incidents
+            if incident.error_code == "probe_resolution_conflict"
+        )
+        assert len(incidents) == 1
+        assert (
+            incidents[0].repair_class,
+            incidents[0].repair_source,
+            incidents[0].reason_code,
+        ) == ("integrity", "integrity_guard", "probe_resolution_conflict")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("boundary", "disposition"),
     (
         ("after_probe_resolution_insert", "succeeded"),

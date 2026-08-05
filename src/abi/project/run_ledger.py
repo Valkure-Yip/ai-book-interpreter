@@ -12,7 +12,7 @@ from typing import Literal, Self, cast
 from uuid import uuid4
 
 import aiosqlite
-from pydantic import Field, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError
 
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.ledger_schema import SCHEMA_SQL
@@ -1046,6 +1046,19 @@ class RunLedger:
         self, action_id: str, *, previous_attempt: int
     ) -> ActionAttemptRecord:
         """Idempotently reserve exactly previous_attempt+1 after durable RETRY_WAIT."""
+        try:
+            return await self._create_next_attempt_once(
+                action_id, previous_attempt=previous_attempt
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise LedgerConflictError(
+                "retry successor authority contains malformed durable facts"
+            ) from exc
+
+    async def _create_next_attempt_once(
+        self, action_id: str, *, previous_attempt: int
+    ) -> ActionAttemptRecord:
+        """Validate the predecessor authority before creating or replaying its successor."""
         next_attempt = previous_attempt + 1
         async with self.transaction() as db:
             action = await self._require_action(db, action_id)
@@ -1055,6 +1068,30 @@ class RunLedger:
                 (action_id, previous_attempt),
             )
             existing = await cursor.fetchone()
+            if existing is None:
+                if (
+                    _action_status(
+                        previous["status"], "action_attempts.status"
+                    )
+                    is not ActionStatus.RETRY_WAIT
+                ):
+                    raise LedgerTransitionError(
+                        "only a durable RETRY_WAIT attempt can create a successor"
+                    )
+                if (
+                    _action_status(action["status"], "actions.status")
+                    is not ActionStatus.RETRY_WAIT
+                ):
+                    raise LedgerTransitionError(
+                        "Action must be RETRY_WAIT before successor reservation"
+                    )
+            await self._validate_retry_successor_authority(
+                db,
+                action=action,
+                previous=previous,
+                action_id=action_id,
+                previous_attempt=previous_attempt,
+            )
             if existing is not None:
                 exact_successor = (
                     int(existing["attempt"]) == next_attempt
@@ -1077,10 +1114,6 @@ class RunLedger:
                         "retry successor conflicts with its predecessor frozen facts"
                     )
                 return self._attempt_from_row(existing)
-            if _action_status(previous["status"], "action_attempts.status") is not ActionStatus.RETRY_WAIT:
-                raise LedgerTransitionError("only a durable RETRY_WAIT attempt can create a successor")
-            if _action_status(action["status"], "actions.status") is not ActionStatus.RETRY_WAIT:
-                raise LedgerTransitionError("Action must be RETRY_WAIT before successor reservation")
             await db.execute(
                 "INSERT INTO action_attempts (action_id, attempt, status, parameters_json, "
                 "expected_manifest_json, expected_manifest_digest, expected_evidence_refs_json, "
@@ -1105,6 +1138,163 @@ class RunLedger:
                 (ActionStatus.AUTHORIZED.value, action_id),
             )
         return await self.get_attempt(action_id, next_attempt)
+
+    async def _validate_retry_successor_authority(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        action: aiosqlite.Row,
+        previous: aiosqlite.Row,
+        action_id: str,
+        previous_attempt: int,
+    ) -> None:
+        """Reconstruct retry eligibility from immutable facts, not a status bit."""
+        frozen_columns = (
+            "parameters_json",
+            "expected_manifest_json",
+            "expected_manifest_digest",
+            "expected_evidence_refs_json",
+            "retry_policy_json",
+            "retry_policy_fingerprint",
+        )
+        if any(action[column] != previous[column] for column in frozen_columns):
+            raise LedgerConflictError(
+                "retry predecessor conflicts with its Action frozen facts"
+            )
+
+        manifest = ExpectedArtifactManifest.model_validate_json(
+            previous["expected_manifest_json"]
+        )
+        manifest_json = canonical_manifest_json(manifest)
+        if (
+            manifest.action_id != action_id
+            or previous["expected_manifest_json"] != manifest_json
+            or previous["expected_manifest_digest"]
+            != sha256_canonical_json(manifest_json)
+        ):
+            raise LedgerConflictError(
+                "retry predecessor has invalid frozen manifest facts"
+            )
+        _EVIDENCE_REFS_ADAPTER.validate_json(previous["expected_evidence_refs_json"])
+
+        policy = RetryPolicySpec.model_validate_json(previous["retry_policy_json"])
+        policy_json = canonical_model_json(policy)
+        if (
+            previous["retry_policy_json"] != policy_json
+            or previous["retry_policy_fingerprint"]
+            != sha256_canonical_json(policy_json)
+        ):
+            raise LedgerConflictError(
+                "retry predecessor has invalid frozen policy facts"
+            )
+        if previous_attempt >= policy.max_attempts:
+            raise LedgerConflictError(
+                "retry predecessor exhausted its frozen retry policy"
+            )
+
+        cursor = await db.execute(
+            "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+            (action_id, previous_attempt),
+        )
+        receipt = await cursor.fetchone()
+        if receipt is None:
+            raise LedgerConflictError(
+                "retry predecessor has no durable outcome receipt"
+            )
+        envelope = _validated_attempt_outcome_receipt(
+            receipt,
+            expected_action_id=action_id,
+            expected_attempt=previous_attempt,
+        )
+        if isinstance(envelope.outcome, RetryableFailure):
+            if envelope.outcome.error_code not in policy.retryable_codes:
+                raise LedgerConflictError(
+                    "retry predecessor error is excluded by its frozen retry policy"
+                )
+            return
+        if isinstance(envelope.outcome, Indeterminate):
+            await self._validate_absent_probe_retry_authority(
+                db,
+                action=action,
+                previous=previous,
+                envelope=envelope,
+            )
+            if envelope.outcome.error_code not in policy.retryable_codes:
+                raise LedgerConflictError(
+                    "resolved-absent error is excluded by its frozen retry policy"
+                )
+            return
+        raise LedgerConflictError(
+            "retry predecessor outcome cannot authorize another attempt"
+        )
+
+    async def _validate_absent_probe_retry_authority(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        action: aiosqlite.Row,
+        previous: aiosqlite.Row,
+        envelope: ActionOutcomeEnvelope,
+    ) -> None:
+        """Validate the immutable probe fact that proved an operation was absent."""
+        assert isinstance(envelope.outcome, Indeterminate)
+        cursor = await db.execute(
+            "SELECT * FROM probe_resolutions WHERE original_action_id = ? "
+            "AND original_attempt = ?",
+            (envelope.action_id, envelope.attempt),
+        )
+        resolution = await cursor.fetchone()
+        if resolution is None or resolution["disposition"] != "absent":
+            raise LedgerConflictError(
+                "indeterminate retry requires a durable absent probe resolution"
+            )
+        if (
+            resolution["operation_key"] != envelope.outcome.operation_key
+            or resolution["original_idempotency_key"] != action["idempotency_key"]
+            or resolution["retry_policy_json"] != previous["retry_policy_json"]
+            or resolution["retry_policy_fingerprint"]
+            != previous["retry_policy_fingerprint"]
+            or resolution["error_code"] != envelope.outcome.error_code
+            or resolution["failure_signature"]
+            != envelope.outcome.failure_signature
+        ):
+            raise LedgerConflictError(
+                "absent probe resolution conflicts with the original frozen facts"
+            )
+
+        cursor = await db.execute(
+            "SELECT * FROM attempt_outcome_receipts WHERE action_id = ? AND attempt = ?",
+            (resolution["probe_action_id"], int(resolution["probe_attempt"])),
+        )
+        probe_receipt = await cursor.fetchone()
+        if probe_receipt is None:
+            raise LedgerConflictError(
+                "absent probe resolution has no durable probe outcome receipt"
+            )
+        probe_envelope = _validated_attempt_outcome_receipt(
+            probe_receipt,
+            expected_action_id=str(resolution["probe_action_id"]),
+            expected_attempt=int(resolution["probe_attempt"]),
+        )
+        if not isinstance(probe_envelope.outcome, ProbeResolution):
+            raise LedgerConflictError(
+                "absent probe resolution is not backed by ProbeResolution evidence"
+            )
+        evidence_refs = _EVIDENCE_REFS_ADAPTER.validate_json(
+            resolution["evidence_refs_json"]
+        )
+        resolution_json = canonical_model_json(probe_envelope.outcome)
+        if (
+            probe_envelope.outcome.disposition != "absent"
+            or probe_envelope.outcome.operation_key != resolution["operation_key"]
+            or probe_envelope.outcome.evidence_refs != evidence_refs
+            or probe_envelope.outcome.message != resolution["message"]
+            or resolution["resolution_digest"]
+            != sha256_canonical_json(resolution_json)
+        ):
+            raise LedgerConflictError(
+                "absent probe resolution conflicts with its durable probe receipt"
+            )
 
     async def create_gate_receipt_and_bundle_intents(
         self, payload: GateReceiptPayload
@@ -1500,7 +1690,7 @@ class RunLedger:
             raise LedgerConflictError(
                 "probe resolution conflicts with the immutable first fact"
             ) from exc
-        except (LedgerTransitionError, ValidationError) as exc:
+        except (LedgerError, ValidationError, TypeError, ValueError) as exc:
             original = await self.get_action(request.original_action_id)
             conflict = _ProbeResolutionConflict(
                 run_id=original.run_id,
@@ -1566,8 +1756,10 @@ class RunLedger:
             probe_receipt = await cursor.fetchone()
             if probe_receipt is None:
                 raise LedgerTransitionError("probe resolution requires its durable outcome receipt")
-            probe_envelope = ActionOutcomeEnvelope.model_validate_json(
-                probe_receipt["canonical_outcome_json"]
+            probe_envelope = _validated_attempt_outcome_receipt(
+                probe_receipt,
+                expected_action_id=request.probe_action_id,
+                expected_attempt=request.probe_attempt,
             )
             if not isinstance(probe_envelope.outcome, ProbeResolution):
                 raise LedgerTransitionError("probe resolution requires ProbeResolution")
@@ -1579,8 +1771,10 @@ class RunLedger:
             original_receipt = await cursor.fetchone()
             if original_receipt is None:
                 raise LedgerTransitionError("probe binding requires original outcome receipt")
-            original_envelope = ActionOutcomeEnvelope.model_validate_json(
-                original_receipt["canonical_outcome_json"]
+            original_envelope = _validated_attempt_outcome_receipt(
+                original_receipt,
+                expected_action_id=request.original_action_id,
+                expected_attempt=request.original_attempt,
             )
             cursor = await db.execute(
                 "SELECT * FROM probe_bindings WHERE original_action_id = ? "
@@ -1611,12 +1805,6 @@ class RunLedger:
                 == original_attempt_row["retry_policy_fingerprint"]
                 and original_attempt_row["retry_policy_fingerprint"]
                 == request.retry_policy_fingerprint
-                and original_receipt["error_code"]
-                == original_envelope.outcome.error_code
-                and original_receipt["failure_signature"]
-                == original_envelope.outcome.failure_signature
-                and tuple(json.loads(probe_receipt["evidence_refs_json"]))
-                == probe_envelope.outcome.evidence_refs
             )
             if not exact_binding:
                 if prior_identity is not None:
@@ -3187,6 +3375,46 @@ class RunLedger:
             resolution_digest=row["resolution_digest"],
             resolved_at=_parse_time(row["resolved_at"]),
         )
+
+
+_EVIDENCE_REFS_ADAPTER = TypeAdapter(tuple[str, ...])
+
+
+def _validated_attempt_outcome_receipt(
+    row: aiosqlite.Row, *, expected_action_id: str, expected_attempt: int
+) -> ActionOutcomeEnvelope:
+    """Parse and cross-check every receipt field used as resolution authority."""
+    canonical_outcome_json = str(row["canonical_outcome_json"])
+    if row["outcome_digest"] != sha256_canonical_json(canonical_outcome_json):
+        raise LedgerConflictError(
+            "attempt outcome receipt digest differs from its canonical envelope"
+        )
+    envelope = ActionOutcomeEnvelope.model_validate_json(canonical_outcome_json)
+    if (
+        row["action_id"] != expected_action_id
+        or int(row["attempt"]) != expected_attempt
+        or envelope.action_id != expected_action_id
+        or envelope.attempt != expected_attempt
+    ):
+        raise LedgerConflictError(
+            "attempt outcome receipt row/envelope identity differs from its bound attempt"
+        )
+    evidence_refs = _EVIDENCE_REFS_ADAPTER.validate_json(row["evidence_refs_json"])
+    if evidence_refs != tuple(getattr(envelope.outcome, "evidence_refs", ())):
+        raise LedgerConflictError(
+            "attempt outcome receipt evidence column differs from its canonical envelope"
+        )
+    if row["error_code"] != getattr(envelope.outcome, "error_code", None):
+        raise LedgerConflictError(
+            "attempt outcome receipt error column differs from its canonical envelope"
+        )
+    if row["failure_signature"] != getattr(
+        envelope.outcome, "failure_signature", None
+    ):
+        raise LedgerConflictError(
+            "attempt outcome receipt failure signature differs from its canonical envelope"
+        )
+    return envelope
 
 
 _RUN_TRANSITIONS: dict[RunStatus, frozenset[RunStatus]] = {
