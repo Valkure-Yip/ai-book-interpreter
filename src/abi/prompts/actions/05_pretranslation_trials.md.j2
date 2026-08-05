@@ -21,8 +21,7 @@ Then write `qa/pretranslation/pretranslation_report.md` with an overall
 conclusion line `result: PASS` or `result: FAIL`, and refine `style_profile.md`
 with anything learned.
 
-Gate: call `record_gate('pretranslation', 'PASS')` ONLY if the report concludes
-PASS, then `set_state` -> `PRETRANSLATION_PASS`. If FAIL, record the gate as FAIL,
-revise the trials, and retry — do NOT proceed to translation.
+If the report concludes FAIL, revise the trials and retry. Do NOT proceed to
+translation. Only the controller records the deterministic gate decision.
 
 Exit condition: report concludes PASS, gate recorded PASS, state PRETRANSLATION_PASS.

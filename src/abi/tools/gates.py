@@ -10,6 +10,7 @@ from __future__ import annotations
 from pydantic import Field
 
 from abi.tools.context import ToolContext
+from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
 from abi.types.tools import ToolBinding
 
@@ -42,14 +43,31 @@ class CreateReleaseInput(FrozenModel):
     version: str = Field(default="", description="Optional explicit release version.")
 
 
-def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
+def make_gate_tools(
+    ctx: ToolContext,
+    *,
+    permissions: ActionPathPermissions | None = None,
+) -> list[ToolBinding]:
     project = ctx.project
+
+    def require_read(path: str) -> None:
+        if permissions is not None and not permissions.can_read(path):
+            raise PermissionError(
+                f"this Action is not allowed to read {path!r}; declare it in read_set"
+            )
+
+    def require_write(path: str) -> None:
+        if permissions is not None and not permissions.can_write(path):
+            raise PermissionError(
+                f"this Action is not allowed to write {path!r}; declare it in write_set"
+            )
 
     def publication_lint() -> str:
         """Run the publication-text lint over frontmatter/chapters/final/metadata.
 
         Writes output/publication_lint.json. Returns PASS or FAIL + hard errors.
         """
+        require_write("output/publication_lint.json")
         from abi.epub.lint import publication_lint as _lint
 
         res = _lint(project)
@@ -60,6 +78,7 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
 
         Writes output/asset_manifest_check.json. Returns PASS or FAIL.
         """
+        require_write("output/asset_manifest_check.json")
         from abi.epub.assets import asset_manifest_check as _check
 
         res = _check(project)
@@ -70,6 +89,7 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
 
         chapter_slugs: comma-separated NNN_slug stems; empty = first chapter.
         """
+        require_write("preproduction/stage2_sample/sample_book.epub")
         from abi.epub.build import build_sample_epub as _build
 
         slugs = [s.strip() for s in chapter_slugs.split(",") if s.strip()]
@@ -78,6 +98,7 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def build_epub() -> str:
         """Build the full EPUB from chapters/final/ into output/book.epub."""
+        require_write("output/book.epub")
         from abi.epub.build import build_epub as _build
 
         res = _build(project)
@@ -85,6 +106,8 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def epubcheck(epub_path: str = "output/book.epub") -> str:
         """Run EPUBCheck on the given EPUB (needs Java). Writes output/epubcheck.json."""
+        require_read(epub_path)
+        require_write("output/epubcheck.json")
         from abi.epub.epubcheck import run_epubcheck
 
         res = run_epubcheck(project, ctx.resolve(epub_path))
@@ -98,6 +121,7 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
         Creates reviews/random_spotcheck/round_XXX/ with seed, manifest, strata,
         and per-agent sample lists. Returns the new round directory.
         """
+        require_write("reviews/random_spotcheck")
         from abi.qa.sampler import select_random_review_passages as _select
 
         res = _select(
@@ -114,6 +138,7 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
         Enforces release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
         Writes validation_report.json. Returns PASS or FAIL.
         """
+        require_write("reviews/random_spotcheck")
         from abi.qa.validator import validate_random_spotcheck as _validate
 
         res = _validate(project, require_pass=require_pass)
@@ -124,6 +149,13 @@ def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
 
         Refuses unless the latest random spot-check validation PASSed.
         """
+        if permissions is not None and not (
+            permissions.can_write("output/release")
+            or permissions.can_write("output/private_artifacts")
+        ):
+            raise PermissionError(
+                "this Action is not allowed to create a release; declare its output directory"
+            )
         from abi.release.create import create_release as _create
 
         res = _create(project, version=version or None)

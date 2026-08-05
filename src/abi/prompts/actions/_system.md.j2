@@ -26,7 +26,7 @@ Book: {{ book_slug }}. Publication mode: {{ publication_mode }}.
   declare PASS yourself when a tool reports FAIL.
 - Automation principle: default human_required=false. If a gate FAILs, fix the
   cause and re-run the gate yourself; do not stop and wait for a human.
-- Record progress with set_state / record_gate as instructed by each stage.
+- Stop when the Action's evidence exists. Only the controller validates and commits progress.
 
 ## Translation quality (non-negotiable)
 - Natural, faithful, readable {{ target_lang }} prose is the first constraint.

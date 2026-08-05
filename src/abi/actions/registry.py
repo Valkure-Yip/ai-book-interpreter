@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Collection, Mapping
 
 from pydantic import ValidationError
 
 from abi.actions.contracts import ActionDefinition, ActionValidator, ResolvedAction
 from abi.actions.predicates import PredicateCatalog, PredicateConfigurationError
+from abi.project.artifact_paths import canonical_artifact_key
 from abi.types._base import FrozenModel
-from abi.types.orchestration import ActionArgument, EligibleAction, RunSnapshot
+from abi.types.orchestration import ActionArgument, ActionSpec, EligibleAction, RunSnapshot
 from abi.types.tools import ToolBinding
 
 
@@ -58,6 +60,12 @@ class ActionRegistry:
 
     def contains(self, capability: str) -> bool:
         return capability in self._definitions
+
+    def specs(self) -> tuple[ActionSpec, ...]:
+        """Return the immutable registered specs in stable capability order."""
+        return tuple(
+            self._definitions[capability].spec for capability in sorted(self._definitions)
+        )
 
     def validate_startup(self) -> None:
         for definition in self._definitions.values():
@@ -111,6 +119,19 @@ class ActionRegistry:
 
     def _validate_definition(self, definition: ActionDefinition) -> None:
         spec = definition.spec
+        if re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", spec.capability) is None:
+            raise RegistryConfigurationError(
+                f"capability {spec.capability!r} must use a portable lowercase ASCII namespace; "
+                "rename the capability before startup"
+            )
+        for access_path in (*spec.read_set, *spec.write_set):
+            try:
+                canonical_artifact_key(access_path)
+            except ValueError as exc:
+                raise RegistryConfigurationError(
+                    f"access path {access_path!r} for {spec.capability} must use a portable "
+                    "lowercase ASCII namespace; correct the ActionSpec before startup"
+                ) from exc
         if not issubclass(definition.input_model, FrozenModel):
             raise RegistryConfigurationError(
                 f"input model for {spec.capability} must inherit FrozenModel; use a frozen schema"

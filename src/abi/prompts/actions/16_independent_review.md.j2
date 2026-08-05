@@ -7,10 +7,8 @@ Spawn two independent reviewers over the finished book (separate from 16a):
   writes `reviews/agent_b/review.md` with scores and PASS/FAIL.
 
 If either FAILs, write `reviews/revision_route.md` routing the problem to the
-correct earlier stage, fix, and re-review. Do not explain-away findings.
+correct repair capability and return repair-required. Reviewers must not edit
+canonical translation or output artifacts. Do not explain-away findings.
 
-When both reviews exist and conclude PASS, call
-`record_gate('independent_review', 'PASS')` then `set_state` ->
-`INDEPENDENT_REVIEW_PASS`, step `16_independent_review_agents`.
-
-Exit condition: both reviews PASS; gate + state set.
+Exit condition: both reviews PASS. Stop for controller validation; do not modify
+gate or control state.

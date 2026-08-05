@@ -18,7 +18,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from abi.project.state import Status
 
-STAGES_DIR = Path(__file__).resolve().parent / "stages"
+STAGES_DIR = Path(__file__).resolve().parent / "actions"
 
 ToolProfile = Literal["authoring", "production", "review"]
 

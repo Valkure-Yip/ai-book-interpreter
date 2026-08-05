@@ -3,7 +3,7 @@
 Follow `skills/expert-translation-quality/SKILL.md` and
 `skills/translation-quality-defect-families/SKILL.md`.
 
-For EACH translated chapter, run a FULL-CHAPTER (not sampled) post-translation
+For EACH authorized translated chapter, run a FULL-CHAPTER (not sampled) post-translation
 control and write `qa/chapter_controls/{NNN_slug}.control.md`. The check must cover
 body text, notes, terminology, reader-facing wording, readability, polish,
 plain-language clarity (without flattening specialist quality), title handling,
@@ -25,8 +25,5 @@ expert_translation_skill_used: true
 polysemy_unresolved_count: 0
 ```
 
-When every translated chapter has a zero-issue PASS control file, call
-`record_gate('chapter_controls', 'PASS')` then `set_state` ->
-`CHAPTER_POST_CONTROL_PASS`, step `08a_chapter_post_translation_control`.
-
-Exit condition: all control files are zero-issue PASS; gate + state set.
+Exit condition: every authorized chapter has a zero-issue PASS control file.
+Stop for controller validation; do not modify gate or control state.

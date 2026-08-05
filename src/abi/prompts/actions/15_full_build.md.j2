@@ -10,7 +10,6 @@ Build the full book only after the sample PASSed.
 4. Call `epubcheck` on `output/book.epub`. Fix any fatal/error and rebuild.
 
 When publication lint + asset manifest + EPUBCheck all pass and `output/book.epub`
-exists, call `record_gate('epub_build', 'PASS')` then `set_state` -> `EPUB_BUILT`,
-step `15_full_book_production`.
+exists, stop for controller validation. Do not modify gate or control state.
 
 Exit condition: output/book.epub exists; lint + assets + EPUBCheck all clean.

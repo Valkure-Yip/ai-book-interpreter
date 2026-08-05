@@ -10,8 +10,7 @@ Build a sample-chapter EPUB and validate it before the full book.
    (EPUBCheck result, cover, fonts, figure/table handling, nav labels) and a final
    `sample_review_status: PASS` or `FAIL`.
 
-If anything FAILs, fix the spec/frontmatter/assets and rebuild. On PASS, call
-`record_gate('sample', 'PASS')` then `set_state` -> `PREPRODUCTION_SAMPLE_PASS`,
-step `14_preproduction_stage2_sample`.
+If anything FAILs, fix the spec/frontmatter/assets and rebuild. Only the
+controller records the deterministic PASS decision.
 
 Exit condition: sample EPUB built, EPUBCheck clean, sample_review_status PASS.

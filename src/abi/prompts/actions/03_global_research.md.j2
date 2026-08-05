@@ -9,8 +9,5 @@ register, sentence-flow strategy, punctuation/typography rules, name handling,
 and terminology-presentation rules (no source-term parentheses in body text for
 ordinary nouns).
 
-Then call `set_state` with status `GLOBAL_RESEARCH_DONE`, step
-`03_global_translation_research`.
-
-Exit condition: `qa/benchmark/global_research_ack.md` exists and state is
-GLOBAL_RESEARCH_DONE.
+Exit condition: `qa/benchmark/global_research_ack.md` exists. Stop and let the
+controller validate and commit the evidence.

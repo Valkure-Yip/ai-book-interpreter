@@ -14,6 +14,7 @@ from pydantic import Field
 
 from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
+from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
 from abi.types.tools import ToolBinding
 
@@ -27,7 +28,11 @@ class SpawnReviewAgentInput(FrozenModel):
     )
 
 
-def make_subagent_tools(ctx: ToolContext) -> list[ToolBinding]:
+def make_subagent_tools(
+    ctx: ToolContext,
+    *,
+    permissions: ActionPathPermissions | None = None,
+) -> list[ToolBinding]:
     async def spawn_review_agent(
         agent_label: str,
         instructions: str,
@@ -48,7 +53,7 @@ def make_subagent_tools(ctx: ToolContext) -> list[ToolBinding]:
             "rationale. Be strict: any single item <80 or any P0/P1/P2 is a FAIL."
         )
         # Read-only-ish subset: fs tools (the reviewer writes only its own report).
-        tools = make_fs_tools(ctx)
+        tools = make_fs_tools(ctx, permissions=permissions)
         from abi.providers.agent_runtime import AgentActionRequest, CheckpointResume
 
         thread_id = resume_thread_id or f"review_{agent_label}_{uuid.uuid4().hex}"

@@ -1,6 +1,6 @@
 # Stage 11 — Chapter reviews + quality gate (GATE)
 
-For each chapter, run the three reviews and the gate, then promote to final.
+For each authorized chapter, run the three reviews and the gate, then promote to final.
 
 1. Fidelity review -> `qa/fidelity/{NNN_slug}.md` (meaning, tone, no add/drop).
 2. Readability + imagery review -> `qa/readability/{NNN_slug}.md` and
@@ -12,8 +12,5 @@ For each chapter, run the three reviews and the gate, then promote to final.
    reviews pass. On PASS, copy the chapter to `chapters/final/{NNN_slug}.md`
    (apply the title policy: produce nav_label / page_title / subtitle).
 
-When every chapter has a PASS gate and a `chapters/final/` file, call
-`record_gate('chapter_gates', 'PASS')` then `set_state` -> `CHAPTER_GATES_PASS`,
-step `11_chapter_quality_gate`.
-
 Exit condition: all chapters reviewed, gated PASS, and present in chapters/final/.
+Stop for controller validation; do not modify gate or control state.

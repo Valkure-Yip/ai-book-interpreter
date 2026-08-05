@@ -7,6 +7,7 @@ import re
 from pydantic import Field
 
 from abi.tools.context import ToolContext
+from abi.tools.permissions import ActionPathPermissions
 from abi.types._base import FrozenModel
 from abi.types.tools import ToolBinding
 
@@ -46,9 +47,30 @@ class GrepInput(FrozenModel):
     path_glob: str = Field(default="**/*.md", description="Files to search.")
 
 
-def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
+def make_fs_tools(
+    ctx: ToolContext,
+    *,
+    permissions: ActionPathPermissions | None = None,
+) -> list[ToolBinding]:
+    def require_read(path: str) -> None:
+        if permissions is not None and not permissions.can_read(path):
+            raise PermissionError(
+                f"this Action is not allowed to read {path!r}; use a declared read_set path"
+            )
+
+    def require_write(path: str) -> None:
+        if permissions is not None and not permissions.can_write(path):
+            raise PermissionError(
+                f"this Action is not allowed to write {path!r}; use a declared write_set path"
+            )
+
+    def safe_glob(pattern: str) -> bool:
+        parts = pattern.replace("\\", "/").split("/")
+        return bool(pattern) and not pattern.startswith("/") and ".." not in parts
+
     def read_file(path: str) -> str:
         """Read a UTF-8 text file inside the project. Path is project-relative."""
+        require_read(path)
         p = ctx.resolve(path)
         if not p.exists():
             return f"ERROR: file not found: {path}"
@@ -63,6 +85,7 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def write_file(path: str, content: str) -> str:
         """Create or overwrite a project-relative text file (creates parent dirs)."""
+        require_write(path)
         p = ctx.resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -71,6 +94,7 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def append_file(path: str, content: str) -> str:
         """Append text to a project-relative file (creates it if missing)."""
+        require_write(path)
         p = ctx.resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
@@ -79,6 +103,8 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def edit_file(path: str, old_string: str, new_string: str) -> str:
         """Replace the first occurrence of old_string with new_string in a file."""
+        require_read(path)
+        require_write(path)
         p = ctx.resolve(path)
         if not p.exists():
             return f"ERROR: file not found: {path}"
@@ -90,6 +116,13 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def list_dir(path: str = ".") -> str:
         """List entries of a project-relative directory."""
+        if permissions is not None:
+            normalized = path.rstrip("/")
+            visible_roots = (*permissions.read_dirs, *permissions.write_dirs)
+            if normalized not in visible_roots:
+                raise PermissionError(
+                    f"this Action is not allowed to list {path!r}; use a declared read_set path"
+                )
         p = ctx.resolve(path)
         if not p.exists():
             return f"ERROR: not found: {path}"
@@ -103,11 +136,24 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
 
     def glob(pattern: str) -> str:
         """Glob project files, e.g. 'chapters/final/*.md'. Returns relative paths."""
-        matches = sorted(ctx.project.rel(p) for p in ctx.project.root.glob(pattern) if p.is_file())
+        if not safe_glob(pattern):
+            raise PermissionError(
+                f"this Action is not allowed to glob {pattern!r}; use a project-relative pattern"
+            )
+        matches = sorted(
+            ctx.project.rel(p)
+            for p in ctx.project.root.glob(pattern)
+            if p.is_file()
+            and (permissions is None or permissions.can_read(ctx.project.rel(p)))
+        )
         return "\n".join(matches) if matches else "(no matches)"
 
     def grep(pattern: str, path_glob: str = "**/*.md") -> str:
         """Regex-search project files matching path_glob. Returns 'file:line: text'."""
+        if not safe_glob(path_glob):
+            raise PermissionError(
+                f"this Action is not allowed to grep {path_glob!r}; use a project-relative pattern"
+            )
         try:
             rx = re.compile(pattern)
         except re.error as exc:
@@ -115,6 +161,9 @@ def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
         out: list[str] = []
         for p in sorted(ctx.project.root.glob(path_glob)):
             if not p.is_file():
+                continue
+            relpath = ctx.project.rel(p)
+            if permissions is not None and not permissions.can_read(relpath):
                 continue
             try:
                 for i, line in enumerate(

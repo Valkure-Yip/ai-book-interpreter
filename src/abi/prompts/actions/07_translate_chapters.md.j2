@@ -1,6 +1,7 @@
 # Stage 07 — Translate chapters (slim calls)
 
-Translate every `chapters/src/{NNN_slug}.md` into `chapters/translated/{NNN_slug}.md`.
+Translate only the explicit chapter tuple authorized in this Action into matching
+`chapters/translated/{NNN_slug}.md` files.
 
 For each not-yet-translated chapter, in order:
 1. Read the source chapter.
@@ -12,10 +13,8 @@ For each not-yet-translated chapter, in order:
    no QA notes, no explanations, no source-term parentheses for ordinary nouns.
 4. Write `chapters/translated/{NNN_slug}.md`.
 
-Process chapters one at a time. Use `glob chapters/src/*.md` and
-`glob chapters/translated/*.md` to track progress.
+Process the authorized chapters one at a time. Do not read or write chapters
+outside this Action's path permissions.
 
-When all chapters in `chapters/src/` have a counterpart in `chapters/translated/`,
-call `set_state` -> `TRANSLATED`, step `07_translate_chapters`.
-
-Exit condition: every source chapter has a translated counterpart; state TRANSLATED.
+Exit condition: every authorized source chapter has a translated counterpart.
+Stop for controller validation; do not modify control state.

@@ -13,16 +13,13 @@ Read `references/stratified_random_spotcheck.md`.
    `{"average_score": .., "lowest_score": .., "open_p0_p1_p2": 0, "confidence": 0.0-1.0,
    "samples": [{"unit_id": "..", "score": .., "priority": "", "rework": false}]}`.
    The two agents must not see each other.
-3. If any issue is found, treat it as a defect family: do a book-wide similar-issue
-   audit (low-token first: grep, glossary, forbidden renderings), fix all hits,
-   and record it in `round_XXX/fixes/fix_log.md` +
-   `round_XXX/verification/closure_check.md` (including the skill backfill fields).
-   Then rebuild and resample with a NEW seed.
+3. If any issue is found, treat it as a defect family: record the evidence and a
+   book-wide audit route under the round directory, then return a repair-required
+   outcome. Reviewers must not edit canonical translation or output artifacts.
 4. Call `validate_random_spotcheck(require_pass=true)`. It enforces
    release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
 
-On validator PASS, call `record_gate('random_spotcheck', 'PASS')` then `set_state`
--> `RANDOM_SPOTCHECK_PASS`, step `16a_stratified_random_spotcheck`. On FAIL, fix
-and loop.
+On validator FAIL, fix and loop. On PASS, stop for controller validation; do not
+modify gate or control state.
 
-Exit condition: validator PASS, gate + state set.
+Exit condition: validator PASS.
