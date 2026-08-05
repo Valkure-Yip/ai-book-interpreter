@@ -471,7 +471,15 @@ async def test_real_source_ingest_writes_and_validates_only_attempt_staging(
     project = BookProject(tmp_path)
     project.source_raw.parent.mkdir(parents=True)
     project.source_raw.write_text("Chapter 1\n\nA source paragraph.", encoding="utf-8")
-    registry = build_action_registry()
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    registry = build_action_registry(
+        tool_context=ToolContext(
+            project=project,
+            services=SimpleNamespace(),  # type: ignore[arg-type]
+            run_id="run-1",
+            get_run_snapshot=lambda: snapshot,
+        )
+    )
     definition = registry.get("source.ingest")
     result = await definition.executor(
         ActionExecutionContext(
@@ -479,7 +487,7 @@ async def test_real_source_ingest_writes_and_validates_only_attempt_staging(
             run_id="run-1",
             action_id="ingest-1",
             attempt=1,
-            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            snapshot=snapshot,
         ),
         SourceIngestInput(),
     )
@@ -500,13 +508,22 @@ async def test_source_split_writes_only_its_exact_staged_toc(tmp_path: Path) -> 
     project = BookProject(tmp_path)
     project.source_raw.parent.mkdir(parents=True)
     project.source_raw.write_text("Chapter 1\n\nA source paragraph.", encoding="utf-8")
-    result = await build_action_registry().get("source.split").executor(
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    registry = build_action_registry(
+        tool_context=ToolContext(
+            project=project,
+            services=SimpleNamespace(),  # type: ignore[arg-type]
+            run_id="run-1",
+            get_run_snapshot=lambda: snapshot,
+        )
+    )
+    result = await registry.get("source.split").executor(
         ActionExecutionContext(
             project=project,
             run_id="run-1",
             action_id="split-1",
             attempt=1,
-            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            snapshot=snapshot,
         ),
         SourceSplitInput(
             refine_toc=False,

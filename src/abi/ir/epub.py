@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -87,3 +88,11 @@ def parse_epub(path: Path) -> tuple[list[RawBlock], dict[str, str]]:
             _process_node(body, all_blocks)
 
     return all_blocks, metadata
+
+
+def parse_epub_bytes(data: bytes) -> tuple[list[RawBlock], dict[str, str]]:
+    """Parse already-authorized EPUB bytes through a private immutable copy."""
+    with tempfile.NamedTemporaryFile(suffix=".epub") as handle:
+        handle.write(data)
+        handle.flush()
+        return parse_epub(Path(handle.name))

@@ -32,6 +32,7 @@ def scaffold_without_ledger(tmp_path: Path) -> BookProject:
     for directory in (
         project.chapters_src,
         project.chapters_translated,
+        project.chapters_controlled,
         project.chapters_final,
         project.root / "qa/chapter_controls",
         project.root / "qa/gates",
@@ -159,6 +160,70 @@ def test_chapter_validator_checks_only_requested_chapters(tmp_path: Path) -> Non
     two = validate_evidence("chapter.translate", two_view, two_parameters, two_bundle)
     assert one.passed is True
     assert two.passed is False
+
+
+@pytest.mark.parametrize(
+    ("controlled_text", "report_text", "expected_pass"),
+    (
+        (
+            "",
+            """scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+""",
+            False,
+        ),
+        (
+            "Substantive controlled translation.",
+            """scope: FULL_CHAPTER
+issues_found: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+""",
+            False,
+        ),
+        (
+            "Substantive controlled translation.",
+            """scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+""",
+            True,
+        ),
+    ),
+)
+def test_chapter_control_requires_substantive_revision_and_complete_pass_report(
+    tmp_path: Path,
+    controlled_text: str,
+    report_text: str,
+    expected_pass: bool,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    parameters = ChapterBatchInput(chapters=("001",))
+    (project.chapters_controlled / "001.md").write_text(
+        controlled_text, encoding="utf-8"
+    )
+    (project.root / "qa/chapter_controls/001.control.md").write_text(
+        report_text, encoding="utf-8"
+    )
+    view, bundle = _validator_input(
+        project, "chapter.control", parameters, action_id="control-001"
+    )
+
+    decision = validate_evidence("chapter.control", view, parameters, bundle)
+
+    assert decision.passed is expected_pass
 
 
 def test_every_builtin_capability_has_an_exhaustive_validator(tmp_path: Path) -> None:

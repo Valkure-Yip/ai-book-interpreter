@@ -142,7 +142,11 @@ def _try_two_line_heading(
 
 def parse_txt(path: Path) -> list[RawBlock]:
     """Parse a TXT file into a flat list of RawBlocks (heading + prose + code/quote)."""
-    data = path.read_bytes()
+    return parse_txt_bytes(path.read_bytes())
+
+
+def parse_txt_bytes(data: bytes) -> list[RawBlock]:
+    """Parse already-authorized TXT bytes without reopening a mutable path."""
     encoding = _detect_encoding(data)
     text = data.decode(encoding, errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n")

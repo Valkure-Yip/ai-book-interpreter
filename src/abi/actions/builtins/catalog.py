@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
 
 from abi.actions.builtins.inputs import (
@@ -405,60 +405,21 @@ def _declared_tools() -> dict[str, ToolBinding]:
 
 
 def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPermissions:
-    item = _BY_CAPABILITY[capability]
-    read_dirs = list(item.read_set)
-    write_dirs = list(item.write_set)
-    read_files: list[str] = []
-    write_files: list[str] = []
+    access = _access_for(capability, parameters)
 
-    if capability in {"chapter.translate", "chapter.control"}:
-        if not isinstance(parameters, ChapterBatchInput):
-            raise TypeError(f"{capability} requires ChapterBatchInput")
-        read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
-        write_dirs = [
-            path
-            for path in write_dirs
-            if not path.startswith("chapters/") and not path.startswith("qa/chapter_controls")
-        ]
-        for chapter in parameters.chapters:
-            read_files.append(f"chapters/src/{chapter}.md")
-            if capability == "chapter.control":
-                read_files.append(f"chapters/translated/{chapter}.md")
-                write_files.extend(
-                    (
-                        f"chapters/controlled/{chapter}.md",
-                        f"qa/chapter_controls/{chapter}.control.md",
-                    )
-                )
-            else:
-                write_files.append(f"chapters/translated/{chapter}.md")
-    elif capability == "chapter.review":
-        if not isinstance(parameters, ReviewBatchInput):
-            raise TypeError("chapter.review requires ReviewBatchInput")
-        read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
-        write_dirs = []
-        for chapter in parameters.chapters:
-            read_files.extend((f"chapters/src/{chapter}.md", f"chapters/controlled/{chapter}.md"))
-            write_files.extend(
-                (
-                    f"qa/fidelity/{chapter}.md",
-                    f"qa/readability/{chapter}.md",
-                    f"qa/imagery/{chapter}.imagery.md",
-                    f"qa/terminology/{chapter}.md",
-                    f"qa/gates/{chapter}.gate.md",
-                    f"chapters/final/{chapter}.md",
-                )
-            )
-    elif capability == "review.spotcheck":
-        if not isinstance(parameters, SpotcheckInput):
-            raise TypeError("review.spotcheck requires SpotcheckInput")
-        write_dirs = []
+    def split_paths(paths: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        files = tuple(path for path in paths if PurePosixPath(path).suffix)
+        directories = tuple(path for path in paths if not PurePosixPath(path).suffix)
+        return files, directories
+
+    read_files, read_dirs = split_paths(access.read_set)
+    write_files, write_dirs = split_paths(access.write_set)
 
     return ActionPathPermissions(
-        read_files=tuple(read_files),
-        read_dirs=tuple(read_dirs),
-        write_files=tuple(write_files),
-        write_dirs=tuple(write_dirs),
+        read_files=read_files,
+        read_dirs=read_dirs,
+        write_files=write_files,
+        write_dirs=write_dirs,
     )
 
 
@@ -532,8 +493,9 @@ def build_action_envelope(capability: str, parameters: FrozenModel) -> ActionEnv
     permissions = _permissions_for(capability, parameters)
     gate_permissions = None
     if capability == "review.spotcheck":
-        gate_permissions = permissions.model_copy(
-            update={"write_dirs": ("reviews/random_spotcheck",)}
+        gate_permissions = permissions
+        permissions = permissions.model_copy(
+            update={"write_files": (), "write_dirs": ()}
         )
     return ActionEnvelope(
         capability=capability,
@@ -840,12 +802,20 @@ class DeterministicActionExecutor:
             if self._capability == "source.ingest":
                 if not isinstance(parameters, SourceIngestInput):
                     raise TypeError("source.ingest requires SourceIngestInput")
-                from abi.ir import ingest
+                from abi.ir import ingest_bytes
 
-                source_path = context.project.root / parameters.source_relpath
-                if not source_path.is_file():
-                    raise FileNotFoundError(f"source input {parameters.source_relpath} is missing")
-                book, warnings = ingest(source_path)
+                if (
+                    self._tool_context is None
+                    or self._tool_context.project.root != context.project.root
+                ):
+                    raise RuntimeError("source Action requires its bound ToolContext")
+                source_data = self._tool_context.read_authorized_bytes(
+                    parameters.source_relpath,
+                    _permissions_for(self._capability, parameters),
+                )
+                book, warnings = ingest_bytes(
+                    source_data, source_name=parameters.source_relpath
+                )
                 paragraphs = book.iter_paragraphs()
                 clean = "\n\n".join(
                     item.source_text for item in paragraphs if item.source_text.strip()
@@ -855,7 +825,7 @@ class DeterministicActionExecutor:
                     "format": book.meta.source_format,
                     "paragraphs": len(paragraphs),
                     "sections": len(book.toc),
-                    "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                    "sha256": hashlib.sha256(source_data).hexdigest(),
                     "source_file": parameters.source_relpath,
                     "source_language": book.meta.source_language,
                     "title": book.meta.title,
@@ -877,15 +847,26 @@ class DeterministicActionExecutor:
             elif self._capability == "source.split":
                 if not isinstance(parameters, SourceSplitInput):
                     raise TypeError("source.split requires SourceSplitInput")
-                from abi.ir import ingest
+                from abi.ir import ingest_bytes
                 from abi.ir.split import render_chapters
 
-                source_path = context.project.root / parameters.source_relpath
-                if not source_path.is_file():
-                    source_path = context.project.source_clean
-                if not source_path.is_file():
-                    raise FileNotFoundError("source input for source.split is missing")
-                book, _ = ingest(source_path)
+                if (
+                    self._tool_context is None
+                    or self._tool_context.project.root != context.project.root
+                ):
+                    raise RuntimeError("source Action requires its bound ToolContext")
+                permissions = _permissions_for(self._capability, parameters)
+                source_relpath = parameters.source_relpath
+                try:
+                    source_data = self._tool_context.read_authorized_bytes(
+                        source_relpath, permissions
+                    )
+                except FileNotFoundError:
+                    source_relpath = "source/source_text.txt"
+                    source_data = self._tool_context.read_authorized_bytes(
+                        source_relpath, permissions
+                    )
+                book, _ = ingest_bytes(source_data, source_name=source_relpath)
                 rendered = render_chapters(book)
                 entries = [entry for entry, _ in rendered]
                 actual_chapters = tuple(entry.slug for entry in entries)

@@ -137,15 +137,12 @@ def make_fs_tools(
                 raise PermissionError(
                     f"this Action is not allowed to list {path!r}; use a declared read_set path"
                 )
-        p = ctx.authorize_read_path(path, permissions)
-        if not p.exists():
+        try:
+            entries = ctx.list_authorized_directory(path, permissions)
+        except FileNotFoundError:
             return f"ERROR: not found: {path}"
-        if p.is_file():
-            return path
-        entries = []
-        for item in sorted(p.iterdir()):
-            suffix = "/" if item.is_dir() else ""
-            entries.append(item.name + suffix)
+        except NotADirectoryError:
+            return f"ERROR: {path} is not a directory"
         return "\n".join(entries) if entries else "(empty)"
 
     def glob(pattern: str) -> str:

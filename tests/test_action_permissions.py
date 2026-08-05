@@ -10,15 +10,17 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from abi.actions.builtins.catalog import build_action_envelope
+from abi.actions.builtins.catalog import build_action_envelope, build_action_registry
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
     ChapterBatchInput,
     EmptyInput,
     ReviewBatchInput,
     SourceIngestInput,
+    SourceSplitInput,
     SpotcheckInput,
 )
+from abi.actions.contracts import ActionExecutionContext
 from abi.actions.effects import expand_expected_artifacts
 from abi.project.artifacts import ArtifactStore
 from abi.project.layout import BookProject
@@ -27,7 +29,7 @@ from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
 from abi.tools.gates import make_gate_tools
 from abi.tools.permissions import ActionPathPermissions
-from abi.types.orchestration import RunSnapshot, RunStatus
+from abi.types.orchestration import RunSnapshot, RunStatus, Succeeded
 from abi.types.tools import GateRuntimeMetadata
 
 
@@ -51,6 +53,11 @@ def _secure_context(root: Path) -> ToolContext:
         run_id="run-1",
         get_run_snapshot=lambda: RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
     )
+
+
+def _source_outputs_exist(root: Path) -> bool:
+    project = BookProject(root)
+    return project.source_clean.exists() or project.source_manifest.exists()
 
 
 def test_action_receives_only_allowlisted_tools_and_paths() -> None:
@@ -139,6 +146,7 @@ def test_content_ingest_rejects_symlinked_source(tmp_path: Path) -> None:
 
     with pytest.raises(PermissionError, match="symlink"):
         ingest_source.callable()
+    assert not _source_outputs_exist(tmp_path)
 
 
 def test_permissioned_read_rejects_check_then_symlink_swap(
@@ -176,6 +184,130 @@ def test_permissioned_read_rejects_check_then_symlink_swap(
 
     with pytest.raises(PermissionError, match="symlink"):
         read_file.callable(path="references/allowed.txt")
+
+
+def test_permissioned_list_rejects_check_then_directory_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = tmp_path / "references"
+    metadata = tmp_path / "metadata"
+    references.mkdir()
+    metadata.mkdir()
+    (references / "public.txt").write_text("PUBLIC", encoding="utf-8")
+    (metadata / "secret.txt").write_text("SECRET", encoding="utf-8")
+    context = _secure_context(tmp_path)
+    real_authorize = context.authorize_read_path
+    swapped = False
+
+    def swap_after_check(
+        relpath: str, permissions: ActionPathPermissions | None
+    ) -> Path:
+        nonlocal swapped
+        candidate = real_authorize(relpath, permissions)
+        if not swapped:
+            references.rename(tmp_path / "original-references")
+            references.symlink_to(metadata, target_is_directory=True)
+            swapped = True
+        return candidate
+
+    monkeypatch.setattr(context, "authorize_read_path", swap_after_check)
+    list_dir = next(
+        tool
+        for tool in make_fs_tools(
+            context,
+            permissions=ActionPathPermissions(read_dirs=("references",)),
+        )
+        if tool.name == "list_dir"
+    )
+
+    with pytest.raises(PermissionError, match="symlink"):
+        list_dir.callable(path="references")
+
+
+def test_content_ingest_rejects_check_then_source_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    metadata = tmp_path / "metadata"
+    source.mkdir()
+    metadata.mkdir()
+    original = source / "source_text_raw.txt"
+    original.write_text("PUBLIC SOURCE", encoding="utf-8")
+    secret = metadata / "secret.txt"
+    secret.write_text("SECRET SOURCE", encoding="utf-8")
+    context = _secure_context(tmp_path)
+    real_authorize = context.authorize_read_path
+    swapped = False
+
+    def swap_after_check(
+        relpath: str, permissions: ActionPathPermissions | None
+    ) -> Path:
+        nonlocal swapped
+        candidate = real_authorize(relpath, permissions)
+        if not swapped and relpath == "source/source_text_raw.txt":
+            original.unlink()
+            original.symlink_to(secret)
+            swapped = True
+        return candidate
+
+    monkeypatch.setattr(context, "authorize_read_path", swap_after_check)
+    parameters = SourceIngestInput()
+    ingest_source = next(
+        tool
+        for tool in make_content_tools(
+            context,
+            permissions=build_action_envelope("source.ingest", parameters).permissions,
+        )
+        if tool.name == "ingest_source"
+    )
+
+    with pytest.raises(PermissionError, match="symlink"):
+        ingest_source.callable()
+    assert not _source_outputs_exist(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "parameters"),
+    (
+        ("source.ingest", SourceIngestInput()),
+        (
+            "source.split",
+            SourceSplitInput(
+                refine_toc=False, expected_chapters=("001_chapter_1",)
+            ),
+        ),
+    ),
+)
+async def test_deterministic_source_executor_rejects_symlinked_input(
+    tmp_path: Path, capability: str, parameters: object
+) -> None:
+    source = tmp_path / "source"
+    metadata = tmp_path / "metadata"
+    source.mkdir()
+    metadata.mkdir()
+    secret = metadata / "secret.txt"
+    secret.write_text(
+        "Chapter 1\n\nSECRET confidential paragraph.\n", encoding="utf-8"
+    )
+    (source / "source_text_raw.txt").symlink_to(secret)
+    context = _secure_context(tmp_path)
+
+    result = await build_action_registry(tool_context=context).get(capability).executor(
+        ActionExecutionContext(
+            project=context.project,
+            run_id="run-1",
+            action_id=capability.replace(".", "-"),
+            snapshot=context.get_run_snapshot(),
+        ),
+        parameters,  # type: ignore[arg-type]
+    )
+
+    assert not isinstance(result.outcome, Succeeded)
+    staged = tmp_path / "state/staging" / capability.replace(".", "-") / "1"
+    assert not any(
+        b"SECRET" in path.read_bytes() for path in staged.rglob("*") if path.is_file()
+    )
 
 
 def test_secure_read_fails_closed_without_no_follow_capability(

@@ -406,11 +406,31 @@ def _chapter_control(
     if not result.passed or not isinstance(parameters, ChapterBatchInput):
         return result
     for chapter in parameters.chapters:
+        controlled_path = f"chapters/controlled/{chapter}.md"
+        controlled = view.read_text(controlled_path)
+        if not controlled.strip() or not any(char.isalnum() for char in controlled):
+            return _decision(
+                view,
+                passed=False,
+                reason_code="chapter_control_revision_invalid",
+                message=f"Controlled revision {controlled_path} must be substantive.",
+                validator_id="chapter.control",
+            )
         text = view.read_text(f"qa/chapter_controls/{chapter}.control.md")
-        if not all(re.search(rf"(?im)^\s*{field}\s*:\s*{value}\s*$", text) for field, value in {
-            "scope": "FULL_CHAPTER", "issues_found": "0", "unresolved_blocking_issues": "0",
-            "latest_round_status": "PASS", "allow_next_chapter": "true",
-        }.items()):
+        required_fields = {
+            "scope": "FULL_CHAPTER",
+            "issues_found": "0",
+            "fixes_applied": "0",
+            "unresolved_blocking_issues": "0",
+            "latest_round_status": "PASS",
+            "allow_next_chapter": "true",
+            "expert_translation_skill_used": "true",
+            "polysemy_unresolved_count": "0",
+        }
+        if not all(
+            re.search(rf"(?im)^\s*{field}\s*:\s*{value}\s*$", text)
+            for field, value in required_fields.items()
+        ):
             return _decision(
                 view, passed=False, reason_code="chapter_control_not_passed",
                 message="Chapter control must record a zero-issue PASS.",

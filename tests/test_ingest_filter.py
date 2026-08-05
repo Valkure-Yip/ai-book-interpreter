@@ -6,11 +6,14 @@ depending on a real EPUB fixture (which would be slow and version-fragile).
 
 from __future__ import annotations
 
+import importlib
+import stat
 from pathlib import Path
 
 import pytest
+from ebooklib import epub as ebook_epub
 
-from abi.ir import ingest
+from abi.ir import ingest, ingest_bytes
 
 
 def _write(tmp: Path, name: str, body: str) -> Path:
@@ -127,3 +130,45 @@ def test_each_canonical_non_content_heading_is_dropped(tmp_path: Path, heading: 
     p = _write(tmp_path, f"book_{heading}.txt", body)
     book, _ = ingest(p)
     assert heading.upper() not in [s.heading for s in book.toc]
+
+
+def test_epub_authorized_bytes_temp_is_private_and_unlinked_on_success_and_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "fixture.epub"
+    fixture = ebook_epub.EpubBook()
+    fixture.set_identifier("fixture")
+    fixture.set_title("Fixture")
+    fixture.set_language("en")
+    chapter = ebook_epub.EpubHtml(
+        title="Chapter 1", file_name="chapter.xhtml", lang="en"
+    )
+    chapter.content = "<h1>Chapter 1</h1><p>Body text.</p>"
+    fixture.add_item(chapter)
+    fixture.add_item(ebook_epub.EpubNcx())
+    fixture.add_item(ebook_epub.EpubNav())
+    fixture.spine = ["nav", chapter]
+    ebook_epub.write_epub(source, fixture)
+
+    parser_module = importlib.import_module("abi.ir.epub")
+    real_named_tempfile = parser_module.tempfile.NamedTemporaryFile
+    observed: list[tuple[Path, int]] = []
+
+    def tracking_named_tempfile(*args: object, **kwargs: object) -> object:
+        handle = real_named_tempfile(*args, **kwargs)
+        path = Path(handle.name)
+        observed.append((path, stat.S_IMODE(path.stat().st_mode)))
+        return handle
+
+    monkeypatch.setattr(
+        parser_module.tempfile, "NamedTemporaryFile", tracking_named_tempfile
+    )
+
+    book, _ = ingest_bytes(source.read_bytes(), source_name="source/fixture.epub")
+    assert book.meta.title == "Fixture"
+    with pytest.raises(ebook_epub.EpubException):
+        ingest_bytes(b"not-an-epub", source_name="source/broken.epub")
+
+    assert len(observed) == 2
+    assert all(mode == 0o600 for _, mode in observed)
+    assert all(not path.exists() for path, _ in observed)

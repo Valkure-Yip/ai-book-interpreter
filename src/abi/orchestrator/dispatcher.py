@@ -83,6 +83,14 @@ class Dispatcher:
             resolved = self._registry.resolve_json(
                 action.capability, durable_attempt.parameters_json
             )
+            current_access = self._registry.access_for(resolved)
+            if (
+                action.read_set != current_access.read_set
+                or action.write_set != current_access.write_set
+            ):
+                raise RegistryConfigurationError(
+                    "durable Action access differs from the current parameter expansion"
+                )
             context = ActionExecutionContext(
                 project=self._project,
                 run_id=run_id,

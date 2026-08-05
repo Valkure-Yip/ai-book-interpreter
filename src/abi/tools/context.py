@@ -112,3 +112,44 @@ class ToolContext:
                 os.close(file_fd)
             for directory_fd in reversed(directory_fds):
                 os.close(directory_fd)
+
+    def list_authorized_directory(
+        self, relpath: str, permissions: ActionPathPermissions | None
+    ) -> tuple[str, ...]:
+        """List one pinned directory without following a swapped path component."""
+        self.authorize_read_path(relpath, permissions)
+        required_flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+        missing = tuple(name for name in required_flags if not hasattr(os, name))
+        if missing:
+            raise PermissionError(
+                "platform lacks secure no-follow read capability: " + ", ".join(missing)
+            )
+        directory_flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+        directory_fds: list[int] = []
+        try:
+            directory_fds.append(os.open(self.project.root, directory_flags))
+            components = () if relpath in {"", "."} else tuple(relpath.split("/"))
+            for component in components:
+                directory_fds.append(
+                    os.open(component, directory_flags, dir_fd=directory_fds[-1])
+                )
+            entries: list[str] = []
+            for name in sorted(os.listdir(directory_fds[-1])):
+                mode = os.stat(
+                    name,
+                    dir_fd=directory_fds[-1],
+                    follow_symlinks=False,
+                ).st_mode
+                entries.append(name + ("/" if stat.S_ISDIR(mode) else ""))
+            return tuple(entries)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise PermissionError(
+                    f"permissioned read rejects symlink or changed path {relpath!r}"
+                ) from exc
+            raise
+        finally:
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)

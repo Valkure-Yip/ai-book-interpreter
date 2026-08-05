@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -43,6 +44,7 @@ from abi.project.run_ledger import (
 from abi.providers.observability.events import EventLogger
 from abi.providers.orchestration_runtime import DurableLoopRuntime
 from abi.providers.orchestration_runtime import runtime as loop_runtime_module
+from abi.tools.context import ToolContext
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionArgument,
@@ -645,6 +647,31 @@ async def test_dispatcher_rejects_mismatched_envelope_without_rebinding_identity
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_blocks_durable_access_drift_before_executor(
+    tmp_path: Path,
+) -> None:
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.access", (SuccessTemplate(),)),),
+        patches=(),
+    ) as rig:
+        action, snapshot = await _authorize_one(rig, "work.access")
+        drifted = action.model_copy(update={"read_set": ("unexpected",)})
+
+        envelope = await rig.dispatcher.execute(
+            run_id=rig.run_id,
+            action=drifted,
+            snapshot=snapshot,
+            attempt=1,
+        )
+
+        assert isinstance(envelope.outcome, RepairRequired)
+        assert envelope.outcome.repair_class == "integrity"
+        assert envelope.outcome.reason_code == "artifact_identity_conflict"
+        assert rig.executors["work.access"].attempt_ids == []
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_rejects_probe_resolution_from_non_probe(tmp_path: Path) -> None:
     """Catch an ordinary capability resolving an unrelated external operation."""
     async with _controller_rig(
@@ -1082,7 +1109,15 @@ async def test_real_source_ingest_stages_receipts_promotes_bundle_then_succeeds(
         encoding="utf-8",
     )
     project.run_db.parent.mkdir(parents=True, exist_ok=True)
-    registry = build_action_registry()
+    tool_snapshot = RunSnapshot(run_id="run-builtin", status=RunStatus.RUNNING)
+    registry = build_action_registry(
+        tool_context=ToolContext(
+            project=project,
+            services=SimpleNamespace(),  # type: ignore[arg-type]
+            run_id="run-builtin",
+            get_run_snapshot=lambda: tool_snapshot,
+        )
+    )
     async with RunLedger.open(project.run_db) as ledger:
         run_id = await ledger.create_run(RunSeed(run_id="run-builtin"))
         store = ArtifactStore(project, ledger)

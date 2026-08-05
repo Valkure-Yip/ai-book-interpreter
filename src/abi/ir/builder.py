@@ -6,10 +6,11 @@ import hashlib
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from abi.ir.blocks import RawBlock, block_kind_to_paragraph_kind
-from abi.ir.epub import parse_epub
-from abi.ir.txt import parse_txt
+from abi.ir.epub import parse_epub_bytes
+from abi.ir.txt import parse_txt_bytes
 from abi.types.book import Book, BookMeta, Paragraph, Section, SourceFormat
 from abi.types.ids import book_id, paragraph_id, section_id
 
@@ -66,7 +67,7 @@ def _build_sections(blocks: list[RawBlock]) -> tuple[list[Section], list[str]]:
     # Headings open new sections; prose goes into the deepest open section.
 
     # Use mutable dicts during build; convert to frozen Section at the end.
-    def new_section(level: int, heading: str, trail: list[str]) -> dict:
+    def new_section(level: int, heading: str, trail: list[str]) -> dict[str, Any]:
         return {
             "level": level,
             "heading": heading,
@@ -75,11 +76,17 @@ def _build_sections(blocks: list[RawBlock]) -> tuple[list[Section], list[str]]:
             "children": [],
         }
 
-    root: dict = {"level": 0, "heading": "", "trail": [], "paragraphs": [], "children": []}
-    stack: list[dict] = [root]
+    root: dict[str, Any] = {
+        "level": 0,
+        "heading": "",
+        "trail": [],
+        "paragraphs": [],
+        "children": [],
+    }
+    stack: list[dict[str, Any]] = [root]
     global_position = 0
 
-    def deepest() -> dict:
+    def deepest() -> dict[str, Any]:
         return stack[-1]
 
     # If file has no heading at all, create a synthetic chapter to host all prose.
@@ -113,7 +120,7 @@ def _build_sections(blocks: list[RawBlock]) -> tuple[list[Section], list[str]]:
             global_position += 1
 
     # Convert mutable dicts into frozen Section models.
-    def materialize(sec: dict) -> Section:
+    def materialize(sec: dict[str, Any]) -> Section:
         sid = section_id(sec["trail"])
         paragraphs: list[Paragraph] = []
         for raw, pos in sec["paragraphs"]:
@@ -152,14 +159,33 @@ def ingest(path: Path, *, title: str | None = None, authors: list[str] | None = 
     if not path.exists():
         raise FileNotFoundError(path)
 
-    fmt = _detect_format(path)
     data = path.read_bytes()
+    return ingest_bytes(
+        data,
+        source_name=path,
+        title=title,
+        authors=authors,
+        source_language=source_language,
+    )
+
+
+def ingest_bytes(
+    data: bytes,
+    *,
+    source_name: str | Path,
+    title: str | None = None,
+    authors: list[str] | None = None,
+    source_language: str | None = None,
+) -> tuple[Book, list[str]]:
+    """Parse authorized source bytes without reopening their mutable origin path."""
+    path = Path(source_name)
+    fmt = _detect_format(path)
 
     detected_meta: dict[str, str] = {}
     if fmt == "txt":
-        blocks = parse_txt(path)
+        blocks = parse_txt_bytes(data)
     elif fmt == "epub":
-        blocks, detected_meta = parse_epub(path)
+        blocks, detected_meta = parse_epub_bytes(data)
     else:
         raise NotImplementedError(f"format {fmt} not supported in v0.1")
 

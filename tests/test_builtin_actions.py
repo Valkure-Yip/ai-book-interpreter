@@ -136,6 +136,7 @@ def test_chapter_pipeline_uses_immutable_disjoint_revision_paths() -> None:
         "chapter.review", ReviewBatchInput(chapters=("001",))
     ).permissions
     assert control.can_read("chapters/translated/001.md")
+    assert not control.can_read("chapters/src/001.md")
     assert control.can_write("chapters/controlled/001.md")
     assert not control.can_write("chapters/translated/001.md")
     assert review.can_read("chapters/controlled/001.md")
@@ -193,18 +194,19 @@ async def test_source_action_executes_the_typed_source_path(tmp_path: Path) -> N
     alternate = project.root / "source/alternate.txt"
     alternate.parent.mkdir(parents=True)
     alternate.write_text("Chapter 1\n\nAlternate source.", encoding="utf-8")
-    tool_context = SimpleNamespace(
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
         project=project,
-        config=None,
-        services=SimpleNamespace(),
-        resolve=lambda relpath: (project.root / relpath).resolve(),
+        services=SimpleNamespace(),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
     )
-    registry = build_action_registry(tool_context=tool_context)  # type: ignore[arg-type]
+    registry = build_action_registry(tool_context=tool_context)
     result = await registry.get("source.ingest").executor(
         ActionExecutionContext(
             project=project,
             run_id="run-1",
-            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            snapshot=snapshot,
         ),
         SourceIngestInput(source_relpath="source/alternate.txt"),
     )
