@@ -847,6 +847,51 @@ async def test_api_status_errors_are_classified_by_http_status_without_body_leak
     assert secret not in result.outcome.message
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "status_code", "kind", "error_code"),
+    [
+        (
+            openai.BadRequestError,
+            500,
+            "retryable_failure",
+            "transient_provider_error",
+        ),
+        (
+            openai.RateLimitError,
+            400,
+            "permanent_failure",
+            "permanent_provider_error",
+        ),
+    ],
+)
+async def test_http_status_precedes_openai_exception_subclass_for_outcome_and_event(
+    tmp_path: Path,
+    error_type: type[Exception],
+    status_code: int,
+    kind: str,
+    error_code: str,
+) -> None:
+    secret = f"contradictory-secret-{status_code}"
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://provider.invalid/v1/chat"),
+    )
+    error = error_type(secret, response=response, body={"secret": secret})
+    runtime = _runtime(tmp_path, _ExplodingModel(error=error))
+
+    result = await runtime.run_action(_request(tmp_path))
+
+    assert result.outcome.kind == kind
+    assert result.outcome.error_code == error_code
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    events = [json.loads(line) for line in event_text.splitlines()]
+    failed_calls = [event for event in events if event["event"] == "agent.call"]
+    assert failed_calls[-1]["error_classification"] == error_code
+    assert secret not in event_text
+    assert secret not in result.outcome.message
+
+
 def test_action_request_rejects_duplicate_tool_names_before_checkpoint_work(
     tmp_path: Path,
 ) -> None:
@@ -898,10 +943,20 @@ def test_llm_callback_finalizes_each_run_id_only_once(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_checkpoint_resume_on_new_thread_returns_repair_instruction(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     model = _RecordingOutcomeModel(human_counts=[])
     runtime = _runtime(tmp_path, model)
+    real_create_agent = runner.create_agent
+    graph_creations = 0
+
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
 
     result = await runtime.run_action(
         _request(tmp_path, resume=runner.CheckpointResume())
@@ -911,6 +966,67 @@ async def test_checkpoint_resume_on_new_thread_returns_repair_instruction(
     assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
     assert "fresh" in result.outcome.message.lower()
     assert model.human_counts == []
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert graph_creations == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_side_effect_tool", [False, True])
+async def test_missing_hitl_resume_is_rejected_before_graph_model_or_tool_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_side_effect_tool: bool,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    real_create_agent = runner.create_agent
+    graph_creations = 0
+    handler_calls = 0
+
+    def tracked_create_agent(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_creations
+        graph_creations += 1
+        return real_create_agent(*args, **kwargs)
+
+    def deliver() -> str:
+        nonlocal handler_calls
+        handler_calls += 1
+        raise TimeoutError("must not execute")
+
+    monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
+    model: BaseChatModel
+    tools: tuple[ToolBinding, ...]
+    approval_tools: tuple[str, ...]
+    if with_side_effect_tool:
+        model = _SideEffectModel()
+        tools = (ToolBinding("deliver", "Side effect.", _NoopInput, deliver),)
+        approval_tools = ("deliver",)
+    else:
+        model = _ExplodingModel(error=AssertionError("model must not execute"))
+        tools = ()
+        approval_tools = ()
+    runtime = _runtime(tmp_path, model)
+    resume = runner.HitlResume(
+        decisions=(runner.HitlDecision(decision="approve"),)
+    )
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            tools=tools,
+            approval_tools=approval_tools,
+            side_effects=with_side_effect_tool,
+            resume=resume,
+        )
+    )
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
+    assert result.llm_calls == 0
+    assert result.tool_calls == 0
+    assert result.tool_log == ()
+    assert handler_calls == 0
+    assert graph_creations == 0
 
 
 @pytest.mark.asyncio

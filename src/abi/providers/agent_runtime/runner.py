@@ -112,16 +112,16 @@ def _estimate_text_tokens(text: str) -> int:
 
 
 def _provider_error_classification(error: BaseException) -> str:
-    if isinstance(error, BudgetExceeded):
-        return "budget"
-    if isinstance(error, TimeoutError):
-        return "provider_timeout"
     status_code = getattr(error, "status_code", None)
     if isinstance(status_code, int):
         if status_code == 429 or 500 <= status_code <= 599:
             return "transient_provider_error"
         if 400 <= status_code <= 499:
             return "permanent_provider_error"
+    if isinstance(error, BudgetExceeded):
+        return "budget"
+    if isinstance(error, TimeoutError):
+        return "provider_timeout"
     if isinstance(error, _PERMANENT_LLM_ERRORS):
         return "permanent_provider_error"
     if isinstance(error, _TRANSIENT_LLM_ERRORS):
@@ -327,50 +327,77 @@ class AgentRuntime:
             max_iterations=request.max_iterations,
         )
         try:
+            raw_result: dict[str, Any] | None = None
             async with AsyncSqliteSaver.from_conn_string(
                 str(request.checkpoint_path)
             ) as checkpointer:
-                agent = create_agent(
-                    model=self._get_model(),
-                    tools=[
-                        to_langchain_tool(tool, on_actual_start=callback.record_tool_start)
-                        for tool in request.tools
-                    ],
-                    system_prompt=request.system_prompt,
-                    response_format=ActionOutcomeEnvelope,
-                    checkpointer=checkpointer,
-                    name=request.agent_name,
-                    middleware=(
-                        [
-                            HumanInTheLoopMiddleware(
-                                interrupt_on={name: True for name in request.approval_tools}
-                            )
-                        ]
-                        if request.approval_tools
-                        else ()
-                    ),
-                )
-                graph_input: Any
-                if request.resume is None:
-                    graph_input = {
-                        "messages": [{"role": "user", "content": request.user_prompt}]
-                    }
-                elif isinstance(request.resume, CheckpointResume):
-                    graph_input = None
-                else:
-                    provider_decisions: list[dict[str, str]] = []
-                    for item in request.resume.decisions:
-                        decision: dict[str, str] = {"type": item.decision}
-                        if item.decision == "reject" and item.feedback:
-                            decision["message"] = item.feedback
-                        provider_decisions.append(decision)
-                    graph_input = Command(resume={"decisions": provider_decisions})
-                async with self._sem:
-                    raw_result = cast(
-                        dict[str, Any],
-                        await agent.ainvoke(graph_input, config=config),
+                if (
+                    request.resume is not None
+                    and await checkpointer.aget_tuple(config) is None
+                ):
+                    result = AgentRunResult(
+                        outcome=RepairRequired(
+                            defect_codes=("checkpoint_not_resumable",),
+                            message=(
+                                "This thread has no checkpoint to resume. "
+                                "Start a fresh Action invocation instead."
+                            ),
+                        ),
+                        llm_calls=0,
+                        tool_calls=0,
+                        cost_usd=0.0,
+                        stopped_reason="error",
                     )
-            if raw_result.get("__interrupt__"):
+                else:
+                    agent = create_agent(
+                        model=self._get_model(),
+                        tools=[
+                            to_langchain_tool(
+                                tool, on_actual_start=callback.record_tool_start
+                            )
+                            for tool in request.tools
+                        ],
+                        system_prompt=request.system_prompt,
+                        response_format=ActionOutcomeEnvelope,
+                        checkpointer=checkpointer,
+                        name=request.agent_name,
+                        middleware=(
+                            [
+                                HumanInTheLoopMiddleware(
+                                    interrupt_on={
+                                        name: True for name in request.approval_tools
+                                    }
+                                )
+                            ]
+                            if request.approval_tools
+                            else ()
+                        ),
+                    )
+                    graph_input: Any
+                    if request.resume is None:
+                        graph_input = {
+                            "messages": [
+                                {"role": "user", "content": request.user_prompt}
+                            ]
+                        }
+                    elif isinstance(request.resume, CheckpointResume):
+                        graph_input = None
+                    else:
+                        provider_decisions: list[dict[str, str]] = []
+                        for item in request.resume.decisions:
+                            decision: dict[str, str] = {"type": item.decision}
+                            if item.decision == "reject" and item.feedback:
+                                decision["message"] = item.feedback
+                            provider_decisions.append(decision)
+                        graph_input = Command(resume={"decisions": provider_decisions})
+                    async with self._sem:
+                        raw_result = cast(
+                            dict[str, Any],
+                            await agent.ainvoke(graph_input, config=config),
+                        )
+            if raw_result is None:
+                pass
+            elif raw_result.get("__interrupt__"):
                 result = AgentRunResult(
                     outcome=Paused(
                         reason="hitl",
@@ -435,53 +462,6 @@ class AgentRuntime:
                 stopped_reason="error",
                 tool_log=tuple(callback.tool_log),
             )
-        except TimeoutError as exc:
-            callback.record_pending_failure("provider_timeout")
-            outcome: ActionOutcome
-            if request.may_have_side_effects and callback.tool_log:
-                outcome = Indeterminate(
-                    operation_key=request.thread_id,
-                    message=f"Timed out after a possible side effect: {exc}",
-                )
-            else:
-                outcome = RetryableFailure(
-                    error_code="provider_timeout",
-                    message=f"Transient provider timeout: {exc}",
-                )
-            result = AgentRunResult(
-                outcome=outcome,
-                llm_calls=callback.llm_calls,
-                tool_calls=len(callback.tool_log),
-                cost_usd=callback.cost_usd,
-                stopped_reason="error",
-                tool_log=tuple(callback.tool_log),
-            )
-        except _TRANSIENT_LLM_ERRORS as exc:
-            callback.record_pending_failure("transient_provider_error")
-            result = AgentRunResult(
-                outcome=RetryableFailure(
-                    error_code="transient_provider_error",
-                    message=f"Transient provider failure: {type(exc).__name__}",
-                ),
-                llm_calls=callback.llm_calls,
-                tool_calls=len(callback.tool_log),
-                cost_usd=callback.cost_usd,
-                stopped_reason="error",
-                tool_log=tuple(callback.tool_log),
-            )
-        except _PERMANENT_LLM_ERRORS as exc:
-            callback.record_pending_failure("permanent_provider_error")
-            result = AgentRunResult(
-                outcome=PermanentFailure(
-                    error_code="permanent_provider_error",
-                    message=f"Permanent provider failure: {type(exc).__name__}",
-                ),
-                llm_calls=callback.llm_calls,
-                tool_calls=len(callback.tool_log),
-                cost_usd=callback.cost_usd,
-                stopped_reason="error",
-                tool_log=tuple(callback.tool_log),
-            )
         except ValueError as exc:
             mismatch = re.search(
                 r"Number of human decisions \((\d+)\).*tool calls \((\d+)\)",
@@ -520,8 +500,20 @@ class AgentRuntime:
         except Exception as exc:
             classification = _provider_error_classification(exc)
             callback.record_pending_failure(classification)
-            if classification == "transient_provider_error":
-                failure: ActionOutcome = RetryableFailure(
+            failure: ActionOutcome
+            if classification == "provider_timeout":
+                if request.may_have_side_effects and callback.tool_log:
+                    failure = Indeterminate(
+                        operation_key=request.thread_id,
+                        message=f"Timed out after a possible side effect: {exc}",
+                    )
+                else:
+                    failure = RetryableFailure(
+                        error_code=classification,
+                        message=f"Transient provider timeout: {exc}",
+                    )
+            elif classification == "transient_provider_error":
+                failure = RetryableFailure(
                     error_code=classification,
                     message=f"Transient provider failure: {type(exc).__name__}",
                 )
@@ -554,6 +546,7 @@ class AgentRuntime:
             cost_usd=round(result.cost_usd, 6),
         )
         return result
+
 
 def _set_model_for_testing(runtime: AgentRuntime, model: BaseChatModel) -> AgentRuntime:
     """Inject a fake provider model without expanding the public constructor."""
