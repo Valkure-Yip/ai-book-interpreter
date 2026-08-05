@@ -11,6 +11,10 @@
 > receipt-driven recovery、durable retry facts、统一 bundle 后验和不可变 conflict lifecycle 修复前一版
 > 在 executor/validator 与 promotion 之间的未持久化窗口。以下正文是唯一当前契约。
 >
+> **Retry attempt 修订：已批准、具有约束力。** 2026-08-05 fix round 2；自动 retry 必须先终结
+> 旧 attempt，再持久化创建严格递增、可首次派发的新 attempt。任何 Mermaid 或文字中的 retry
+> 都不得回接当前 `RUNNING` / `INDETERMINATE` / `REPAIR_REQUIRED` attempt。
+>
 > 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
 > [`agentic-pipeline.md`](./agentic-pipeline.md) 和
@@ -215,7 +219,7 @@ flowchart TD
 
     PLANOK -- "是" --> BATCH["选择一个 Action<br/>或无写冲突的并行 batch"]
     BATCH --> AUTH["AUTHORIZED 持久化<br/>expected manifest + retry policy/fingerprint"]
-    AUTH --> PRECP["RUNNING attempt 快照 durable facts<br/>写执行前 checkpoint"]
+    AUTH --> PRECP["start/claim AUTHORIZED attempt<br/>RUNNING 快照 + 执行前 checkpoint"]
     PRECP --> DISPATCH["Dispatcher 派发 Action"]
 
     DISPATCH --> KIND{"Action 类型"}
@@ -232,8 +236,8 @@ flowchart TD
     HOOK -- "Succeeded(bundle)" --> BUNDLE["验证 typed bundle<br/>identity · permissions · exact effects"]
     BUNDLE --> VIEW["构造 staging-aware evidence view<br/>本 attempt 输出覆盖 canonical"]
     VIEW --> VALIDATE["确定性 validator<br/>绑定 bundle digest 与 checksum"]
-    HOOK -- "可重试异常" --> RETRY{"durable policy 允许？"}
-    RETRY -- "是" --> PRECP
+    HOOK -- "RetryableFailure" --> RETRY{"durable receipt/policy<br/>允许 next attempt？"}
+    RETRY -- "是" --> RETRYWAIT["路由事务终结旧 attempt/action<br/>RETRY_WAIT · receipt 不变"]
     RETRY -- "否" --> INCIDENT["提交 incident<br/>标记 REPAIR_REQUIRED"]
     INCIDENT --> OBS
 
@@ -242,8 +246,11 @@ flowchart TD
     HOOK -- "Indeterminate(error_code)" --> PROBE["只读 probe Action<br/>返回 ProbeResolution"]
     PROBE --> RESOLVE{"disposition"}
     RESOLVE -- "succeeded" --> PROBEOK["原 Action = SUCCEEDED<br/>禁止重发"]
-    RESOLVE -- "absent" --> RETRY
+    RESOLVE -- "absent + allowed" --> RETRYWAIT
+    RESOLVE -- "absent + denied" --> BLOCKED
     RESOLVE -- "unknown" --> BLOCKED
+    RETRYWAIT --> NEXTATTEMPT["create_next_attempt() 一个事务<br/>同 action_id · attempt+1 · AUTHORIZED<br/>新 staging · facts 快照"]
+    NEXTATTEMPT --> PRECP
     PB --> RESUME["外部条件更新后恢复"]
     PH --> RESUME
     RESUME --> RECON
@@ -493,6 +500,33 @@ canonical `GateDecision` JSON/digest、bundle digest、按 bundle 顺序的 stag
 refs。该 receipt 同样不是 success。只有 outcome receipt、gate receipt 和完整 intent 集都 durable 后才
 允许复制第一个 canonical byte；部分 intent 集是 durable corruption，不能补插缺项。
 
+### 7.7 Durable retry attempt transition
+
+自动 retry 永远创建新 attempt，不得把当前 attempt 重新送入 executor。普通 `RetryableFailure` 的 durable
+outcome receipt 路由先在事务中把旧 attempt 与 Action 置为 `RETRY_WAIT`；probe `absent` 且 durable policy
+允许时，`resolve_indeterminate()` 的原子事务也把原 attempt 与 Action 置为 `RETRY_WAIT`。两条路径都保留
+旧 receipt、error code、failure signature、staging、intents 和其他历史；probe resolve 事务本身不创建或
+派发下一 attempt。
+
+之后 controller 显式调用 `RunLedger.create_next_attempt(action_id, previous_attempt)`。该 API 用
+`BEGIN IMMEDIATE` 在一个事务中验证 previous attempt 确为 `RETRY_WAIT`、其 receipt/error 与快照 policy
+仍允许重试，并将 `next_attempt = previous_attempt + 1` 以唯一 `(action_id, next_attempt)` 写成尚未执行的
+`AUTHORIZED` attempt。新行冻结同一 authorized Action 的 parameters、expected manifest、stable expected
+evidence refs、retry policy JSON/fingerprint 和 `retry_of_attempt=previous_attempt`，同时把 Action 转回
+`AUTHORIZED`。完全相同的重复调用或并发 controller tick 必须返回同一行；若已有不同事实、attempt
+不连续或 retry 来源不一致则 fail closed，绝不能创建 attempt 3 来“绕过”已有 attempt 2。
+
+Dispatcher 只首次 claim 该明确的 `AUTHORIZED` attempt，将它与 Action 转为 `RUNNING` 并使用新的
+`state/staging/{action_id}/{next_attempt}`；executor 收到并必须回显这个新 attempt ID。对正常自动重试，
+`action_id` 保持为同一个已授权 Action，attempt 严格递增（例如 1、2），旧 attempt 永不重入。进程在
+next-attempt 创建后、首次 claim 前崩溃时，可恢复派发该 `AUTHORIZED` 行；一旦 attempt 已是 `RUNNING`，
+即使崩溃发生在 claim 与 executor 调用之间，也仍遵守 at-most-once 边界，只能按 durable staging/receipt
+规则重建或阻断，不能再次调用 executor。
+
+这条自动 retry 路径不适用于 artifact conflict/integrity failure。`REPAIR_REQUIRED + BLOCKED` 的人工恢复
+仍必须显式选择/清理 canonical 冲突，并创建 new plan version、new action ID 和 new staging namespace；
+不得通过 `create_next_attempt()` 复活旧 conflict Action。
+
 ## 8. Planner 与 PolicyEngine
 
 ### 8.1 Planner
@@ -630,7 +664,8 @@ retry policy JSON/fingerprint 一致。resolve 路由不得读取当前 catalog 
 - `succeeded`：evidence-only 提交 probe attempt/action，并把原 attempt/action 解析为 `SUCCEEDED`；原操作
   不重发。
 - `absent`：evidence-only 提交 probe attempt/action；仅当原 retry policy、attempt count 和 error code 允许
-  时把原 Action 转为 `RETRY_WAIT`，否则转为 `BLOCKED` 并记录 incident。
+  时把原 attempt/Action 转为 `RETRY_WAIT`，否则转为 `BLOCKED` 并记录 incident。该 resolve 事务不创建
+  next attempt；controller 随后必须显式、幂等调用第 7.7 节的 `create_next_attempt()`。
 - `unknown`：evidence-only 提交 probe attempt/action，原 attempt/action 保持 `INDETERMINATE`，run 转为
   `BLOCKED` 并记录等待人工核对的 incident。
 
@@ -665,6 +700,8 @@ LangGraph checkpoint
 | 中断位置 | 恢复行为 |
 | --- | --- |
 | Action 尚为 `AUTHORIZED`、attempt 未启动 | 可以首次派发；`start_attempt` 先 durable manifest/policy snapshot |
+| 旧 attempt/Action=`RETRY_WAIT`、next attempt 尚不存在 | 调用 `create_next_attempt(action_id, old_attempt)`；同一事务唯一创建 attempt+1=`AUTHORIZED` 并冻结同一 authorized facts；重复/并发 tick 返回同一行 |
+| next attempt=`AUTHORIZED`、尚未 claim | 可以首次 claim/派发该明确 attempt；使用新的 attempt-scoped staging，绝不回到旧 attempt |
 | attempt=`RUNNING`、outcome receipt 缺失 | **不得重跑 Action**；仅按 durable expected manifest 安全扫描 staging 并精确重建 receipt；缺失/额外/unsafe 则进入 conflict lifecycle |
 | outcome receipt 已 durable、controller 尚未路由 | 按 receipt discriminant 幂等路由；Succeeded 构造 staging-aware view/validator，failure/probe 只用 durable attempt policy/facts；`after_action_output` hook 位于 receipt 之后 |
 | validator 已返回但 gate receipt/intent tx 尚未 durable | 若全部 staging 仍安全存在，可重跑 validator且 canonical decision 必须相同；否则 fail closed，不把内存 PASS 当事实 |
@@ -826,7 +863,7 @@ flowchart TD
     EXEC["Action 执行结束"] --> RESULT{"结构化结果类型"}
 
     RESULT -- "Succeeded(bundle)" --> VALIDATE["staging-aware 确定性验证"]
-    RESULT -- "RetryableFailure" --> RETRY["按 retry policy 重试"]
+    RESULT -- "RetryableFailure" --> RETRYPOLICY{"durable receipt/policy<br/>允许 next attempt？"}
     RESULT -- "RepairRequired" --> REPAIR["提交缺陷证据<br/>Planner 生成其他修复 Action"]
     RESULT -- "PermanentFailure" --> PERM["Action = PERMANENT_FAILED<br/>记录不可变 incident"]
     RESULT -- "Indeterminate" --> PROBE["运行绑定的只读 probe<br/>禁止直接重复副作用"]
@@ -840,9 +877,12 @@ flowchart TD
     PROBE --> CHECKPROBE
     CHECKPROBE --> KNOWN{"disposition"}
     KNOWN -- "succeeded" --> RESOLVED["原 Action = SUCCEEDED<br/>不重发"]
-    KNOWN -- "absent" --> RETRYPOLICY{"原 retry policy 允许？"}
-    RETRYPOLICY -- "是" --> RETRY
+    KNOWN -- "absent + allowed" --> RETRYWAIT["resolve tx：旧 attempt/action<br/>RETRY_WAIT · 历史不变"]
+    KNOWN -- "absent + denied" --> BLOCKED
+    RETRYPOLICY -- "是" --> RETRYWAIT
     RETRYPOLICY -- "否" --> BLOCKED
+    RETRYWAIT --> CREATENEXT["create_next_attempt() 一个事务<br/>同 action_id · attempt+1 · AUTHORIZED"]
+    CREATENEXT --> NEWDISPATCH["首次 claim/dispatch 新 attempt<br/>新 staging namespace"]
     KNOWN -- "unknown" --> UNKNOWNBLOCKED["原 attempt 保持 INDETERMINATE<br/>Run = BLOCKED / 人工核对"]
 ```
 
@@ -850,7 +890,7 @@ flowchart TD
 
 | Outcome | 语义 | 例子 | 下一步 |
 | --- | --- | --- | --- |
-| `RetryableFailure` | 同一输入再次执行可能成功 | 429、5xx、临时网络/锁 | 指数退避、jitter、上限 |
+| `RetryableFailure` | 同一输入在**新 attempt** 再次执行可能成功 | 429、5xx、临时网络/锁 | 旧 attempt=`RETRY_WAIT`；幂等创建 attempt+1、新 staging；指数退避、jitter、上限 |
 | `RepairRequired` | 原动作不该重试，但其他工作可修复证据 | 术语冲突、章节质量 FAIL、EPUB lint FAIL | replan 修复 Action |
 | `PermanentFailure` | 相同能力和输入不会成功 | 版权禁止、格式不支持、权限永久拒绝、invariant 冲突 | 替代能力或 `BLOCKED` |
 | `Indeterminate` | 带 durable error code/failure signature 的副作用可能已发生 | 发布超时、commit 后崩溃 | probe/reconcile，禁止盲重试 |
@@ -866,7 +906,9 @@ ProbeResolver 同时校验它是原 ActionSpec 唯一绑定的 probe capability�
 启动前快照的完整 retry policy/max attempts；当前 catalog 漂移不能改变结果。相同 resolution 重放幂等；
 `succeeded/absent/unknown` 之间的冲突重放、错误
 probe capability、原状态已经改变或 operation key 不同一律 fail closed 并留下 incident。`unknown` 不是
-pause 成功：原 attempt 保持 `INDETERMINATE`，run 明确进入 `BLOCKED` 等待人工或新的外部证据。
+pause 成功：原 attempt 保持 `INDETERMINATE`，run 明确进入 `BLOCKED` 等待人工或新的外部证据。允许的
+`absent` 只终结原 attempt/Action 为 `RETRY_WAIT`；下一 attempt 必须通过第 7.7 节的显式 ledger 事务创建，
+不能由重复 resolution 或重复 controller tick 隐式递增。
 
 ## 14. 并发与调度
 
@@ -939,6 +981,8 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - authorization/attempt 在 executor 前 durable expected manifest 和完整 retry policy/fingerprint；
 - outcome receipt 在 controller hook 前 durable，gate receipt 与完整 intent 集同事务；
 - receipt exact replay 幂等、conflicting replay/partial intent set fail closed；
+- retry route 原子终结旧 attempt/action 为 `RETRY_WAIT`，并发/重复
+  `create_next_attempt()` 只创建同 action ID 的唯一 attempt+1=`AUTHORIZED`，完整复制 frozen facts；
 - ledger transition 和事务回滚；
 - 全部 intents durable 之前零 canonical copy、完整 bundle 前零 ledger success；
 - artifact promotion 与 checksum 冲突；
@@ -966,6 +1010,11 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - success 后 graph crash 复核全部 intent/canonical；drift 补偿为 `REPAIR_REQUIRED` + run `BLOCKED`；
 - `Indeterminate` 的 `succeeded/absent/unknown` probe matrix 不会盲重试，重复相同 resolution 幂等且冲突
   resolution fail closed；
+- 普通 `RetryableFailure` 与 probe `absent` 都先把旧 attempt/action 终结为 `RETRY_WAIT`；在
+  `after_retry_wait`、`before/after_create_next_attempt`、`before_start_next_attempt` 边界崩溃并恢复时，
+  并发/重复 tick 只得到同一个 attempt 2，executor 观察到 attempt IDs `1, 2` 且从不再调用 attempt 1；
+- `RUNNING` next attempt 在 receipt 前崩溃仍不得重入 executor；保留 attempt 1/2 的各自 staging 与全部
+  receipts/intents。若 next attempt 尚为 `AUTHORIZED` 则可首次派发，二者不得混淆；
 - budget/HITL/blocked 可恢复；
 - outbox 不丢事件且不会重复投影业务事实。
 

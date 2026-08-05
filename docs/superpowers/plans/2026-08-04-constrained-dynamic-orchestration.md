@@ -18,6 +18,11 @@
 > receipt-driven Reconciler, unified bundle postcheck, and immutable conflict lifecycle specified
 > below. These requirements replace any earlier step that assumed an in-memory outcome or PASS could
 > survive a crash.
+>
+> **Retry attempt transition fix round 2 (2026-08-05):** Every allowed automatic retry must first
+> terminate the old attempt as `RETRY_WAIT`, then idempotently create a strictly increasing
+> `AUTHORIZED` next attempt with a fresh staging namespace before its first dispatch. No diagram or
+> implementation step may route retry back into the current attempt.
 
 ## Global Constraints
 
@@ -30,6 +35,7 @@
 - Unknown capability, validator, predicate, outcome, or exception classification fails closed with an error message that includes a repair instruction.
 - `state/run.db` is the business source of truth; `events.jsonl`, `metrics.json`, and `state/status.json` are rebuildable projections.
 - A `RUNNING` attempt's executor is never automatically invoked again; missing handoff facts are reconstructed or blocked from durable staging/manifest evidence. Business commits are exactly-once by stable `run_id`, `plan_version`, `action_id`, `attempt`, and `idempotency_key`.
+- Ordinary retryable outcomes and allowed probe-`absent` resolutions terminate the old attempt/Action as `RETRY_WAIT`; `create_next_attempt(action_id, previous_attempt)` uniquely and idempotently creates attempt+1=`AUTHORIZED`, freezes the same authorized facts, and reserves the logical `state/staging/{action_id}/{attempt+1}` identity before first dispatch. Automatic retry keeps the action ID; conflict recovery still requires a new plan version and action ID.
 - Filesystem promotion and SQLite commits use `promotion_intent` plus reconciliation; never claim cross-medium atomicity.
 - The platform remains single-process. Machine-managed canonical relpaths are exact portable lowercase keys; after an intent is `COMMITTED`, canonical plus ledger are authoritative and staged residue is non-authoritative.
 - Externally supplied, foreign-owned, dirty, or hot-journal SQLite files are invalid input; no mutation-free inspection guarantee is made for them.
@@ -86,7 +92,10 @@ flowchart TD
     INDET["Original attempt INDETERMINATE"] --> PROBE["Bound read-only probe Action"]
     PROBE --> RESOLUTION{"ProbeResolution"}
     RESOLUTION -- "succeeded" --> ORIGINALOK["Original SUCCEEDED<br/>do not reissue"]
-    RESOLUTION -- "absent + retry allowed" --> RETRY["Original RETRY_WAIT"]
+    RESOLUTION -- "absent + retry allowed" --> RETRY["Original attempt/action RETRY_WAIT"]
+    RETRYABLE["RetryableFailure receipt<br/>old attempt/action RETRY_WAIT"] --> RETRY
+    RETRY --> NEXTATTEMPT["One ledger transaction<br/>same action_id · attempt+1 AUTHORIZED<br/>fresh staging + frozen facts"]
+    NEXTATTEMPT --> NEXTDISPATCH["First dispatch of new attempt only"]
     RESOLUTION -- "absent + retry denied" --> BLOCKED["Run BLOCKED"]
     RESOLUTION -- "unknown" --> BLOCKED
 ```
@@ -700,7 +709,7 @@ git commit -m "feat: authorize registered actions with deterministic policy"
 
 **Interfaces:**
 - Consumes: Task 1 models.
-- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `start_attempt()`, `record_attempt_outcome()`, `create_gate_receipt_and_bundle_intents()`, `mark_bundle_conflict()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
+- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `create_next_attempt()`, `start_attempt()`, `record_attempt_outcome()`, `create_gate_receipt_and_bundle_intents()`, `mark_bundle_conflict()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
 
 - [ ] **Step 1: Write transaction, transition, and exactly-once tests**
 
@@ -728,10 +737,26 @@ async def test_illegal_transition_rolls_back(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_attempt_snapshots_manifest_and_retry_policy_before_dispatch(tmp_path: Path) -> None:
     async with seeded_ledger(tmp_path) as ledger:
-        attempt = await ledger.start_attempt("a1")
+        attempt = await ledger.start_attempt("a1", attempt=1)
         assert attempt.expected_manifest_digest == authorized_manifest_digest("a1")
         assert attempt.retry_policy.retryable_codes == ("provider_timeout",)
         assert attempt.retry_policy_fingerprint == retry_policy_digest(attempt.retry_policy)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retry_ticks_create_exactly_attempt_two(tmp_path: Path) -> None:
+    async with retry_wait_ledger(tmp_path, action_id="a1", attempt=1) as ledger:
+        first, second = await asyncio.gather(
+            ledger.create_next_attempt("a1", previous_attempt=1),
+            ledger.create_next_attempt("a1", previous_attempt=1),
+        )
+        assert first == second
+        assert first.attempt == 2
+        assert first.status is ActionStatus.AUTHORIZED
+        assert first.expected_manifest_digest == authorized_manifest_digest("a1")
+        assert first.retry_policy_fingerprint == retry_policy_digest(first.retry_policy)
+        assert await ledger.attempt_numbers("a1") == (1, 2)
+        assert await ledger.attempt_status("a1", 1) is ActionStatus.RETRY_WAIT
 
 
 @pytest.mark.asyncio
@@ -756,13 +781,16 @@ Expected: collection fails because `abi.project.run_ledger` does not exist.
 Add `"aiosqlite>=0.20,<1"` to runtime dependencies and run `uv lock`. `SCHEMA_SQL` must create WAL-backed tables `runs`, `plan_versions`, `actions`, `action_attempts`, `attempt_outcome_receipts`, `artifact_bundles`, `artifacts`, `gate_receipts`, `promotion_intents`, `gate_evidence`, `probe_resolutions`, `incidents`, `interrupts`, `budget_entries`, and `event_outbox`.
 
 `actions` stores canonical expected-manifest JSON/digest, stable expected evidence refs, plus complete retry-policy JSON/fingerprint.
-`start_attempt()` copies those immutable facts into `action_attempts` in the same transaction that
-sets `RUNNING`, before executor dispatch. `attempt_outcome_receipts` stores action/attempt, canonical
+Initial `start_attempt()` copies those immutable facts into `action_attempts` in the same transaction
+that sets `RUNNING`, before executor dispatch. Retry attempts are first created as `AUTHORIZED` by
+`create_next_attempt()` and carry `retry_of_attempt`; a partial unique constraint on
+`(action_id, retry_of_attempt)` plus unique `(action_id, attempt)` prevents two controller ticks
+from creating different successors for the same old attempt. `attempt_outcome_receipts` stores action/attempt, canonical
 outcome JSON/digest, optional bundle JSON/digest, evidence refs, error code, failure signature, and
 `recorded_at`. `gate_receipts` stores validator ID/version, canonical GateDecision JSON/digest,
 bundle digest, ordered staged path/canonical path/checksum identities, evidence refs, and
 `recorded_at`. Add unique constraints on `(run_id, version)`, `(run_id, action_id)`,
-`(action_id, attempt)`, exactly one outcome receipt and gate receipt per attempt, one bundle per
+`(action_id, attempt)`, non-null `(action_id, retry_of_attempt)`, exactly one outcome receipt and gate receipt per attempt, one bundle per
 attempt, artifact canonical path, one probe resolution per original attempt/operation key, and
 event idempotency key.
 
@@ -786,9 +814,10 @@ CREATE TABLE IF NOT EXISTS actions (
 
 - [ ] **Step 4: Implement `RunLedger` with explicit transactions**
 
-Use `aiosqlite.Connection`, `BEGIN IMMEDIATE`, injected UTC clock, and repository-owned row-to-model parsing. `record_attempt_outcome()` verifies the receipt against the immutable attempt identity/manifest/policy snapshot; exact replay is idempotent and any differing fact conflicts. `create_gate_receipt_and_bundle_intents()` verifies outcome/bundle identity and inserts the gate receipt plus the **complete** intent set in one transaction; partial replay is corruption, never piecemeal repair. `commit_success()` requires matching outcome/gate receipts and every expected intent `COMMITTED`, then writes Action status, artifacts, gate evidence, budget entry, and outbox event in one SQLite transaction. An identical repeated commit returns the prior record; a different checksum for the same Action enters the conflict lifecycle.
+Use `aiosqlite.Connection`, `BEGIN IMMEDIATE`, injected UTC clock, and repository-owned row-to-model parsing. `record_attempt_outcome()` verifies the receipt against the immutable attempt identity/manifest/policy snapshot; exact replay is idempotent and any differing fact conflicts. Route an allowed ordinary `RetryableFailure` by atomically terminating its attempt/Action as `RETRY_WAIT` while preserving its receipt/error/signature. `create_next_attempt(action_id, previous_attempt)` then verifies that durable state and the snapshotted policy/count, derives exactly `previous_attempt + 1`, and in one transaction creates a not-yet-run `AUTHORIZED` row with a fresh staging identity and copies the same authorized parameters/manifest/evidence/retry facts. It also returns the Action to `AUTHORIZED`. Exact/concurrent replay returns that row; an existing mismatched successor fails closed instead of creating another attempt. `create_gate_receipt_and_bundle_intents()` verifies outcome/bundle identity and inserts the gate receipt plus the **complete** intent set in one transaction; partial replay is corruption, never piecemeal repair. `commit_success()` requires matching outcome/gate receipts and every expected intent `COMMITTED`, then writes Action status, artifacts, gate evidence, budget entry, and outbox event in one SQLite transaction. An identical repeated commit returns the prior record; a different checksum for the same Action enters the conflict lifecycle.
 
-Add legal compensating transitions `RUNNING → REPAIR_REQUIRED` and
+Add legal retry transitions `RUNNING → RETRY_WAIT → AUTHORIZED → RUNNING`, with the last two
+transitions applying only through the unique new attempt. Add compensating transitions `RUNNING → REPAIR_REQUIRED` and
 `SUCCEEDED → REPAIR_REQUIRED` for receipt/intent/canonical integrity failure. `mark_bundle_conflict()`
 atomically applies the attempt and Action transition, sets run `BLOCKED`, and inserts one idempotent
 subject-scoped incident while preserving all prior receipts/intents/artifact/gate rows. It cannot
@@ -1563,6 +1592,27 @@ async def test_permanent_failure_blocks_without_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_dispatches_attempt_two_without_reentering_attempt_one() -> None:
+    rig = controller_rig(outcomes=(
+        ActionOutcomeEnvelope(
+            action_id="a1", attempt=1,
+            outcome=RetryableFailure(error_code="provider_timeout", message="retry later"),
+        ),
+        ActionOutcomeEnvelope(
+            action_id="a1", attempt=2,
+            outcome=Succeeded(artifact_bundle=bundle(
+                action_id="a1", attempt=2,
+                entries=(("chapter.md", "chapters/translated/001.md", "text/markdown", "translation"),),
+            ), evidence_refs=("gate",)),
+        ),
+    ))
+    await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+    assert await rig.executor.attempt_ids("a1") == (1, 2)
+    assert await rig.ledger.attempt_status("a1", 1) is ActionStatus.RETRY_WAIT
+    assert await rig.ledger.action_status("a1") is ActionStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
 async def test_committer_requires_complete_multi_file_bundle(tmp_path: Path) -> None:
     rig = committer_rig(tmp_path, expected=("reports/a.json", "reports/b.json"))
     envelope = two_file_success(rig, action_id="a1", attempt=1)
@@ -1589,7 +1639,7 @@ Expected: collection fails because the Scheduler and dynamic controller do not e
 
 - [ ] **Step 4: Implement batch selection and typed dispatch**
 
-Scheduler sorts by priority then action ID, incrementally admits Actions whose dependencies are committed and whose read/write sets do not conflict with the batch. Dispatcher starts attempts in the ledger (thereby snapshotting the authorized expected manifest and full retry policy before execution), resolves canonical parameters, creates the exact attempt-scoped writer/output view, runs deterministic/agent/composite executors, applies per-Action timeout, and requires `ActionOutcomeEnvelope.action_id/attempt` on every result. It rejects a `Succeeded` bundle whose identity/order/effects differ from the durable action/attempt manifest and rejects `ProbeResolution` from a non-probe capability.
+Scheduler sorts by priority then action ID, incrementally admits Actions whose dependencies are committed and whose read/write sets do not conflict with the batch. Before first execution, controller/Dispatcher uses `start_attempt()` to create/claim the initial attempt and snapshot authorized manifest/policy facts. For retry, controller must first idempotently obtain the exact `AUTHORIZED` successor from `create_next_attempt(action_id, previous_attempt)`; Dispatcher may only claim and dispatch that returned attempt, never infer a number or reuse the old attempt. It resolves canonical parameters, creates the exact new attempt-scoped writer/output view, runs deterministic/agent/composite executors, applies per-Action timeout, and requires `ActionOutcomeEnvelope.action_id/attempt` on every result. It rejects a `Succeeded` bundle whose identity/order/effects differ from the durable action/attempt manifest and rejects `ProbeResolution` from a non-probe capability.
 
 Immediately after typed executor return, the `before_outcome_receipt` test hook may crash. Otherwise
 Dispatcher canonical-encodes the envelope and calls `record_attempt_outcome()` in one SQLite
@@ -1622,7 +1672,8 @@ Implement ordinary-success commit in this exact order:
 
 Filesystem promotion across bundle entries is explicitly non-atomic. Any crash before step 6 leaves
 the attempt `RUNNING`; it does not become retryable, repair-required, or successful merely because
-some files exist. Outcome routing is exact: retryable → bounded retry; repair → incident + replan;
+some files exist. Outcome routing is exact: retryable → atomically close old attempt/Action as
+`RETRY_WAIT`, then explicit idempotent attempt+1 creation and first dispatch; repair → incident + replan;
 permanent → alternative capability or BLOCKED; indeterminate → registered probe Action only; paused
 → run pause; ordinary success → the six-step receipt protocol. Reconciler runs before every planning
 cycle and groups facts by run/action/attempt. A `RUNNING` attempt with no outcome receipt is never
@@ -1635,6 +1686,9 @@ GateDecision JSON/digest. Finalize only after unified postcheck. Any conflict/in
 atomically sets attempt/Action `REPAIR_REQUIRED`, run `BLOCKED`, preserves receipts/intents/files,
 and creates an idempotent subject incident; no automatic rerun/replan. Manual continuation creates a
 new plan version/action ID/staging namespace after explicit canonical conflict selection/cleanup.
+Automatic retry is different: it retains the same authorized `action_id`, increments attempt exactly
+once, freezes identical authorized facts, and uses `state/staging/{action_id}/{next_attempt}`. Repeated
+or concurrent ticks return the existing successor and cannot create two next attempts.
 Even after ledger success, the next Reconciler cycle repeats committed-intent/canonical postchecks
 and compensates drift to `REPAIR_REQUIRED + BLOCKED`; this does not claim FS/SQLite atomicity.
 
@@ -1687,7 +1741,7 @@ git commit -m "feat: execute durable policy-gated action loop"
 
 **Interfaces:**
 - Consumes: Task 8 control plane.
-- Produces: deterministic bundle crash-point hooks, retry signature accounting, frozen `ProbeResolution`, atomic `RunLedger.resolve_indeterminate()`, durable `probe_resolutions`, and resume behavior for paused/blocked runs.
+- Produces: deterministic bundle/retry-transition crash-point hooks, retry signature accounting, frozen `ProbeResolution`, atomic `RunLedger.resolve_indeterminate()`, durable `probe_resolutions`, idempotent next-attempt creation under concurrent ticks, and resume behavior for paused/blocked runs.
 
 - [ ] **Step 1: Write the recovery matrix as executable tests**
 
@@ -1714,6 +1768,35 @@ async def test_crash_boundaries_do_not_duplicate_business_facts(
     assert await rig.executor.call_count("a1") == 1
 ```
 
+Add a separate retry-transition matrix for both ordinary `RetryableFailure` and allowed probe
+`absent`:
+
+```python
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", [
+    "after_retry_wait", "before_create_next_attempt", "after_create_next_attempt",
+    "before_start_next_attempt", "before_dispatch_next_attempt",
+])
+async def test_retry_crashes_create_and_dispatch_only_attempt_two(
+    retry_rig: RetryRig, boundary: str
+) -> None:
+    retry_rig.crash_at(boundary)
+    with pytest.raises(InjectedCrash):
+        await retry_rig.run()
+    retry_rig.disable_crash()
+    await asyncio.gather(retry_rig.controller.tick(), retry_rig.controller.tick())
+    await retry_rig.resume()
+    assert await retry_rig.ledger.attempt_numbers("a1") == (1, 2)
+    assert await retry_rig.executor.attempt_ids("a1") == (1, 2)
+    assert await retry_rig.ledger.attempt_status("a1", 1) is ActionStatus.RETRY_WAIT
+```
+
+Define `before_dispatch_next_attempt` before the `AUTHORIZED → RUNNING` claim. Also inject the
+unavoidable crash immediately after that claim and before executor invocation: attempt 2 is then
+`RUNNING` with no receipt, so recovery must reconstruct or block under the existing at-most-once
+rule and must call neither attempt 1 nor attempt 2 again. It may not demote attempt 2 to
+`AUTHORIZED`. In all cases keep both attempt namespaces and prior receipts/intents unchanged.
+
 For every boundary, use a two-entry bundle and assert: all intent rows existed before the first
 canonical copy; outcome receipt existed before `after_action_output`; gate receipt and all intents
 appeared in one transaction; the attempt stayed `RUNNING` until the complete success transaction; resume grouped
@@ -1729,6 +1812,11 @@ on entry 1/entry 2 and drift after unified postcheck and after success. Each cas
 `REPAIR_REQUIRED`, run `BLOCKED`, preserves all receipts/intents/files/history, creates one stable
 subject incident, and only inspects siblings read-only. Assert unblock cannot reuse the old Action;
 a new plan version/action ID/staging namespace is required after explicit canonical cleanup.
+For retry transitions, race many identical `create_next_attempt("a1", previous_attempt=1)` calls and
+assert one durable `(a1, 2)` row with `retry_of_attempt=1`, no `(a1, 3)`, one fresh
+`state/staging/a1/2` namespace, and exact manifest/retry-policy fingerprints copied from the same
+authorized Action. A conflicting successor row or a call from `RUNNING`, `INDETERMINATE`, or
+`REPAIR_REQUIRED` fails closed without executor calls.
 
 - [ ] **Step 2: Write failure classification and probe tests**
 
@@ -1797,7 +1885,10 @@ probe registration, wrong original status, wrong operation key, and probe return
 disposition, evidence set, operation key, original attempt, or retry fingerprint and assert a
 durable conflict with no overwritten fact. Inject a crash at every point of the single SQLite
 resolve transaction and prove it rolls back probe evidence, probe success, and original status
-together.
+together. For allowed `absent`, assert resolve terminates the original attempt/Action as
+`RETRY_WAIT` but creates no next attempt. Replaying resolution still creates none; only subsequent
+concurrent controller calls to `create_next_attempt(original_action_id, original_attempt)` may
+produce the single `AUTHORIZED` attempt+1.
 
 - [ ] **Step 3: Run recovery tests and confirm red results**
 
@@ -1830,17 +1921,24 @@ fingerprint. In the same transaction, commit the probe attempt/action and eviden
 insert the immutable resolution/outbox facts, then apply exactly one original route:
 
 - `succeeded`: original attempt/Action → `SUCCEEDED`; never redispatch the external operation.
-- `absent`: original Action → `RETRY_WAIT` only when its attempt-snapshotted retry policy, outcome-receipt error code, and attempt
-  count allow; otherwise run → `BLOCKED` with an incident.
+- `absent`: original attempt/Action → `RETRY_WAIT` only when its attempt-snapshotted retry policy,
+  outcome-receipt error code, and attempt count allow; otherwise run → `BLOCKED` with an incident.
+  The resolve transaction does not create or dispatch the successor.
 - `unknown`: leave original attempt/Action `INDETERMINATE`; run → `BLOCKED` with an incident that
   requests human/external evidence.
 
 An exact replay returns the stored resolution. Any conflicting resolution/evidence/key/policy fact
-fails closed and preserves the first durable fact.
+fails closed and preserves the first durable fact. After either an ordinary retryable receipt route
+or allowed `absent`, controller invokes Task 3's `create_next_attempt()` as a separate explicit
+idempotent transaction, applies backoff, then first-claims that exact `AUTHORIZED` attempt. Normal
+automatic retry retains the action ID and produces executor attempt IDs 1 then 2; it never reuses
+attempt 1. `INDETERMINATE`, `RUNNING`, and `REPAIR_REQUIRED` attempts are ineligible.
 
 - [ ] **Step 5: Implement all recovery boundaries**
 
-At startup reconcile ledger/checkpoint/artifacts in this order: `RUNNING` attempts grouped by
+At startup reconcile ledger/checkpoint/artifacts in this order: retryable receipts whose old
+attempt/Action transition to `RETRY_WAIT` is incomplete; `RETRY_WAIT` Actions and their unique
+`AUTHORIZED` successor rows; never-started `AUTHORIZED` retry attempts; `RUNNING` attempts grouped by
 run/action/attempt and their durable manifest/policy snapshot; missing/conflicting outcome receipts;
 missing/conflicting gate receipt + complete intent sets; pending/committed intents; unified
 canonical bundle postcheck; success rows missing graph progress; post-success canonical drift;
@@ -1849,6 +1947,10 @@ never causes Action redispatch: exact safe reconstruction or `REPAIR_REQUIRED + 
 partial intent set is corruption, not a repair invitation. An intent conflict stops further sibling
 promotion but permits read-only evidence collection. Emit `action.reconciled` for every correction,
 preserve original receipts/intents/files/history, and never auto-create the replacement plan/action.
+Creating an automatic retry successor is not a replacement plan: it is allowed only from
+`RETRY_WAIT`, retains the same action ID, uses attempt+1 and a fresh staging namespace, and is
+idempotent across crashes/concurrent ticks. Reconcile may first-dispatch an existing `AUTHORIZED`
+successor but may never re-enter any `RUNNING`/`INDETERMINATE`/`REPAIR_REQUIRED` attempt.
 
 - [ ] **Step 6: Run recovery and full unit tests**
 
@@ -1997,7 +2099,10 @@ the unified canonical postcheck passed before ledger success; post-success drift
 `REPAIR_REQUIRED + BLOCKED`; conflict history was never reset/reused; every release prerequisite
 was committed; no failed/paused/indeterminate Action was treated as success except through a valid
 immutable probe resolution using durable attempt policy/error facts; and every plan rejection has
-reasons. Keep L2 translation and L3 EPUB scoring behavior unchanged.
+reasons. Every automatic retry lineage must show old attempt/Action `RETRY_WAIT`, exactly one
+attempt+1 `AUTHORIZED` successor with the same action ID and frozen manifest/policy fingerprint,
+fresh staging, and executor attempt IDs that never repeat; `REPAIR_REQUIRED` conflict recovery must
+instead show a new plan version/action ID. Keep L2 translation and L3 EPUB scoring behavior unchanged.
 
 - [ ] **Step 5: Synchronize all authoritative documentation**
 
@@ -2054,6 +2159,10 @@ Expected: all two-entry boundaries before/after outcome receipt, before/after at
 intents, each promotion, unified postcheck, success/checkpoint, partial-intent corruption,
 pre/post-success drift, immutable conflict/unblock replacement, permanent failures, all three probe
 dispositions using durable policy/error facts, replay conflicts, concurrency, and completion pass.
+The recovery set must also cover ordinary retryable and allowed probe-`absent` transitions at
+`after_retry_wait`, before/after next-attempt creation, before first dispatch, and after
+`AUTHORIZED → RUNNING`: concurrent/repeated ticks create only attempt 2, the normal executor log is
+exactly attempts `1, 2`, and no `RUNNING`/`INDETERMINATE`/`REPAIR_REQUIRED` attempt is re-entered.
 
 - [ ] **Step 4: Verify forbidden symbols and SDK boundaries**
 
