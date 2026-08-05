@@ -17,7 +17,11 @@
 >
 > **Retry / manual recovery 区分修订：已批准、具有约束力。** 2026-08-05 fix round 3；
 > 自动 retry 的同 action/new attempt 路径不得被“仅人工/new plan”表述覆盖，manual recovery 也不得
-> 借 `create_next_attempt()` 绕过 `REPAIR_REQUIRED`、conflict、durable corruption 或 unknown probe。
+> 借 `create_next_attempt()` 绕过 integrity-class repair、conflict、durable corruption 或 unknown probe。
+>
+> **Semantic / integrity repair 区分修订：已批准、具有约束力。** 2026-08-05 fix round 4；
+> `REPAIR_REQUIRED` 是状态而非处置类别。只有 `repair_class=semantic` 可在 run=`RUNNING` 时自动 replan；
+> `repair_class=integrity` 或缺失/未知分类必须 fail closed 为 `BLOCKED` 并等待人工处理。
 >
 > 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
@@ -242,8 +246,9 @@ flowchart TD
     VIEW --> VALIDATE["确定性 validator<br/>绑定 bundle digest 与 checksum"]
     HOOK -- "RetryableFailure" --> RETRY{"durable receipt/policy<br/>允许 next attempt？"}
     RETRY -- "是" --> RETRYWAIT["路由事务终结旧 attempt/action<br/>RETRY_WAIT · receipt 不变"]
-    RETRY -- "否" --> INCIDENT["提交 incident<br/>标记 REPAIR_REQUIRED"]
-    INCIDENT --> OBS
+    RETRY -- "否" --> RETRYBLOCK["retry_exhausted incident<br/>run = BLOCKED"]
+    RETRYBLOCK --> BLOCKED
+    HOOK -- "RepairRequired" --> REPAIRCLASS{"repair_class + source/reason<br/>明确且可信？"}
 
     HOOK -- "预算耗尽" --> PB["PAUSED_BUDGET"]
     HOOK -- "需要人工判断" --> PH["PAUSED_HITL"]
@@ -252,7 +257,7 @@ flowchart TD
     RESOLVE -- "succeeded" --> PROBEOK["原 Action = SUCCEEDED<br/>禁止重发"]
     RESOLVE -- "absent + allowed" --> RETRYWAIT
     RESOLVE -- "absent + denied" --> BLOCKED
-    RESOLVE -- "unknown" --> BLOCKED
+    RESOLVE -- "unknown / conflicting" --> BLOCKED
     RETRYWAIT --> NEXTATTEMPT["create_next_attempt() 一个事务<br/>同 action_id · attempt+1 · AUTHORIZED<br/>新 staging · facts 快照"]
     NEXTATTEMPT --> PRECP
     PB --> RESUME["外部条件更新后恢复"]
@@ -260,8 +265,10 @@ flowchart TD
     RESUME --> RECON
 
     VALIDATE --> PASS{"Evidence PASS？"}
-    PASS -- "否" --> REPAIR["提交 gate failure 与修复证据"]
-    REPAIR --> OBS
+    PASS -- "否" --> REPAIRCLASS
+    REPAIRCLASS -- "semantic + mapped" --> SEMREPAIR["持久化 repair fact + incident<br/>原 action=REPAIR_REQUIRED<br/>run 保持 RUNNING"]
+    SEMREPAIR --> OBS
+    REPAIRCLASS -- "integrity / missing / unknown / unmapped" --> CONFLICT
 
     PASS -- "是" --> INTENTS["同一个 SQLite 事务<br/>GateReceipt + bundle 全部 intents"]
     INTENTS --> PROMOTE["逐项 promote / reconcile<br/>文件系统非原子"]
@@ -276,9 +283,7 @@ flowchart TD
     COMPLETE -- "是" --> DONE(["RUN_COMPLETED"])
 
     PROBEOK --> COMPLETE
-    INCIDENT --> RECOVERABLE{"仍可自动或外部恢复？"}
-    RECOVERABLE -- "是" --> OBS
-    RECOVERABLE -- "否" --> BLOCKED["BLOCKED<br/>保留完整恢复点"]
+    BLOCKED["BLOCKED<br/>保留完整恢复点"]
     CONFLICT --> BLOCKED
     BLOCKED --> RESUME
 ```
@@ -400,6 +405,14 @@ class Succeeded(BaseModel):
     artifact_bundle: ArtifactBundle
     evidence_refs: tuple[str, ...] = ()
 
+class RepairRequired(BaseModel):
+    kind: Literal["repair_required"] = "repair_required"
+    repair_class: Literal["semantic", "integrity"]
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"]
+    reason_code: str
+    defect_codes: tuple[str, ...]
+    message: str
+
 class ProbeResolution(BaseModel):
     kind: Literal["probe_resolution"] = "probe_resolution"
     operation_key: str
@@ -496,7 +509,8 @@ error code/failure signature 等 failure fields 和 `recorded_at`。同一 ident
 重建一个完全匹配的 `Succeeded` receipt：所有 expected regular files 必须存在、没有额外 leaf/目录/
 unsafe entry，media type/evidence role/metadata 来自 durable manifest，checksums 现场计算，evidence refs
 来自 durable expected evidence identity。缺失、额外、unsafe 或无法唯一重建时进入第 12 节的 immutable
-conflict lifecycle：attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`，绝不重派 executor。空/evidence-only
+conflict lifecycle：持久化 `repair_class=integrity`、`repair_source=integrity_guard` 和稳定 reason code，
+attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`，绝不重派 executor。空/evidence-only
 manifest 或可能返回 failure/probe 而没有唯一文件证据的 attempt 不能猜测 outcome，必须走同一阻断路径。
 
 validator PASS 后，Committer 调用一个 ledger API，在**同一个 SQLite 事务**中写
@@ -528,10 +542,52 @@ next-attempt 创建后、首次 claim 前崩溃时，可恢复派发该 `AUTHORI
 即使崩溃发生在 claim 与 executor 调用之间，也仍遵守 at-most-once 边界，只能按 durable staging/receipt
 规则重建或阻断，不能再次调用 executor。
 
-这条自动 retry 路径不适用于 `REPAIR_REQUIRED`、artifact conflict/integrity failure、durable corruption
-或 unknown probe。它们禁止自动 retry；人工 resolve/unblock 后仍必须显式处理相应证据/冲突，并创建
-new plan version、new action ID 和 new staging namespace。不得通过 `create_next_attempt()` 复活旧
-conflict/corrupt/unknown Action。
+`create_next_attempt()` 只适用于本节两种自动 retry 来源；`RepairRequired` 不重跑原 action，而是按下节
+分类为 semantic automatic replan 或 integrity blocking。artifact conflict、durable corruption 与 unknown
+probe 绝不能借 retry API 继续。
+
+### 7.8 Semantic repair versus integrity blocking
+
+`REPAIR_REQUIRED` 是 attempt/Action 状态，不足以决定 run 路由。每个 repair fact、incident 和对应 outbox
+event 必须持久化 `repair_class=semantic|integrity`、`repair_source=action_outcome|validator|integrity_guard`
+以及稳定 `reason_code`；Action outcome 的 `RepairRequired` 还必须显式携带前三项。缺失、未知或不匹配的
+class/source/reason 一律由 PolicyEngine/ledger classifier 记为 `repair_class_unknown`，按 integrity 路径
+fail closed，不能默认为 semantic。
+
+三条后续执行路径互斥：
+
+1. **Automatic retry**：仅限 `RetryableFailure` 或 durable policy 允许的 `ProbeResolution.absent`。旧
+   attempt/Action → `RETRY_WAIT`；同 `action_id` 幂等创建 attempt+1 和新 staging，不 replan、不需人工。
+2. **Semantic repair replan**：普通业务/质量 `RepairRequired(repair_class="semantic")`，例如
+   `term_drift`，或 validator reason code 在 Registry 的 semantic-repair mapping 中明确绑定 repair
+   capability；并且没有 artifact/receipt/intent integrity conflict，也没有 uncertain external side effect。
+   ledger 事务保留原 attempt receipt，写 repair fact + semantic incident，把原 attempt/Action 标为
+   `REPAIR_REQUIRED`，但 run 保持 `RUNNING`。Planner 只从这些 durable defect facts 自动创建 new
+   plan version、new repair action ID 和 new staging namespace；原 attempt 不重跑，也不使用
+   `create_next_attempt()`。
+3. **Integrity block**：artifact bundle `CONFLICT`、partial intent set/durable corruption、receipt/gate
+   binding conflict、post-success canonical drift、`ProbeResolution.unknown`/conflicting resolution，以及
+   无法安全分类的 external side effect。attempt/Action 按来源保持 `REPAIR_REQUIRED` 或
+   `INDETERMINATE`，run=`BLOCKED`；禁止 Planner 自动 repair。只有人工 resolve/unblock 后才可创建 new
+   plan version、new action ID 和 new staging namespace。
+
+Semantic repair Action 仍只能写自己的 attempt staging，并受新的 exact expected manifest 约束；它不得
+覆盖、删除、选择或“清理”任何 conflict canonical、旧 receipts、gate receipts 或 intents。若 semantic
+repair 规划时发现任一 integrity incident，PolicyEngine 必须拒绝授权并保持 `BLOCKED`。
+
+第一版至少固定以下分类 vocabulary；validator 可增加 reason，但只有 Registry 显式映射后才可进入
+semantic 路径：
+
+| repair class | repair source | stable reason codes | route |
+| --- | --- | --- | --- |
+| `semantic` | `action_outcome` | `term_drift` | run 保持 `RUNNING`；new plan/action/staging |
+| `semantic` | `validator` | Registry-mapped validator reason，例如 `chapter_quality_failed`、`epub_lint_failed` | run 保持 `RUNNING`；new plan/action/staging |
+| `integrity` | `action_outcome` | `artifact_identity_conflict` | run=`BLOCKED`；人工 resolve/unblock 后 new plan/action/staging |
+| `integrity` | `integrity_guard` | `artifact_bundle_conflict`、`artifact_checksum_conflict`、`canonical_write_incomplete`、`partial_intent_set`、`receipt_binding_conflict`、`gate_binding_conflict`、`post_success_drift`、`probe_resolution_unknown`、`probe_resolution_conflict`、`external_side_effect_unclassified`、`repair_class_unknown` | run=`BLOCKED`；人工 resolve/unblock 后 new plan/action/staging |
+
+`repair_source` 描述实际产生 durable repair fact 的边界，不能为迎合 semantic mapping 而改写；例如
+executor 返回的 `term_drift` 是 `action_outcome`，validator FAIL 是 `validator`，Reconciler 检出的 drift
+是 `integrity_guard`。
 
 ## 8. Planner 与 PolicyEngine
 
@@ -546,8 +602,10 @@ Planner 是结构化模型调用，不是拥有业务工具的通用 agent。它
 - 不读取整本书或全部 agent 轨迹；
 - 不能通过文本声称 PASS/DONE。
 
-以下事件触发 replan：Action/batch 完成、gate FAIL、新缺陷、artifact drift、重试用尽、预算阈值、
-人工恢复或约束改变。
+以下事件可触发 replan：Action/batch 完成、已持久化且 policy-mapped 的 semantic repair fact、预算阈值、
+人工 resolve/unblock 后的恢复或约束改变。gate FAIL 只有被 Registry 明确映射为 semantic repair 且完整性
+前提成立时才属于该集合；artifact drift、重试用尽、未知 repair classification 和 integrity incident 必须先
+`BLOCKED`，不能直接触发 Planner。
 
 ### 8.2 PolicyEngine
 
@@ -565,6 +623,12 @@ PolicyEngine 是纯确定性模块，输入
 - 并行 Action 的 write/write 和 read/write 集合无冲突；
 - fan-out、成本、turn、时限和并发上限有效；
 - 相同失败签名不得形成无界循环；
+- semantic repair reason 必须在 Registry 中显式映射到 repair capability，且 durable repair fact 的
+  `repair_class`、`repair_source`、`reason_code` 与映射一致；
+- 任一 integrity incident、未知/缺失 repair classification 或不确定外部副作用存在时，拒绝自动 repair
+  plan 并保持 run=`BLOCKED`；
+- semantic repair Action 的 exact manifest 只能指向新 attempt staging，不能覆盖、删除、选择或清理
+  conflict canonical、旧 outcome/gate receipts、promotion intents 或 probe resolutions；
 - release Action 只能在 terminal policy 的全部前置条件满足后授权。
 
 拒绝决定与原因进入 ledger，作为下一次 Planner 输入和 L1 eval 数据。
@@ -644,6 +708,12 @@ event_outbox
   bundle，重复不同内容 fail closed。
 - probe resolution 表唯一绑定原 action/attempt、probe action/attempt 和 operation key；重复相同 resolution
   幂等，任何冲突 disposition/evidence 都拒绝。
+- repair fact、attempt/action repair state、incident 与 outbox event 持久化同一组
+  `repair_class`、`repair_source`、`reason_code`；缺失、未知或互相不一致时写
+  `repair_class_unknown` 并按 integrity fail closed。
+- semantic repair 路由在一个事务中保留原 receipt、写 repair fact/incident/outbox、把原 attempt/action
+  置为 `REPAIR_REQUIRED`，但 run 保持 `RUNNING`；integrity 路由则在补偿事务中保留所有证据并把 run
+  置为 `BLOCKED`。
 - 业务 commit 与 outbox event 写入同一事务；事件发布后标记 delivered。
 - `events.jsonl`、`metrics.json`、`state/status.json` 是可重建投影，不是真相源。
 
@@ -716,7 +786,8 @@ LangGraph checkpoint
 | 任一 bundle intent 为 `CONFLICT` | attempt/action=`REPAIR_REQUIRED`、run=`BLOCKED`；幂等 subject incident；继续只读对账其余 intents，禁止自动重跑/replan |
 | 全部 promotion 已 `COMMITTED` 但 Action 尚未成功 | 用 gate receipt + intents 对完整 canonical bundle 做统一后验；通过后在一个 SQLite 事务中提交 artifacts/evidence/attempt/action success |
 | ledger 已 success 但 graph 未 checkpoint | Reconciler 重做全部 committed-intent/canonical 后验；一致则跳过执行，drift 则 conflict lifecycle + run `BLOCKED` |
-| gate FAIL | 保留证据并 replan 修复动作 |
+| 普通业务/质量 `RepairRequired`，或 gate FAIL reason 已显式映射 semantic repair | 原 attempt/action=`REPAIR_REQUIRED`，持久化 `repair_class=semantic`、source/reason、证据与 incident；run 保持 `RUNNING`；Planner 自动创建 new plan/action/staging，不重跑原 attempt |
+| gate FAIL 未映射、repair classification 缺失/未知，或存在 integrity/外部副作用不确定性 | 按 `repair_class=integrity`（未知时 reason=`repair_class_unknown`）保留证据并令 run=`BLOCKED`；只允许人工 resolve/unblock 后 new plan/action/staging |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
 | 需要人工判断 | `PAUSED_HITL`；以 interrupt/Command 恢复 |
 | 原 Action 为 `INDETERMINATE` | 只授权其绑定的 evidence-only probe；用 `ProbeResolution` 原子解析，禁止重发原操作 |
@@ -725,14 +796,17 @@ LangGraph checkpoint
 业务事实提供 exactly-once commit。executor 可能被 runtime 调用一次，但一旦 attempt 已是 `RUNNING`，
 Reconciler 不会自动再次调用**同一 attempt**；恢复依赖 stable
 `action_id + plan_version + attempt + idempotency_key`、durable manifest/policy snapshot 和 receipts。
-后续 executor 执行只有两类合法来源：
+后续工作只有三类互斥来源：
 
 - 自动 retry：仅限 `RetryableFailure` 或 durable policy 允许的 `ProbeResolution.absent`。旧 attempt/Action
   先转 `RETRY_WAIT`，再幂等 `create_next_attempt()`；保持同一 `action_id`，使用严格递增的 attempt 和
   `state/staging/{action_id}/{next_attempt}`，不需要人工处理或 new plan；
-- manual recovery：`REPAIR_REQUIRED`、`CONFLICT`、durable corruption 或 unknown probe 均禁止自动 retry。
-  只有人工 resolve/unblock 后才能创建 new plan version、new action ID 和 new staging namespace；旧 attempt
-  永不重入。
+- semantic repair replan：显式 `repair_class=semantic` 且 reason 已映射、无 integrity conflict/不确定副作用
+  时，原 attempt/Action 保持 `REPAIR_REQUIRED`、run 保持 `RUNNING`；Planner 自动创建 new plan version、
+  new repair action ID 和 new staging namespace，原 attempt 永不重入；
+- integrity manual recovery：`repair_class=integrity`、`CONFLICT`、durable corruption、unknown/conflicting
+  probe 或缺失/未知分类均禁止自动 retry/replan。只有人工 resolve/unblock 后才能创建 new plan version、
+  new action ID 和 new staging namespace；旧 attempt 永不重入。
 
 ## 12. 工件隔离与提交
 
@@ -841,6 +915,8 @@ canonical 与 staged 证据，记录
 必须允许 `RUNNING/SUCCEEDED → REPAIR_REQUIRED` 的补偿 transition），run 置为 `BLOCKED`，保留原
 outcome/gate receipts、intents、artifact/gate history 与所有 staged/canonical/partial 文件，并按
 `run/action/attempt/subject/error_code` 幂等创建 incident。不得自动 retry、rerun 或 replan。
+attempt、Action、incident 与 outbox 同时持久化一致的 `repair_class=integrity`、
+`repair_source=integrity_guard` 和该 `error_code` 对应的稳定 `reason_code`。
 
 人工 resolve/unblock 不能复活旧 Action：必须先显式选择/清理 canonical 冲突，再创建新 plan version、
 新 action ID 和新的 staging namespace。旧 receipt/intent/conflict/incident 是不可变历史；旧
@@ -878,11 +954,19 @@ flowchart TD
 
     RESULT -- "Succeeded(bundle)" --> VALIDATE["staging-aware 确定性验证"]
     RESULT -- "RetryableFailure" --> RETRYPOLICY{"durable receipt/policy<br/>允许 next attempt？"}
-    RESULT -- "RepairRequired" --> REPAIR["提交缺陷证据<br/>Planner 生成其他修复 Action"]
+    RESULT -- "RepairRequired" --> REPAIRCLASS{"repair_class/source/reason<br/>明确且一致？"}
     RESULT -- "PermanentFailure" --> PERM["Action = PERMANENT_FAILED<br/>记录不可变 incident"]
     RESULT -- "Indeterminate" --> PROBE["运行绑定的只读 probe<br/>禁止直接重复副作用"]
     RESULT -- "ProbeResolution" --> CHECKPROBE["校验 probe capability<br/>operation key · original status"]
     RESULT -- "Paused" --> PAUSE["PAUSED_BUDGET / PAUSED_HITL"]
+
+    VALIDATE --> GATE{"gate decision"}
+    GATE -- "PASS" --> CONTINUE["进入 receipt/intents/promotion 协议"]
+    GATE -- "FAIL" --> REPAIRCLASS
+    REPAIRCLASS -- "semantic + Registry mapped" --> SEMREPAIR["repair fact + incident<br/>原 action=REPAIR_REQUIRED<br/>run 保持 RUNNING"]
+    SEMREPAIR --> REPLAN
+    REPAIRCLASS -- "integrity / missing / unknown / unmapped" --> INTEGRITY["保留全部证据<br/>run = BLOCKED · 禁止自动 Planner repair"]
+    INTEGRITY --> BLOCKED
 
     PERM --> ALT{"存在策略允许的替代能力？"}
     ALT -- "是" --> REPLAN["生成替代计划"]
@@ -897,7 +981,7 @@ flowchart TD
     RETRYPOLICY -- "否" --> BLOCKED
     RETRYWAIT --> CREATENEXT["create_next_attempt() 一个事务<br/>同 action_id · attempt+1 · AUTHORIZED"]
     CREATENEXT --> NEWDISPATCH["首次 claim/dispatch 新 attempt<br/>新 staging namespace"]
-    KNOWN -- "unknown" --> UNKNOWNBLOCKED["原 attempt 保持 INDETERMINATE<br/>Run = BLOCKED / 人工核对"]
+    KNOWN -- "unknown / conflicting" --> UNKNOWNBLOCKED["原 attempt 保持 INDETERMINATE<br/>Run = BLOCKED / 人工核对"]
 ```
 
 分类规则：
@@ -905,8 +989,9 @@ flowchart TD
 | Outcome | 语义 | 例子 | 下一步 |
 | --- | --- | --- | --- |
 | `RetryableFailure` | 同一输入在**新 attempt** 再次执行可能成功 | 429、5xx、临时网络/锁 | 旧 attempt=`RETRY_WAIT`；幂等创建 attempt+1、新 staging；指数退避、jitter、上限 |
-| `RepairRequired` | 原动作不该重试，但其他工作可修复证据 | 术语冲突、章节质量 FAIL、EPUB lint FAIL | replan 修复 Action |
-| `PermanentFailure` | 相同能力和输入不会成功 | 版权禁止、格式不支持、权限永久拒绝、invariant 冲突 | 替代能力或 `BLOCKED` |
+| `RepairRequired(repair_class="semantic")` | 原动作不重跑，但已映射的业务/质量缺陷可由新动作修复，且没有完整性冲突或不确定副作用 | `term_drift`、映射到 repair capability 的章节质量或 EPUB lint reason | 原 attempt/action=`REPAIR_REQUIRED`、run 保持 `RUNNING`；自动 new plan/new action/new staging |
+| `RepairRequired(repair_class="integrity")` | 证据、绑定或外部副作用不可信；缺失/未知分类也归此路径 | artifact `CONFLICT`、partial intents、receipt/gate binding conflict、post-success drift、unknown/conflicting probe | run=`BLOCKED`；只有人工 resolve/unblock 后 new plan/new action/new staging |
+| `PermanentFailure` | 相同能力和输入不会成功 | 版权禁止、格式不支持、权限永久拒绝 | 替代能力或 `BLOCKED` |
 | `Indeterminate` | 带 durable error code/failure signature 的副作用可能已发生 | 发布超时、commit 后崩溃 | probe/reconcile，禁止盲重试 |
 | `Paused` | 等待预算或人类 | 预算上限、敏感动作确认 | interrupt 后恢复 |
 | `ProbeResolution` | 只读 probe 对原 operation 的专用裁决 | 外部幂等查询、发布状态核对 | 经 ledger 原子 resolve；不能作为普通成功 |
@@ -973,7 +1058,10 @@ run.completed
 ```
 
 事件包含 `run_id`、`plan_version`、`action_id`、`attempt`、capability、输入/输出 artifact hashes、
-validator version、错误分类、成本和 trace IDs。敏感正文是否进入 trace 继续受安全配置控制。
+validator version、错误分类、成本和 trace IDs。repair 事件还必须携带与 ledger 一致的
+`repair_class`、`repair_source`、`reason_code`；未知分类以 `repair_class=integrity`、
+`reason_code=repair_class_unknown` 投影，不能省略或猜为 semantic。敏感正文是否进入 trace 继续受安全配置
+控制。
 
 ## 17. Eval 与测试策略
 
@@ -989,6 +1077,8 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - read/write 冲突；
 - terminal policy；
 - ActionOutcome 分类；
+- semantic/integrity repair classification 的 class/source/reason 必填、Registry reason mapping 与未知分类
+  fail-closed；
 - frozen bundle 的唯一排序/canonical JSON、非空、duplicate/path/type/identity 拒绝；
 - 参数展开的 expected effect manifest 与实际 bundle 对额外/缺失项均 fail closed；
 - agent handler 与 deterministic builder 都只能通过 attempt-scoped writer 写 staging；
@@ -998,6 +1088,11 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - receipt exact replay 幂等、conflicting replay/partial intent set fail closed；
 - retry route 原子终结旧 attempt/action 为 `RETRY_WAIT`，并发/重复
   `create_next_attempt()` 只创建同 action ID 的唯一 attempt+1=`AUTHORIZED`，完整复制 frozen facts；
+- semantic repair 事务保留原 receipt、将原 attempt/action 置为 `REPAIR_REQUIRED`、run 保持 `RUNNING`，
+  重复/并发 replan 只产生一个 new plan version/new repair action ID/new staging，且不调用
+  `create_next_attempt()`；
+- integrity/缺失/未知 repair classification 把 run 置为 `BLOCKED`，Planner 不生成 repair Action；semantic
+  repair manifest 不能触及 conflict canonical、旧 receipts/gates/intents；
 - ledger transition 和事务回滚；
 - 全部 intents durable 之前零 canonical copy、完整 bundle 前零 ledger success；
 - artifact promotion 与 checksum 冲突；
@@ -1005,7 +1100,8 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 
 ### 17.2 Planner eval
 
-- 给定 snapshot 是否选择合法且最小的修复动作；
+- 给定 durable semantic repair snapshot 是否选择合法且最小的新修复动作，并保留原 action lineage；
+- 给定 integrity incident 或缺失/未知 repair classification 时是否保持 `BLOCKED` 且不调用 Planner；
 - 是否避免重复失败动作；
 - 是否在预算下降时缩短计划；
 - 是否针对公式、插图、体裁等特征选择需要的 capability；
@@ -1023,7 +1119,10 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - `after_outcome_receipt`、gate receipt/all-intents transaction、每个 copy/postcheck、统一 bundle 后验和
   success transaction 边界崩溃后均 receipt-driven 恢复；
 - 部分 intents、任一 `CONFLICT` 或完整性失败进入 immutable conflict lifecycle，不自动 retry/replan；
-- success 后 graph crash 复核全部 intent/canonical；drift 补偿为 `REPAIR_REQUIRED` + run `BLOCKED`；
+- success 后 graph crash 复核全部 intent/canonical；drift 补偿为
+  `repair_class=integrity` 的 `REPAIR_REQUIRED` + run `BLOCKED`；
+- semantic repair fact/incident 事务前后与 new plan/action 创建前后崩溃，恢复后 run 始终保持 `RUNNING`、
+  原 attempt 不重跑、只产生一个新 repair action；若同时出现 integrity incident 则立即 fail closed；
 - `Indeterminate` 的 `succeeded/absent/unknown` probe matrix 不会盲重试，重复相同 resolution 幂等且冲突
   resolution fail closed；
 - 普通 `RetryableFailure` 与 probe `absent` 都先把旧 attempt/action 终结为 `RETRY_WAIT`；在
@@ -1041,7 +1140,7 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - 术语缺陷只修订受影响章节；
 - 并行章节执行；
 - 独立双评审；
-- EPUB gate FAIL 后精准修复；
+- EPUB gate FAIL reason 已映射时精准 semantic repair；未映射或有 integrity conflict 时阻断；
 - permanent copyright failure；
 - release 结果不确定后的 reconcile；
 - Planner 连续产生非法 plan 时安全阻断。
@@ -1109,12 +1208,14 @@ dict/Any。
    SQLite 事务中 durable，之后才允许 promote。
 7. 完整 bundle 的所有 intents `COMMITTED` 后通过统一 canonical 后验，才在一个 SQLite 事务中提交
    artifacts/gates/success；文档和实现均不声称文件系统多文件或跨介质原子。
-8. 崩溃恢复按 run/action/attempt 和 receipts 对账、不重跑同一 attempt 的 Action executor；任一
-   conflict/integrity failure 触发
-   immutable `REPAIR_REQUIRED + BLOCKED` lifecycle，人工只能用新 plan/action/staging 继续。
-9. `PermanentFailure`、`RepairRequired`、带 durable error code 的 `Indeterminate`、三种
-   `ProbeResolution`、预算暂停和 HITL 都有
-   端到端测试；probe 重放相同裁决幂等、冲突裁决 fail closed。
+8. 崩溃恢复按 run/action/attempt 和 receipts 对账、不重跑同一 attempt 的 Action executor；semantic
+   repair 保留原 receipt/attempt 并在 run=`RUNNING` 下幂等创建 new plan/action/staging；任一
+   conflict/integrity/unknown-class failure 触发 immutable `REPAIR_REQUIRED + BLOCKED` lifecycle，人工只能
+   resolve/unblock 后用 new plan/action/staging 继续。
+9. `PermanentFailure`、semantic 与 integrity 两类 `RepairRequired`、缺失/未知 repair classification、带
+   durable error code 的 `Indeterminate`、三种 `ProbeResolution`、预算暂停和 HITL 都有端到端测试；
+   semantic repair 自动 replan 不复活原 attempt，integrity repair 不调用 Planner，probe 重放相同裁决幂等、
+   冲突裁决 fail closed。
 10. 恢复不会重复已提交业务事实；不确定副作用不会盲重试。
 11. 动态并行不会产生未声明的写冲突。
 12. 所有 LLM 与子 agent 调用仍受预算、Langfuse 和本地事件管道覆盖。

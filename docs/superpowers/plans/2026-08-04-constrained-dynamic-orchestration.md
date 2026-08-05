@@ -26,8 +26,14 @@
 >
 > **Retry/manual-recovery distinction fix round 3 (2026-08-05):** Automatic retry keeps the
 > authorized action ID and creates attempt+1 without human intervention or a new plan. Only
-> `REPAIR_REQUIRED`, conflict, durable corruption, and unknown-probe recovery require human
-> resolve/unblock followed by a new plan version, action ID, and staging namespace.
+> integrity-class `REPAIR_REQUIRED`, conflict, durable corruption, and unknown-probe recovery require
+> human resolve/unblock followed by a new plan version, action ID, and staging namespace.
+>
+> **Semantic/integrity repair distinction fix round 4 (2026-08-05):** `REPAIR_REQUIRED` is a status,
+> not one universal disposition. A mapped ordinary business/quality repair keeps the run `RUNNING`
+> and automatically creates a new plan version/action ID/staging namespace; integrity repair and
+> missing/unknown classification fail closed to `BLOCKED`. Every repair fact, incident, and event
+> persists explicit `repair_class`, `repair_source`, and stable `reason_code`.
 
 ## Global Constraints
 
@@ -54,7 +60,21 @@
 - Validator PASS becomes durable only when one SQLite transaction creates the `gate_receipt` and the complete promotion-intent set. No canonical copy precedes that transaction.
 - Before success, Committer performs a unified postcheck of every committed canonical entry against receipts/intents; post-success reconciliation continues the same checks and blocks the run on drift.
 - Any intent conflict, partial intent set, receipt mismatch, or integrity failure atomically moves attempt/Action to `REPAIR_REQUIRED`, blocks the run, preserves all evidence/files, and requires a new plan version/new action ID/new staging namespace after manual resolution.
-- `REPAIR_REQUIRED`, any conflict/durable corruption, and an unknown probe disposition are never eligible for `create_next_attempt()`; after human resolve/unblock, any further execution uses a new plan version, new action ID, and new staging namespace. This manual path is distinct from allowed automatic retry.
+- `REPAIR_REQUIRED` is never eligible for `create_next_attempt()`. A durable, Registry-mapped
+  `repair_class=semantic` fact with no integrity conflict or uncertain external side effect leaves the
+  run `RUNNING`; Planner automatically creates a new plan version, repair action ID, and staging
+  namespace while preserving the original attempt. A `repair_class=integrity` fact, any
+  conflict/durable corruption, unknown/conflicting probe, unsafe external side effect, or
+  missing/unknown/mismatched classification blocks the run; only that path requires human
+  resolve/unblock before a new plan/action/staging. Semantic repair cannot overwrite or clean
+  conflict canonical files, receipts, gates, intents, or probe resolutions.
+- The initial stable repair vocabulary includes semantic `term_drift` and Registry-mapped validator
+  reasons, plus integrity `artifact_identity_conflict`, `artifact_bundle_conflict`,
+  `artifact_checksum_conflict`, `canonical_write_incomplete`, `partial_intent_set`,
+  `receipt_binding_conflict`, `gate_binding_conflict`, `post_success_drift`,
+  `probe_resolution_unknown`, `probe_resolution_conflict`, `external_side_effect_unclassified`, and
+  `repair_class_unknown`. The stored `repair_source` is the actual producing boundary, not a value
+  rewritten to obtain semantic authorization.
 - `ProbeResolution` is a separate evidence-only outcome. It atomically resolves the original `INDETERMINATE` attempt through the ledger; ordinary `Succeeded` never implicitly resolves an external operation.
 - Unclassified failures are `PermanentFailure`, except possible external side effects, which are `Indeterminate` and must be probed before retry.
 - Translation Actions receive only source text, five to eight style rules, and matched terminology; QA, EPUB, and release rules are excluded.
@@ -87,13 +107,19 @@ flowchart TD
     BUNDLE --> OUTREC["AttemptOutcomeReceipt<br/>durable before controller hook"]
     OUTREC --> VIEW["StagingEvidenceView<br/>current outputs shadow canonical"]
     VIEW --> GATE["GateDecision<br/>bundle digest + staged checksums"]
-    GATE --> INTENTS["One SQLite transaction<br/>GateReceipt + complete intent set"]
+    GATE -- "PASS" --> INTENTS["One SQLite transaction<br/>GateReceipt + complete intent set"]
     INTENTS --> PROMOTE["Per-entry promote / reconcile<br/>filesystem is not atomic"]
     PROMOTE --> ALL{"All intents COMMITTED?"}
     ALL -- "yes" --> POSTCHECK["Unified canonical bundle postcheck"]
     POSTCHECK -- "pass" --> SUCCESS["One SQLite transaction<br/>artifacts + gate + attempt/action success"]
-    ALL -- "no / conflict" --> INCIDENT["Attempt/Action REPAIR_REQUIRED<br/>Run BLOCKED · immutable evidence"]
+    ALL -- "no / conflict" --> INCIDENT["Integrity-class REPAIR_REQUIRED<br/>Run BLOCKED · immutable evidence"]
     POSTCHECK -- "drift" --> INCIDENT
+
+    REPAIR["RepairRequired outcome"] --> REPAIRCLASS{"Explicit class/source/reason<br/>and Registry mapping?"}
+    GATE -- "FAIL" --> REPAIRCLASS
+    REPAIRCLASS -- "semantic + mapped" --> SEMANTIC["Original attempt/action REPAIR_REQUIRED<br/>Run stays RUNNING · repair fact + incident"]
+    SEMANTIC --> NEWREPAIR["Planner creates new plan version<br/>new repair action ID + staging"]
+    REPAIRCLASS -- "integrity / missing / unknown / unmapped" --> INCIDENT
 
     INDET["Original attempt INDETERMINATE"] --> PROBE["Bound read-only probe Action"]
     PROBE --> RESOLUTION{"ProbeResolution"}
@@ -103,7 +129,7 @@ flowchart TD
     RETRY --> NEXTATTEMPT["One ledger transaction<br/>same action_id · attempt+1 AUTHORIZED<br/>fresh staging + frozen facts"]
     NEXTATTEMPT --> NEXTDISPATCH["First dispatch of new attempt only"]
     RESOLUTION -- "absent + retry denied" --> BLOCKED["Run BLOCKED"]
-    RESOLUTION -- "unknown" --> BLOCKED
+    RESOLUTION -- "unknown / conflicting" --> BLOCKED
 ```
 
 ## Task 1: Frozen Orchestration and Tool Contracts
@@ -171,7 +197,10 @@ conflicting `ActionOutcomeEnvelope` identity. Add a golden canonical-JSON/digest
 three `ProbeResolution.disposition` values. Assert `Indeterminate` rejects missing error code or a
 non-canonical failure signature. Add receipt-payload tests for JSON/digest mismatch, success without
 bundle, failure without failure fields, and caller disorder; never auto-sort. Assert the superseded
-single-file payload is rejected as an extra/missing-field error.
+single-file payload is rejected as an extra/missing-field error. Assert `RepairRequired` rejects a
+missing/unknown `repair_class`, missing/unknown `repair_source`, or empty `reason_code`; Task 8's
+boundary classifier must convert such malformed external outcomes into an integrity incident with
+`reason_code=repair_class_unknown`, never silently default them to semantic.
 
 - [ ] **Step 2: Run the tests and confirm the missing-module failure**
 
@@ -239,6 +268,9 @@ class RetryableFailure(FrozenModel):
 
 class RepairRequired(FrozenModel):
     kind: Literal["repair_required"] = "repair_required"
+    repair_class: Literal["semantic", "integrity"]
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"]
+    reason_code: str
     defect_codes: tuple[str, ...]
     message: str
 
@@ -431,6 +463,9 @@ class IncidentView(FrozenModel):
     error_code: str
     message: str
     action_id: str | None = None
+    repair_class: Literal["semantic", "integrity"] | None = None
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"] | None = None
+    reason_code: str | None = None
 
 
 class ActionView(FrozenModel):
@@ -438,6 +473,9 @@ class ActionView(FrozenModel):
     capability: str
     status: ActionStatus
     failure_signature: str | None = None
+    repair_class: Literal["semantic", "integrity"] | None = None
+    repair_source: Literal["action_outcome", "validator", "integrity_guard"] | None = None
+    reason_code: str | None = None
 
 
 class EligibleAction(FrozenModel):
@@ -522,6 +560,11 @@ pairs, require bundle fields only for ordinary success, and preserve caller orde
 repairing it. Apply discriminant-specific rules: copy
 `error_code` where the outcome defines it, and require `failure_signature` for `Indeterminate`.
 
+`IncidentView` and `ActionView` use model validators so repair fields are all-null for non-repair
+records or all-present for repair records. A `REPAIR_REQUIRED` action cannot be parsed without a
+class/source/reason; malformed persisted values become the integrity `repair_class_unknown` incident
+at the repository boundary before a snapshot is exposed.
+
 No legacy single-file `Succeeded` field or compatibility parser is permitted. An ordinary success
 must contain at least one entry; evidence-only probe Actions return `ProbeResolution`, never an
 empty bundle. `ActionOutcomeEnvelope.action_id` and `.attempt`, when parsed at the dispatcher
@@ -556,7 +599,7 @@ git commit -m "feat: define dynamic orchestration contracts"
 
 **Interfaces:**
 - Consumes: Task 1 models.
-- Produces: `ActionDefinition`, `ResolvedAction`, `ActionExecutionContext`, `ActionRegistry.register()`, `ActionRegistry.resolve()`, `PredicateCatalog`, and `PolicyEngine.authorize(snapshot, patch, next_plan_version)`.
+- Produces: `ActionDefinition`, `ResolvedAction`, `ActionExecutionContext`, `ActionRegistry.register()`, `ActionRegistry.resolve()`, explicit semantic-repair reason-to-capability mappings, `PredicateCatalog`, and `PolicyEngine.authorize(snapshot, patch, next_plan_version)`.
 
 - [ ] **Step 1: Write registry fail-closed tests**
 
@@ -597,6 +640,13 @@ def test_policy_emits_only_canonical_validated_parameters() -> None:
     assert action.retry_policy.retryable_codes == ("provider_timeout",)
     assert action.retry_policy_fingerprint == retry_policy_digest(action.retry_policy)
 ```
+
+Add tests that a durable semantic repair fact such as `term_drift` authorizes only its explicitly
+mapped repair capability with a new action ID/manifest, while the original action remains outside
+the patch. Assert an integrity incident, uncertain external side effect, unknown/missing/mismatched
+repair class/source/reason, or semantic repair manifest touching conflict canonical paths, old
+receipts, gates, intents, or probe resolutions rejects the whole patch with stable reason codes and
+does not call the Planner fallback.
 
 - [ ] **Step 3: Run both test files and observe missing implementations**
 
@@ -667,11 +717,24 @@ class ActionRegistry:
 
 `validate_startup()` iterates every definition and calls `_validate_definition()`. `eligible()` evaluates every declared predicate through `PredicateCatalog`, then returns immutable `EligibleAction` summaries sorted by capability. Unit tests must exercise those two methods directly rather than relying only on `register()`.
 
+Registry startup also validates an explicit one-to-one semantic repair mapping from stable validator/
+outcome `reason_code` to a registered repair capability. Duplicate reasons, missing targets, or a
+mapping to a capability whose declared effects could touch protocol-owned conflict evidence fail
+startup. Absence from this mapping is not an implicit semantic repair.
+
 `resolve()` rejects duplicate argument names, parses each `value_json`, builds one JSON object only inside the parsing boundary, validates it through `input_model.model_validate`, and immediately stores `model_dump_json()` as canonical JSON. Error text names the capability, field, and how to correct the plan.
 
 - [ ] **Step 5: Implement deterministic policy checks**
 
 `PolicyEngine.authorize()` runs in this order: horizon 1–5, unique proposal IDs, known/eligible capability, argument parsing, deterministic effect expansion, dependencies exist, acyclic graph, hard prerequisites, budget estimate, read/write conflicts, repeated-failure signature, terminal release policy. For each authorized Action it embeds the canonical parameter-expanded expected manifest JSON/digest, stable expected evidence refs, and the complete canonical `RetryPolicySpec` JSON/fingerprint; these are authorization facts, not later Registry lookups. It returns all rejection codes in stable sorted order and never partially authorizes a rejected patch.
+
+Before ordinary plan checks, classify open repair facts. Only a fact with
+`repair_class=semantic`, an explicit trusted source/reason, a Registry mapping, run=`RUNNING`, and no
+integrity incident or uncertain external side effect may authorize an automatic repair plan. That
+plan creates a new plan version/action ID and exact fresh-staging manifest. Integrity or
+missing/unknown/mismatched classification keeps run=`BLOCKED` and rejects Planner output. A semantic
+repair action may not overwrite/delete/select/clean conflict canonical files or mutate old outcome/
+gate receipts, promotion intents, or probe resolutions.
 
 ```python
 class PolicyEngine:
@@ -715,7 +778,7 @@ git commit -m "feat: authorize registered actions with deterministic policy"
 
 **Interfaces:**
 - Consumes: Task 1 models.
-- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `create_next_attempt()`, `start_attempt()`, `record_attempt_outcome()`, `create_gate_receipt_and_bundle_intents()`, `mark_bundle_conflict()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
+- Produces: `RunLedger.open(path)`, `create_run()`, `append_plan()`, `authorize_actions()`, `create_next_attempt()`, `start_attempt()`, `record_attempt_outcome()`, `record_repair_required()`, `create_gate_receipt_and_bundle_intents()`, `mark_bundle_conflict()`, `finish_attempt()`, `commit_success()`, `record_incident()`, `set_run_status()`, `load_snapshot()`, and `rebuild_status_projection()`.
 
 - [ ] **Step 1: Write transaction, transition, and exactly-once tests**
 
@@ -776,6 +839,13 @@ async def test_outcome_receipt_is_idempotent_but_conflicts_on_changed_bundle(tmp
             )
 ```
 
+Add transaction tests for both `record_repair_required()` branches. Semantic `term_drift` must
+atomically persist the original receipt-bound repair fact/incident/outbox, set original
+attempt/action `REPAIR_REQUIRED`, and leave run `RUNNING`. Integrity, unknown/missing class/source/
+reason, and conflicting replay must preserve evidence and set run `BLOCKED`. Assert all repair rows
+carry identical class/source/reason values and neither branch creates a retry attempt or replacement
+Action inside the ledger transaction.
+
 - [ ] **Step 2: Run the ledger tests and confirm failure**
 
 Run: `.venv/bin/pytest tests/test_run_ledger.py -v`
@@ -784,7 +854,7 @@ Expected: collection fails because `abi.project.run_ledger` does not exist.
 
 - [ ] **Step 3: Add the async SQLite dependency and schema**
 
-Add `"aiosqlite>=0.20,<1"` to runtime dependencies and run `uv lock`. `SCHEMA_SQL` must create WAL-backed tables `runs`, `plan_versions`, `actions`, `action_attempts`, `attempt_outcome_receipts`, `artifact_bundles`, `artifacts`, `gate_receipts`, `promotion_intents`, `gate_evidence`, `probe_resolutions`, `incidents`, `interrupts`, `budget_entries`, and `event_outbox`.
+Add `"aiosqlite>=0.20,<1"` to runtime dependencies and run `uv lock`. `SCHEMA_SQL` must create WAL-backed tables `runs`, `plan_versions`, `actions`, `action_attempts`, `attempt_outcome_receipts`, `artifact_bundles`, `artifacts`, `gate_receipts`, `promotion_intents`, `gate_evidence`, `probe_resolutions`, `repair_facts`, `incidents`, `interrupts`, `budget_entries`, and `event_outbox`.
 
 `actions` stores canonical expected-manifest JSON/digest, stable expected evidence refs, plus complete retry-policy JSON/fingerprint.
 Initial `start_attempt()` copies those immutable facts into `action_attempts` in the same transaction
@@ -799,6 +869,13 @@ bundle digest, ordered staged path/canonical path/checksum identities, evidence 
 `(action_id, attempt)`, non-null `(action_id, retry_of_attempt)`, exactly one outcome receipt and gate receipt per attempt, one bundle per
 attempt, artifact canonical path, one probe resolution per original attempt/operation key, and
 event idempotency key.
+
+`repair_facts` uniquely binds run/action/attempt to `repair_class`, `repair_source`, stable
+`reason_code`, defect/evidence identities, and the original outcome/gate receipt. The matching
+nullable fields on `actions`, `action_attempts`, `incidents`, and repair-related `event_outbox` rows
+must agree with that fact. Repository parsing treats a missing/unknown/mismatched class/source/reason
+as `repair_class=integrity`, `reason_code=repair_class_unknown`, and blocks the run; projections never
+invent a semantic default.
 
 ```sql
 CREATE TABLE IF NOT EXISTS actions (
@@ -822,11 +899,21 @@ CREATE TABLE IF NOT EXISTS actions (
 
 Use `aiosqlite.Connection`, `BEGIN IMMEDIATE`, injected UTC clock, and repository-owned row-to-model parsing. `record_attempt_outcome()` verifies the receipt against the immutable attempt identity/manifest/policy snapshot; exact replay is idempotent and any differing fact conflicts. Route an allowed ordinary `RetryableFailure` by atomically terminating its attempt/Action as `RETRY_WAIT` while preserving its receipt/error/signature. `create_next_attempt(action_id, previous_attempt)` then verifies that durable state and the snapshotted policy/count, derives exactly `previous_attempt + 1`, and in one transaction creates a not-yet-run `AUTHORIZED` row with a fresh staging identity and copies the same authorized parameters/manifest/evidence/retry facts. It also returns the Action to `AUTHORIZED`. Exact/concurrent replay returns that row; an existing mismatched successor fails closed instead of creating another attempt. `create_gate_receipt_and_bundle_intents()` verifies outcome/bundle identity and inserts the gate receipt plus the **complete** intent set in one transaction; partial replay is corruption, never piecemeal repair. `commit_success()` requires matching outcome/gate receipts and every expected intent `COMMITTED`, then writes Action status, artifacts, gate evidence, budget entry, and outbox event in one SQLite transaction. An identical repeated commit returns the prior record; a different checksum for the same Action enters the conflict lifecycle.
 
+`record_repair_required()` has two mutually exclusive transactions. For a trusted, Registry-mapped
+semantic reason with no integrity/external-side-effect conflict, preserve the original receipt,
+insert the repair fact + semantic incident + outbox, set original attempt/Action
+`REPAIR_REQUIRED`, and leave run=`RUNNING`; it neither calls `create_next_attempt()` nor creates the
+replacement action. For integrity or missing/unknown/mismatched classification, preserve every fact,
+write `repair_class=integrity` (unknown reason becomes `repair_class_unknown`), set attempt/Action
+`REPAIR_REQUIRED` or preserve `INDETERMINATE` as appropriate, and set run=`BLOCKED`. Exact replay is
+idempotent; conflicting replay is itself an integrity block.
+
 Add legal retry transitions `RUNNING → RETRY_WAIT → AUTHORIZED → RUNNING`, with the last two
 transitions applying only through the unique new attempt. Add compensating transitions `RUNNING → REPAIR_REQUIRED` and
 `SUCCEEDED → REPAIR_REQUIRED` for receipt/intent/canonical integrity failure. `mark_bundle_conflict()`
 atomically applies the attempt and Action transition, sets run `BLOCKED`, and inserts one idempotent
-subject-scoped incident while preserving all prior receipts/intents/artifact/gate rows. It cannot
+subject-scoped incident with `repair_class=integrity`, `repair_source=integrity_guard`, and its stable
+conflict `reason_code`, while preserving all prior receipts/intents/artifact/gate rows. It cannot
 authorize retry or create a replacement Action.
 
 ```python
@@ -963,14 +1050,16 @@ canonical copies; a crash after intent creation or after any individual copy lea
 intent without executing the Action, and reports every conflict after read-only inspection of the
 rest. Add missing outcome-receipt tests that rebuild only when every expected regular file exists
 and there are no extra/unsafe leaves; incomplete/extra staging must atomically set attempt/Action
-`REPAIR_REQUIRED` and run `BLOCKED` without executor calls. Assert a bundle with one `CONFLICT` can
+`REPAIR_REQUIRED`, persist `repair_class=integrity`, `repair_source=integrity_guard` and the stable
+staging reason code, and set run `BLOCKED` without executor calls. Assert a bundle with one `CONFLICT` can
 never be reported successful even when all sibling intents had already committed.
 
 Add unified-postcheck tests that mutate entry 1 or entry 2 after its per-item postcheck but before
 success; `verify_committed_bundle()` must detect name/inode/checksum/dirchain drift against
 outcome/gate receipts and intents, enter the conflict lifecycle, and withhold success. Repeat after
 success and assert the compensating `SUCCEEDED → REPAIR_REQUIRED` transition, idempotent incident,
-and run `BLOCKED` while prior success/artifact/gate history remains auditable.
+explicit integrity class/source/drift reason, and run `BLOCKED` while prior success/artifact/gate
+history remains auditable.
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
@@ -1087,7 +1176,8 @@ proves every name/inode/checksum/dirchain against outcome receipt, gate receipt,
 single failure marks the entire bundle conflict. This pre-success check does not make filesystem
 and SQLite atomic. The next Reconciler cycle repeats it even after success; post-success drift uses
 the compensating `SUCCEEDED → REPAIR_REQUIRED`, run `BLOCKED`, and idempotent incident path while
-preserving prior business history.
+preserving prior business history; the action/attempt/incident/event all carry matching
+`repair_class=integrity`, `repair_source=integrity_guard`, and post-success-drift reason.
 
 - [ ] **Step 6: Implement reconciliation from the durable state table**
 
@@ -1180,6 +1270,9 @@ and eligible capability descriptions—never book body or arbitrary rejection
 messages. Limit incident messages to 500 characters, samples to configured
 counts, and Planner horizon to five. Loading additional content is represented
 by an eligible `inspect.*` Action rather than direct file access.
+Repair facts/incidents retain their explicit class/source/reason. Only mapped semantic repair facts
+may expose repair capabilities while run=`RUNNING`; an integrity/unknown-class blocked snapshot
+exposes no automatic repair candidate and controller must not invoke Planner for it.
 
 - [ ] **Step 4: Implement the Planner prompt and structured call**
 
@@ -1187,7 +1280,7 @@ by an eligible `inspect.*` Action rather than direct file access.
 PLANNER_SYSTEM_PROMPT = """You are ABI's constrained planner.
 Return one PlanPatch with one to five actions chosen only from eligible_actions.
 You cannot mark gates passed, mutate run state, invent capabilities, or skip dependencies.
-Prefer the smallest action that produces missing evidence or repairs an open incident.
+Prefer the smallest action that produces missing evidence or repairs a mapped semantic incident.
 Treat prior rejection reasons as hard feedback.
 """
 
@@ -1444,7 +1537,9 @@ from the committed artifact manifest; another attempt's staging is invisible; an
 version. Add fail-closed tests for extra and missing expected effects, media/evidence-role mismatch,
 metadata mismatch, caller-disordered bundle entries/metadata (no auto-sort), and a deterministic
 builder or agent tool attempting a direct canonical write. Assert even the unknown-validator FAIL
-decision contains required validator ID/version, bundle digest, ordered checksums, and evidence refs.
+decision contains required validator ID/version, bundle digest, ordered checksums, and evidence refs;
+because its reason is not Registry-mapped semantic repair, controller must fail closed to integrity
+`BLOCKED`, not automatically replan.
 
 - [ ] **Step 3: Run focused tests and confirm failure**
 
@@ -1569,7 +1664,13 @@ async def test_controller_replans_after_repair_and_completes() -> None:
     rig = controller_rig(outcomes=(
         ActionOutcomeEnvelope(
             action_id="a1", attempt=1,
-            outcome=RepairRequired(defect_codes=("term_drift",), message="repair glossary"),
+            outcome=RepairRequired(
+                repair_class="semantic",
+                repair_source="action_outcome",
+                reason_code="term_drift",
+                defect_codes=("term_drift",),
+                message="repair glossary",
+            ),
         ),
         ActionOutcomeEnvelope(
             action_id="a2", attempt=1,
@@ -1581,7 +1682,29 @@ async def test_controller_replans_after_repair_and_completes() -> None:
     ))
     await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
     assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.COMPLETED
+    assert await rig.ledger.attempt_status("a1", 1) is ActionStatus.REPAIR_REQUIRED
+    assert await rig.ledger.plan_versions() == (1, 2)
+    assert await rig.ledger.action_ids() == ("a1", "a2")
+    assert await rig.executor.attempt_ids("a1") == (1,)
     assert await rig.ledger.event_names() == expected_replan_event_sequence()
+
+
+@pytest.mark.asyncio
+async def test_integrity_repair_blocks_without_planner_or_replacement() -> None:
+    rig = controller_rig(outcomes=(ActionOutcomeEnvelope(
+        action_id="a1", attempt=1,
+        outcome=RepairRequired(
+            repair_class="integrity",
+            repair_source="action_outcome",
+            reason_code="artifact_identity_conflict",
+            defect_codes=("artifact_identity_conflict",),
+            message="preserve evidence for human resolution",
+        ),
+    ),))
+    await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+    assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
+    assert rig.planner.call_count == 0
+    assert await rig.ledger.action_ids() == ("a1",)
 
 
 @pytest.mark.asyncio
@@ -1636,6 +1759,13 @@ copy/postcheck and unified postcheck; one conflict among committed
 siblings; and refusal to mark either attempt or Action successful before every intent is
 `COMMITTED`. Assert a crash leaves the attempt `RUNNING` unless integrity failure invokes the
 explicit `REPAIR_REQUIRED + BLOCKED` compensation.
+Add a mapped validator `term_drift` FAIL test with the same semantic lineage, and unmapped validator
+FAIL, malformed/unknown repair classification, uncertain external side effect, and concurrent
+integrity-incident tests that all block with zero replacement Action/Planner invocation. Assert the
+semantic branch records class/source/reason consistently, leaves the run `RUNNING` between old-action
+repair commit and Planner append, creates one new plan/action/staging under repeated ticks, never
+creates attempt+1 for the old action, and cannot write/delete/select conflict canonical or protocol
+receipt/intent rows.
 
 - [ ] **Step 3: Run Scheduler and controller tests and confirm failure**
 
@@ -1652,6 +1782,9 @@ Dispatcher canonical-encodes the envelope and calls `record_attempt_outcome()` i
 transaction. Only after that transaction commits may it invoke the `after_action_output` hook or
 return control to the controller. This applies to success and all failure outcomes; receipts are not
 PASS or terminal status. `Indeterminate` requires error code and canonical failure signature.
+If external outcome parsing lacks a valid repair class/source/reason, Dispatcher/controller records
+an integrity incident with `reason_code=repair_class_unknown` and blocks the run; it never repairs the
+payload by defaulting to semantic.
 
 - [ ] **Step 5: Implement commit and reconciliation routing**
 
@@ -1679,7 +1812,10 @@ Implement ordinary-success commit in this exact order:
 Filesystem promotion across bundle entries is explicitly non-atomic. Any crash before step 6 leaves
 the attempt `RUNNING`; it does not become retryable, repair-required, or successful merely because
 some files exist. Outcome routing is exact: retryable → atomically close old attempt/Action as
-`RETRY_WAIT`, then explicit idempotent attempt+1 creation and first dispatch; repair → incident + replan;
+`RETRY_WAIT`, then explicit idempotent attempt+1 creation and first dispatch; mapped semantic repair
+→ durable repair fact/incident, original attempt/Action `REPAIR_REQUIRED`, run remains `RUNNING`, then
+Planner creates exactly one new plan version/repair action ID/staging; integrity or missing/unknown
+repair classification → preserve evidence and run `BLOCKED` with no Planner call;
 permanent → alternative capability or BLOCKED; indeterminate → registered probe Action only; paused
 → run pause; ordinary success → the six-step receipt protocol. Reconciler runs before every planning
 cycle and groups facts by run/action/attempt. A `RUNNING` attempt with no outcome receipt is never
@@ -1690,15 +1826,20 @@ staging or rerunning validator. A durable non-success receipt is routed idempote
 discriminant and attempt-snapshotted policy/failure facts, never from in-memory output. Revalidate only when all staging remains and require byte-identical
 GateDecision JSON/digest. Finalize only after unified postcheck. Any conflict/integrity failure
 atomically sets attempt/Action `REPAIR_REQUIRED`, run `BLOCKED`, preserves receipts/intents/files,
-and creates an idempotent subject incident; no automatic rerun/replan. Manual continuation creates a
+and creates an idempotent subject incident with explicit integrity class/source/reason; no automatic
+rerun/replan. Manual continuation creates a
 new plan version/action ID/staging namespace after explicit canonical conflict selection/cleanup.
 Automatic retry is different: it retains the same authorized `action_id`, increments attempt exactly
 once, freezes identical authorized facts, and uses `state/staging/{action_id}/{next_attempt}`. Repeated
 or concurrent ticks return the existing successor and cannot create two next attempts.
 Even after ledger success, the next Reconciler cycle repeats committed-intent/canonical postchecks
-and compensates drift to `REPAIR_REQUIRED + BLOCKED`; this does not claim FS/SQLite atomicity.
+and compensates drift to integrity-class `REPAIR_REQUIRED + BLOCKED`; this does not claim FS/SQLite
+atomicity. Semantic repair never uses conflict cleanup and PolicyEngine rejects it if any integrity
+incident appears before authorization.
 
 `OutboxProjector.flush()` reads undelivered ledger events in sequence order, appends them to `events.jsonl` through `EventLogger.append_record(event_id, record)`, updates metrics/status projections, then marks each outbox row delivered. `EventLogger` builds a seen-event-ID set from the existing JSONL file at startup and refuses a second append of the same ID, closing the crash window between file append and the delivered flag. Provider events also receive stable call/attempt IDs, so one file remains a deduplicated projection.
+Every repair-related event projects the ledger's exact `repair_class`, `repair_source`, and
+`reason_code`; `repair_class_unknown` is projected as integrity and cannot be omitted or rewritten.
 
 - [ ] **Step 6: Implement a provider-generic durable cycle graph**
 
@@ -1810,19 +1951,31 @@ by run/action/attempt and did not rerun that attempt's Action executor; exactly 
 committed; and staged residue became non-authoritative only after each corresponding intent reached
 `COMMITTED`. At `before_outcome_receipt`, resume must rebuild the exact receipt from safe staging +
 durable expected manifest without executor calls. Add incomplete, extra, symlink, and unsafe staging
-variants that instead produce `REPAIR_REQUIRED + BLOCKED`.
+variants that instead produce `repair_class=integrity`, `repair_source=integrity_guard`, a stable
+staging reason code, and `REPAIR_REQUIRED + BLOCKED`.
 
 Inject a deliberately partial durable intent set separately (the normal transaction cannot create
 one) and assert corruption is blocked without adding missing rows or copying canonical. Add conflict
 on entry 1/entry 2 and drift after unified postcheck and after success. Each case sets attempt/Action
 `REPAIR_REQUIRED`, run `BLOCKED`, preserves all receipts/intents/files/history, creates one stable
-subject incident, and only inspects siblings read-only. Assert unblock cannot reuse the old Action;
+subject incident whose repair class/source/reason matches the action and attempt, and only inspects
+siblings read-only. Assert unblock cannot reuse the old Action;
 a new plan version/action ID/staging namespace is required after explicit canonical cleanup.
 For retry transitions, race many identical `create_next_attempt("a1", previous_attempt=1)` calls and
 assert one durable `(a1, 2)` row with `retry_of_attempt=1`, no `(a1, 3)`, one fresh
 `state/staging/a1/2` namespace, and exact manifest/retry-policy fingerprints copied from the same
 authorized Action. A conflicting successor row or a call from `RUNNING`, `INDETERMINATE`, or
 `REPAIR_REQUIRED` fails closed without executor calls.
+
+Add a semantic-repair crash matrix at `before/after_repair_fact_commit`,
+`before/after_semantic_replan`, and `before/after_repair_action_authorization`. Start from mapped
+`term_drift` and assert every recovery preserves the original receipt, leaves run `RUNNING`, never
+reruns original attempt or calls `create_next_attempt()`, and produces exactly one new plan version,
+repair action ID, and staging namespace. Inject an integrity incident between repair-fact commit and
+authorization and assert PolicyEngine switches to fail-closed `BLOCKED` without authorizing the
+semantic action. Also assert semantic recovery cannot clean any conflict canonical/receipt/gate/
+intent evidence. Missing/unknown/mismatched repair class/source/reason must record
+`repair_class_unknown` on the integrity branch.
 
 - [ ] **Step 2: Write failure classification and probe tests**
 
@@ -1933,7 +2086,9 @@ insert the immutable resolution/outbox facts, then apply exactly one original ro
   outcome-receipt error code, and attempt count allow; otherwise run → `BLOCKED` with an incident.
   The resolve transaction does not create or dispatch the successor.
 - `unknown`: leave original attempt/Action `INDETERMINATE`; run → `BLOCKED` with an incident that
-  requests human/external evidence. It is ineligible for automatic retry or `create_next_attempt()`;
+  carries `repair_class=integrity`, `repair_source=integrity_guard`, and
+  `reason_code=probe_resolution_unknown`, and requests human/external evidence. It is ineligible for
+  automatic retry or `create_next_attempt()`;
   any later executor work requires human resolve/unblock and a new plan version/action ID/staging
   namespace.
 
@@ -1952,12 +2107,17 @@ attempt/Action transition to `RETRY_WAIT` is incomplete; `RETRY_WAIT` Actions an
 run/action/attempt and their durable manifest/policy snapshot; missing/conflicting outcome receipts;
 missing/conflicting gate receipt + complete intent sets; pending/committed intents; unified
 canonical bundle postcheck; success rows missing graph progress; post-success canonical drift;
-indeterminate operations through bound probe Actions; outbox delivery. A missing outcome receipt
+semantic repair facts awaiting one idempotent new-plan/new-action authorization; indeterminate
+operations through bound probe Actions; outbox delivery. A missing outcome receipt
 never causes that same attempt's Action executor to be redispatched: exact safe reconstruction or
-`REPAIR_REQUIRED + BLOCKED` only. A partial intent set is corruption, not a repair invitation. An
+integrity-class `REPAIR_REQUIRED + BLOCKED` only. A partial intent set is corruption, not a repair
+invitation. An
 intent conflict stops further sibling
-promotion but permits read-only evidence collection. Emit `action.reconciled` for every correction,
-preserve original receipts/intents/files/history, and never auto-create the replacement plan/action.
+promotion but permits read-only evidence collection. Emit `action.reconciled` for every correction
+and preserve original receipts/intents/files/history. Integrity, unknown-class, and indeterminate
+routes never auto-create a replacement plan/action; only mapped semantic repair facts with run still
+`RUNNING` may idempotently invoke Planner for one new plan/action/staging, and they cannot mutate
+conflict evidence.
 Creating an automatic retry successor is not a replacement plan: it is allowed only from
 `RETRY_WAIT`, retains the same action ID, uses attempt+1 and a fresh staging namespace, and is
 idempotent across crashes/concurrent ticks. Reconcile may first-dispatch an existing `AUTHORIZED`
@@ -2013,9 +2173,12 @@ def test_inspect_prints_plan_actions_and_incidents(cli_runner, seeded_project) -
     assert "Open incidents" in result.stdout
 ```
 
-Add a conflict-unblock test that starts with immutable old receipts/intents and a
+Add a conflict-unblock test that starts with immutable old receipts/intents and an integrity-class
 `REPAIR_REQUIRED` Action, supplies explicit canonical resolution evidence, and asserts a new plan
 version, new action ID, and new staging namespace are created while every old row remains unchanged.
+Add a semantic-repair test proving `unblock` rejects the request because that run never entered
+`BLOCKED`: its replacement comes only from automatic Planner replan and cannot select/clean conflict
+canonical files or mutate old protocol rows.
 
 - [ ] **Step 2: Run lifecycle tests and confirm they fail against old behavior**
 
@@ -2029,7 +2192,7 @@ Scaffold creates the directory contract, `state/run.db`, `state/staging`, and ch
 
 - [ ] **Step 4: Replace status-based CLI commands**
 
-Remove `--until` and the happy-path table. `inspect` prints run status, current plan version, authorized/running/recent Actions, gates, receipts, incidents, budget, and next recovery instruction. `approve` resumes one `PAUSED_HITL` interrupt by ID and records the human decision. `unblock` requires a reason and evidence that canonical conflicts were explicitly selected/cleaned. For a bundle-conflict incident it must append a new plan version and authorize a new action ID/new staging namespace before returning the run to `RUNNING`; it never resets or reuses the old `REPAIR_REQUIRED` Action or changes old receipts/intents/conflicts. A budget-only unblock may transition without replacement work. `cancel` is idempotent and cannot reopen COMPLETED.
+Remove `--until` and the happy-path table. `inspect` prints run status, current plan version, authorized/running/recent Actions, gates, receipts, incidents, budget, and next recovery instruction. `approve` resumes one `PAUSED_HITL` interrupt by ID and records the human decision. `unblock` is only for integrity-class blocked recovery and requires a reason and evidence that canonical conflicts were explicitly selected/cleaned. For a bundle-conflict incident it must append a new plan version and authorize a new action ID/new staging namespace before returning the run to `RUNNING`; it never resets or reuses the old `REPAIR_REQUIRED` Action or changes old receipts/intents/conflicts. It rejects semantic repair facts and may not be used to bypass their automatic policy-mapped replan. A budget-only unblock may transition without replacement work. `cancel` is idempotent and cannot reopen COMPLETED.
 
 - [ ] **Step 5: Rewrite the offline end-to-end test around a deterministic Planner**
 
@@ -2107,13 +2270,16 @@ identity/version, and the complete intent set. Path conformance becomes policy c
 ordinary success had a non-empty caller-canonical exact bundle; outcome receipt preceded controller
 handling; gate receipt and every intent were created together before promotion; every intent and
 the unified canonical postcheck passed before ledger success; post-success drift created
-`REPAIR_REQUIRED + BLOCKED`; conflict history was never reset/reused; every release prerequisite
+integrity-class `REPAIR_REQUIRED + BLOCKED`; conflict history was never reset/reused; every release prerequisite
 was committed; no failed/paused/indeterminate Action was treated as success except through a valid
 immutable probe resolution using durable attempt policy/error facts; and every plan rejection has
 reasons. Every automatic retry lineage must show old attempt/Action `RETRY_WAIT`, exactly one
 attempt+1 `AUTHORIZED` successor with the same action ID and frozen manifest/policy fingerprint,
-fresh staging, and executor attempt IDs that never repeat; `REPAIR_REQUIRED` conflict recovery must
-instead show a new plan version/action ID. Keep L2 translation and L3 EPUB scoring behavior unchanged.
+fresh staging, and executor attempt IDs that never repeat. Every semantic repair lineage must show
+explicit class/source/reason, original attempt/action `REPAIR_REQUIRED`, run remaining `RUNNING`, and
+exactly one automatic new plan version/repair action ID/staging without original re-execution; every
+integrity or unknown-class lineage must show `BLOCKED`, zero automatic Planner repair, and a new plan/
+action only after human resolve/unblock. Keep L2 translation and L3 EPUB scoring behavior unchanged.
 
 - [ ] **Step 5: Synchronize all authoritative documentation**
 
@@ -2170,6 +2336,9 @@ Expected: all two-entry boundaries before/after outcome receipt, before/after at
 intents, each promotion, unified postcheck, success/checkpoint, partial-intent corruption,
 pre/post-success drift, immutable conflict/unblock replacement, permanent failures, all three probe
 dispositions using durable policy/error facts, replay conflicts, concurrency, and completion pass.
+The same set must cover mapped semantic `term_drift`/validator repair at every repair-fact and replan
+crash boundary, integrity-class repair, missing/unknown classification fail-closed, and semantic
+repair refusal to touch conflict evidence.
 The recovery set must also cover ordinary retryable and allowed probe-`absent` transitions at
 `after_retry_wait`, before/after next-attempt creation, before first dispatch, and after
 `AUTHORIZED → RUNNING`: concurrent/repeated ticks create only attempt 2, the normal executor log is
