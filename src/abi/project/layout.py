@@ -21,6 +21,7 @@ CONTRACT_DIRS: tuple[str, ...] = (
     "skills/expert-translation-quality",
     "chapters/src",
     "chapters/translated",
+    "chapters/controlled",
     "chapters/final",
     "glossary",
     "frontmatter",
@@ -125,6 +126,10 @@ class BookProject:
     @property
     def chapters_translated(self) -> Path:
         return self.root / "chapters/translated"
+
+    @property
+    def chapters_controlled(self) -> Path:
+        return self.root / "chapters/controlled"
 
     @property
     def chapters_final(self) -> Path:

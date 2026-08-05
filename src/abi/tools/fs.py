@@ -79,12 +79,13 @@ def make_fs_tools(
         require_read(path)
         if writer is not None and path in {entry.canonical_relpath for entry in writer.entries}:
             return writer.read_bytes(path).decode("utf-8", errors="replace")
-        p = ctx.resolve(path)
-        if not p.exists():
+        try:
+            data = ctx.read_authorized_bytes(path, permissions)
+        except FileNotFoundError:
             return f"ERROR: file not found: {path}"
-        if p.is_dir():
+        except IsADirectoryError:
             return f"ERROR: {path} is a directory; use list_dir."
-        text = p.read_text(encoding="utf-8", errors="replace")
+        text = data.decode("utf-8", errors="replace")
         if len(text) > _MAX_READ_CHARS:
             return (
                 text[:_MAX_READ_CHARS] + f"\n\n[...truncated {len(text) - _MAX_READ_CHARS} chars]"
@@ -136,7 +137,7 @@ def make_fs_tools(
                 raise PermissionError(
                     f"this Action is not allowed to list {path!r}; use a declared read_set path"
                 )
-        p = ctx.resolve(path)
+        p = ctx.authorize_read_path(path, permissions)
         if not p.exists():
             return f"ERROR: not found: {path}"
         if p.is_file():
@@ -153,11 +154,14 @@ def make_fs_tools(
             raise PermissionError(
                 f"this Action is not allowed to glob {pattern!r}; use a project-relative pattern"
             )
-        matches = sorted(
-            ctx.project.rel(p)
-            for p in ctx.project.root.glob(pattern)
-            if p.is_file() and (permissions is None or permissions.can_read(ctx.project.rel(p)))
-        )
+        matches = []
+        for p in sorted(ctx.project.root.glob(pattern)):
+            relpath = ctx.project.rel(p)
+            if permissions is not None and not permissions.can_read(relpath):
+                continue
+            authorized = ctx.authorize_read_path(relpath, permissions)
+            if authorized.is_file():
+                matches.append(relpath)
         return "\n".join(matches) if matches else "(no matches)"
 
     def grep(pattern: str, path_glob: str = "**/*.md") -> str:
@@ -178,9 +182,10 @@ def make_fs_tools(
             if permissions is not None and not permissions.can_read(relpath):
                 continue
             try:
-                for i, line in enumerate(
-                    p.read_text(encoding="utf-8", errors="replace").splitlines(), 1
-                ):
+                text = ctx.read_authorized_bytes(relpath, permissions).decode(
+                    "utf-8", errors="replace"
+                )
+                for i, line in enumerate(text.splitlines(), 1):
                     if rx.search(line):
                         out.append(f"{ctx.project.rel(p)}:{i}: {line.strip()[:200]}")
                         if len(out) >= 200:

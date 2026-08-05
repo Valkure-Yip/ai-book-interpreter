@@ -77,6 +77,18 @@ class EffectExpander(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ActionAccess:
+    """Parameter-expanded read/write resources for one resolved Action instance."""
+
+    read_set: tuple[str, ...] = ()
+    write_set: tuple[str, ...] = ()
+
+
+class AccessExpander(Protocol):
+    def __call__(self, capability: str, parameters: FrozenModel) -> ActionAccess: ...
+
+
+@dataclass(frozen=True, slots=True)
 class ActionDefinition:
     """One capability's schema, executor, and deterministic validator binding."""
 
@@ -85,6 +97,7 @@ class ActionDefinition:
     executor: ActionExecutor
     validator: ActionValidator
     effect_expander: EffectExpander
+    access_expander: AccessExpander | None = None
 
 
 @dataclass(frozen=True, slots=True)

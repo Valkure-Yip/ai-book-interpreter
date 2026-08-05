@@ -94,7 +94,7 @@ def expand_expected_artifacts(
             item
             for chapter in sorted(parameters.chapters)
             for item in (
-                _artifact(f"chapters/translated/{chapter}.md", "text/markdown", "translation"),
+                _artifact(f"chapters/controlled/{chapter}.md", "text/markdown", "translation"),
                 _artifact(f"qa/chapter_controls/{chapter}.control.md", "text/markdown", "control"),
             )
         )

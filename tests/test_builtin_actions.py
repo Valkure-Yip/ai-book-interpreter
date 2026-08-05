@@ -17,6 +17,7 @@ from abi.actions.builtins.inputs import (
     ChapterBatchInput,
     EmptyInput,
     ReleaseInput,
+    ReviewBatchInput,
     SourceIngestInput,
 )
 from abi.actions.contracts import ActionDefinition, ActionExecutionContext
@@ -27,6 +28,7 @@ from abi.project.layout import BookProject
 from abi.prompts.actions import ActionPromptRegistry, ActionPromptSnapshot
 from abi.tools.belt import build_belt
 from abi.tools.content import make_content_tools
+from abi.tools.context import ToolContext
 from abi.types.orchestration import (
     ActionKind,
     ActionSpec,
@@ -92,13 +94,12 @@ def test_deterministic_content_tool_does_not_mutate_control_state(tmp_path: Path
     project.source_raw.write_text("Chapter 1\n\nA source paragraph.", encoding="utf-8")
 
     snapshot = RunSnapshot(run_id="test-run", status=RunStatus.RUNNING)
-    context = SimpleNamespace(
+    context = ToolContext(
         project=project,
         services=SimpleNamespace(),
         run_id="test-run",
         get_run_snapshot=lambda: snapshot,
-        resolve=lambda relpath: (project.root / relpath).resolve(),
-    )
+    )  # type: ignore[arg-type]
     ingest_source = next(
         tool for tool in make_content_tools(context) if tool.name == "ingest_source"
     )
@@ -117,6 +118,28 @@ def test_action_receives_only_allowlisted_tools_and_paths() -> None:
     assert {tool.name for tool in envelope.tools} == {"read_file", "write_file", "grep"}
     assert envelope.permissions.can_write("chapters/translated/001.md")
     assert not envelope.permissions.can_write("glossary/terms.csv")
+
+
+def test_chapter_pipeline_uses_immutable_disjoint_revision_paths() -> None:
+    """Catch post-translation control trying to overwrite a committed translation."""
+    chapters = ChapterBatchInput(chapters=("001",))
+    translated = expand_expected_artifacts("chapter.translate", "translate", chapters)
+    controlled = expand_expected_artifacts("chapter.control", "control", chapters)
+    translated_paths = {entry.canonical_relpath for entry in translated.entries}
+    controlled_paths = {entry.canonical_relpath for entry in controlled.entries}
+
+    assert translated_paths.isdisjoint(controlled_paths)
+    assert "chapters/controlled/001.md" in controlled_paths
+
+    control = build_action_envelope("chapter.control", chapters).permissions
+    review = build_action_envelope(
+        "chapter.review", ReviewBatchInput(chapters=("001",))
+    ).permissions
+    assert control.can_read("chapters/translated/001.md")
+    assert control.can_write("chapters/controlled/001.md")
+    assert not control.can_write("chapters/translated/001.md")
+    assert review.can_read("chapters/controlled/001.md")
+    assert not review.can_read("chapters/translated/001.md")
 
 
 def test_agent_capabilities_share_one_executor_type() -> None:
@@ -321,17 +344,66 @@ def test_prompt_snapshot_never_reads_legacy_pipeline_state(
         target_lang="zh-Hans",
         book_slug="fixture",
     )
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: context.snapshot,
+    )
+    permissions = build_action_envelope(
+        "chapter.translate", ChapterBatchInput(chapters=("001",))
+    ).permissions
 
     prompt = _prompt_snapshot(
         context,
         ChapterBatchInput(chapters=("001",)),
         capability="chapter.translate",
+        tool_context=tool_context,
+        permissions=permissions,
     )
 
     assert prompt.source_lang == "en"
     assert prompt.target_lang == "zh-Hans"
     assert prompt.book_slug == "fixture"
     assert prompt.source_text == "## 001\nSource paragraph."
+
+
+def test_translation_prompt_snapshot_rejects_symlinked_source(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    project.chapters_src.mkdir(parents=True)
+    metadata = project.root / "metadata"
+    metadata.mkdir(parents=True)
+    secret = metadata / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    (project.chapters_src / "001.md").symlink_to(secret)
+    project.style_guide.parent.mkdir(parents=True)
+    project.style_guide.write_text(
+        "\n".join(f"- rule {number}" for number in range(1, 6)), encoding="utf-8"
+    )
+    context = ActionExecutionContext(
+        project=project,
+        run_id="run-1",
+        snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+    )
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: context.snapshot,
+    )
+    parameters = ChapterBatchInput(chapters=("001",))
+    permissions = build_action_envelope("chapter.translate", parameters).permissions
+
+    with pytest.raises(PermissionError, match="symlink"):
+        _prompt_snapshot(
+            context,
+            parameters,
+            capability="chapter.translate",
+            tool_context=tool_context,
+            permissions=permissions,
+        )
 
 
 @pytest.mark.parametrize(

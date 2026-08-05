@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from abi.actions.contracts import ActionDefinition
+from abi.actions.builtins.catalog import build_action_registry
+from abi.actions.contracts import AccessExpander, ActionAccess, ActionDefinition
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.planning.policy import PolicyEngine
+from abi.planning.scheduler import Scheduler
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionArgument,
@@ -77,6 +81,7 @@ def _definition(
     read_set: tuple[str, ...] = (),
     estimated_cost_usd: float = 0.0,
     expected_evidence: tuple[str, ...] = (),
+    access_expander: AccessExpander | None = None,
 ) -> ActionDefinition:
     return ActionDefinition(
         spec=ActionSpec(
@@ -95,6 +100,7 @@ def _definition(
         executor=_execute_unused,
         validator=_validate_unused,
         effect_expander=_expand,
+        access_expander=access_expander,
     )
 
 
@@ -233,6 +239,97 @@ def test_policy_blocks_every_plan_when_integrity_incident_is_open() -> None:
 
     assert not decision.authorized
     assert decision.reason_codes == ("integrity_incident_open",)
+
+
+def test_real_chapter_parameters_drive_parallel_policy_and_scheduler_access_sets() -> None:
+    """Catch production chapter batches retaining capability-wide directory locks."""
+    registry = build_action_registry()
+    snapshot = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        actions=(
+            ActionView(
+                action_id="glossary",
+                capability="glossary.prepare",
+                status=ActionStatus.SUCCEEDED,
+            ),
+        ),
+        eligible_actions=(
+            EligibleAction(
+                capability="chapter.translate",
+                description="translate",
+                input_schema="ChapterBatchInput",
+                estimated_cost_usd=1.5,
+            ),
+        ),
+    )
+    patch = PlanPatch(
+        objective="translate independent chapters",
+        proposed_actions=tuple(
+            ProposedAction(
+                proposal_id=f"chapter-{chapter}",
+                capability="chapter.translate",
+                arguments=(
+                    ActionArgument(name="chapters", value_json=json.dumps([chapter])),
+                ),
+            )
+            for chapter in ("001", "002")
+        ),
+        rationale="chapters have disjoint sources and outputs",
+    )
+
+    decision = PolicyEngine(registry).authorize(snapshot, patch, next_plan_version=1)
+
+    assert decision.authorized, decision.reason_codes
+    assert tuple(action.read_set for action in decision.actions) == (
+        ("chapters/src/001.md", "glossary"),
+        ("chapters/src/002.md", "glossary"),
+    )
+    assert tuple(action.write_set for action in decision.actions) == (
+        ("chapters/translated/001.md",),
+        ("chapters/translated/002.md",),
+    )
+    scheduled = Scheduler(max_parallel=4).select_batch(decision.actions)
+    assert tuple(action.proposal_id for action in scheduled) == ("chapter-001", "chapter-002")
+
+
+def test_policy_fails_closed_when_parameterized_access_expansion_is_invalid() -> None:
+    def invalid_access(capability: str, parameters: FrozenModel) -> ActionAccess:
+        return ActionAccess(write_set=("../secret",))
+
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+    )
+    registry.register(_definition("work.invalid", access_expander=invalid_access))
+    registry.validate_startup()
+    snapshot = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        eligible_actions=(
+            EligibleAction(
+                capability="work.invalid",
+                description="invalid dynamic access",
+                input_schema="EmptyInput",
+                estimated_cost_usd=0,
+            ),
+        ),
+    )
+
+    decision = PolicyEngine(registry).authorize(
+        snapshot,
+        PlanPatch(
+            objective="reject malformed authority",
+            proposed_actions=(
+                ProposedAction(proposal_id="invalid", capability="work.invalid"),
+            ),
+            rationale="expanded access must be validated before authorization",
+        ),
+        next_plan_version=1,
+    )
+
+    assert not decision.authorized
+    assert decision.reason_codes == ("invalid_arguments",)
 
 
 def _snapshot(*, budget: float | None = 10.0) -> RunSnapshot:

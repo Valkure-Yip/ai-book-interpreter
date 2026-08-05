@@ -68,7 +68,7 @@ def test_scheduler_parallelizes_only_non_conflicting_actions() -> None:
         )
     )
 
-    assert {item.action_id for item in batch} == {"t1", "t2", "g"}
+    assert {item.action_id for item in batch} == {"g"}
 
 
 def test_scheduler_uses_priority_identity_and_committed_dependencies() -> None:
@@ -98,3 +98,15 @@ def test_scheduler_rechecks_current_eligibility() -> None:
     )
 
     assert tuple(item.action_id for item in batch) == ("eligible",)
+
+
+def test_scheduler_blocks_directory_and_descendant_resource_overlap() -> None:
+    """Catch a directory lock and its child being treated as independent resources."""
+    batch = Scheduler(max_parallel=2).select_batch(
+        (
+            _action("directory", writes=("chapters/translated",)),
+            _action("file", writes=("chapters/translated/001.md",)),
+        )
+    )
+
+    assert tuple(action.action_id for action in batch) == ("directory",)

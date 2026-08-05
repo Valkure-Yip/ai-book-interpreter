@@ -59,6 +59,19 @@ def make_content_tools(
                 f"this Action is not allowed to write {path!r}; declare it in write_set"
             )
 
+    def authorized_read(path: str) -> Path:
+        require_read(path)
+        return ctx.authorize_read_path(path, permissions)
+
+    def source_epubs() -> list[tuple[str, Path]]:
+        epubs: list[tuple[str, Path]] = []
+        for candidate in sorted(project.root.glob("source/*.epub")):
+            relpath = candidate.relative_to(project.root).as_posix()
+            if permissions is not None and not permissions.can_read(relpath):
+                continue
+            epubs.append((relpath, ctx.authorize_read_path(relpath, permissions)))
+        return epubs
+
     def ingest_source(source_relpath: str = "source/source_text_raw.txt") -> str:
         """Parse the raw source file into clean text + source_manifest.json.
 
@@ -66,26 +79,26 @@ def make_content_tools(
         ``source/``) and writes ``source/source_text.txt`` plus
         ``source/source_manifest.json`` (hash, format, paragraph/section counts).
         """
-        require_read(source_relpath)
-        requested = ctx.resolve(source_relpath)
-        epubs = sorted(project.root.glob("source/*.epub"))
-        src_path = requested if requested.exists() else (
+        requested = authorized_read(source_relpath)
+        epubs = source_epubs()
+        selected = (source_relpath, requested) if requested.exists() else (
             epubs[0] if source_relpath == "source/source_text_raw.txt" and epubs else None
         )
-        if src_path is None:
+        if selected is None:
             return (
                 "ERROR: no source found. Place the source text at "
                 "source/source_text_raw.txt or an .epub under source/."
             )
+        src_relpath, src_path = selected
         require_write(project.rel(project.source_clean))
         require_write(project.rel(project.source_manifest))
         book, warnings = ingest(src_path)
         paras = book.iter_paragraphs()
         clean = "\n\n".join(p.source_text for p in paras if p.source_text.strip())
         project.source_clean.write_text(clean, encoding="utf-8")
-        data = src_path.read_bytes()
+        data = ctx.read_authorized_bytes(src_relpath, permissions)
         manifest = {
-            "source_file": project.rel(src_path),
+            "source_file": src_relpath,
             "format": book.meta.source_format,
             "sha256": hashlib.sha256(data).hexdigest(),
             "title": book.meta.title,
@@ -107,6 +120,7 @@ def make_content_tools(
         book: Book,
         warnings: list[str],
         src_path: Path,
+        src_relpath: str,
         *,
         refine_toc: bool,
     ) -> Book:
@@ -121,7 +135,9 @@ def make_content_tools(
             len(book.toc),
             len(book.iter_paragraphs()),
         )
-        raw_text = src_path.read_text(encoding="utf-8", errors="replace")
+        raw_text = ctx.read_authorized_bytes(src_relpath, permissions).decode(
+            "utf-8", errors="replace"
+        )
         try:
             refined = asyncio.get_event_loop().run_until_complete(
                 refine_toc_with_llm(book, raw_text, router=ctx.services.router)
@@ -146,16 +162,22 @@ def make_content_tools(
         refine_toc: bool = True,
     ) -> str:
         """Split the ingested source into chapters/src/{NNN_slug}.md + source/toc.json."""
-        require_read(source_relpath)
-        requested = ctx.resolve(source_relpath)
-        epubs = sorted(project.root.glob("source/*.epub"))
-        src_path = requested if requested.exists() else (
+        requested = authorized_read(source_relpath)
+        epubs = source_epubs()
+        selected = (source_relpath, requested) if requested.exists() else (
             epubs[0] if source_relpath == "source/source_text_raw.txt" and epubs else None
         )
-        if src_path is None:
+        if selected is None:
             return "ERROR: ingest the source first (no source file found)."
+        src_relpath, src_path = selected
         book, warnings = ingest(src_path)
-        book = _maybe_refine_toc(book, warnings, src_path, refine_toc=refine_toc)
+        book = _maybe_refine_toc(
+            book,
+            warnings,
+            src_path,
+            src_relpath,
+            refine_toc=refine_toc,
+        )
         require_write(project.rel(project.toc_json))
         require_write(project.rel(project.chapters_src))
         entries = split_book_to_chapters(book, project.chapters_src)

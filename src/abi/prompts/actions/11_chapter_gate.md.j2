@@ -1,6 +1,7 @@
 # Stage 11 — Chapter reviews + quality gate (GATE)
 
-For each authorized chapter, run the three reviews and the gate, then promote to final.
+For each authorized chapter, review the committed `chapters/controlled/{NNN_slug}.md`, run the
+three reviews and the gate, then promote a new immutable revision to final.
 
 1. Fidelity review -> `qa/fidelity/{NNN_slug}.md` (meaning, tone, no add/drop).
 2. Readability + imagery review -> `qa/readability/{NNN_slug}.md` and
@@ -9,7 +10,7 @@ For each authorized chapter, run the three reviews and the gate, then promote to
 3. Terminology review -> `qa/terminology/{NNN_slug}.md` (consistency vs
    `glossary/terms.csv`; scan for `forbidden_body_renderings`).
 4. Chapter gate -> `qa/gates/{NNN_slug}.gate.md` with `result: PASS` only when all
-   reviews pass. On PASS, copy the chapter to `chapters/final/{NNN_slug}.md`
+   reviews pass. On PASS, copy the controlled chapter to `chapters/final/{NNN_slug}.md`
    (apply the title policy: produce nav_label / page_title / subtitle).
 
 Exit condition: all chapters reviewed, gated PASS, and present in chapters/final/.

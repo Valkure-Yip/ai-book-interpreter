@@ -4,13 +4,16 @@ Follow `skills/expert-translation-quality/SKILL.md` and
 `skills/translation-quality-defect-families/SKILL.md`.
 
 For EACH authorized translated chapter, run a FULL-CHAPTER (not sampled) post-translation
-control and write `qa/chapter_controls/{NNN_slug}.control.md`. The check must cover
+control. Read the committed `chapters/translated/{NNN_slug}.md`, write the corrected immutable
+revision to `chapters/controlled/{NNN_slug}.md`, and write
+`qa/chapter_controls/{NNN_slug}.control.md`. Never overwrite or adopt the committed translated
+artifact. The check must cover
 body text, notes, terminology, reader-facing wording, readability, polish,
 plain-language clarity (without flattening specialist quality), title handling,
 and text interfaces for any figures/tables/formulas/images.
 
 Include a Chinese-only readability pass (read the translation without the source
-first). Fix any issue found IN the translated chapter file, then append a fresh
+first). Fix any issue found in the new controlled revision, then append a fresh
 recheck round. A round where issues were fixed is `FIXED_RECHECK_REQUIRED`, not PASS.
 
 Each control file's latest round must end with these machine-readable fields:

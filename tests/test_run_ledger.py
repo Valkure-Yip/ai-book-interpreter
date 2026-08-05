@@ -82,7 +82,11 @@ async def test_ledger_rejects_existing_unversioned_or_unknown_schema(
 
 
 def _action(
-    action_id: str = "a1", *, canonical_relpath: str | None = None
+    action_id: str = "a1",
+    *,
+    canonical_relpath: str | None = None,
+    read_set: tuple[str, ...] = (),
+    write_set: tuple[str, ...] = ("source",),
 ) -> AuthorizedAction:
     canonical_relpath = canonical_relpath or f"source/{action_id}.json"
     manifest = ExpectedArtifactManifest(
@@ -102,7 +106,8 @@ def _action(
         plan_version=1,
         capability="source.ingest",
         parameters_json='{"source_relpath":"source/raw.txt"}',
-        write_set=("source",),
+        read_set=read_set,
+        write_set=write_set,
         idempotency_key=f"action:{action_id}",
         expected_artifact_manifest=manifest,
         expected_artifact_manifest_digest=sha256_canonical_json(
@@ -112,6 +117,48 @@ def _action(
         retry_policy=retry,
         retry_policy_fingerprint=sha256_canonical_json(canonical_model_json(retry)),
     )
+
+
+@pytest.mark.asyncio
+async def test_attempt_reuses_the_authorized_action_frozen_access_sets(
+    tmp_path: Path,
+) -> None:
+    read_set = ("chapters/translated/chapter-001.md",)
+    write_set = (
+        "chapters/controlled/chapter-001.md",
+        "reports/control/chapter-001.json",
+    )
+
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        run_id = await ledger.create_run(_run_seed())
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="control chapter",
+                proposed_actions=(
+                    ProposedAction(
+                        proposal_id="proposal-1", capability="chapter.control"
+                    ),
+                ),
+                rationale="persist exact resource authority once",
+            ),
+        )
+        await ledger.authorize_actions(
+            run_id,
+            (
+                _action(
+                    read_set=read_set,
+                    write_set=write_set,
+                ),
+            ),
+        )
+
+        attempt = await ledger.start_attempt("a1")
+        durable_action = await ledger.get_action("a1")
+
+    assert attempt.action_id == durable_action.action_id
+    assert durable_action.read_set == read_set
+    assert durable_action.write_set == write_set
 
 
 async def _seed_authorized_action(

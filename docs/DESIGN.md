@@ -118,8 +118,9 @@ Prompt、模型输出、LangGraph checkpoint 和 `events.jsonl` 都不能写 run
 
 ### 规则 D13: 章节-译文对应完整
 
-`chapters/src/` 中每个章节都必须在 `chapters/translated/` 有对应译文，并在章节门禁
-PASS 后进入 `chapters/final/`；缺一即 validator 失败，不得授权构建或 release Action。
+`chapters/src/` 中每个章节都必须依次产生不可变的 `chapters/translated/` 初译和
+`chapters/controlled/` 章控修订，并在章节门禁 PASS 后进入 `chapters/final/`；后继 Action 不得覆盖
+已提交 canonical 版本。缺一即 validator 失败，不得授权构建或 release Action。
 
 ## 7. 文档与代码同步
 

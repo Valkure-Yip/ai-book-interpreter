@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,14 +21,13 @@ from abi.actions.builtins.inputs import (
     SourceSplitInput,
     SpotcheckInput,
 )
-from abi.actions.contracts import ActionDefinition, ActionExecutionContext
+from abi.actions.contracts import ActionAccess, ActionDefinition, ActionExecutionContext
 from abi.actions.effects import expand_expected_artifacts
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.actions.validators import validator_catalog
 from abi.epub.result import GateResult
 from abi.project.artifacts import ArtifactStore, BufferedAttemptWriter
-from abi.project.layout import BookProject
 from abi.prompts.actions import ActionPromptRegistry, ActionPromptSnapshot
 from abi.tools.belt import build_belt
 from abi.tools.context import ToolContext
@@ -213,7 +213,7 @@ _BUILTINS = (
         ("read_file", "write_file", "edit_file", "grep"),
         _QUALITY_SKILLS,
         ("chapters/translated", "glossary", "skills"),
-        ("chapters/translated", "qa/chapter_controls"),
+        ("chapters/controlled", "qa/chapter_controls"),
         0.70,
     ),
     _Builtin(
@@ -226,7 +226,7 @@ _BUILTINS = (
         "qa/gates",
         ("read_file", "write_file", "grep"),
         _QUALITY_SKILLS,
-        ("chapters/src", "chapters/translated", "glossary", "skills"),
+        ("chapters/src", "chapters/controlled", "glossary", "skills"),
         (
             "qa/fidelity",
             "qa/readability",
@@ -426,7 +426,7 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
                 read_files.append(f"chapters/translated/{chapter}.md")
                 write_files.extend(
                     (
-                        f"chapters/translated/{chapter}.md",
+                        f"chapters/controlled/{chapter}.md",
                         f"qa/chapter_controls/{chapter}.control.md",
                     )
                 )
@@ -438,7 +438,7 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
         read_dirs = [path for path in read_dirs if not path.startswith("chapters/")]
         write_dirs = []
         for chapter in parameters.chapters:
-            read_files.extend((f"chapters/src/{chapter}.md", f"chapters/translated/{chapter}.md"))
+            read_files.extend((f"chapters/src/{chapter}.md", f"chapters/controlled/{chapter}.md"))
             write_files.extend(
                 (
                     f"qa/fidelity/{chapter}.md",
@@ -459,6 +459,62 @@ def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPerm
         read_dirs=tuple(read_dirs),
         write_files=tuple(write_files),
         write_dirs=tuple(write_dirs),
+    )
+
+
+def _access_for(capability: str, parameters: FrozenModel) -> ActionAccess:
+    """Expand chapter batches to exact resources while preserving shared read roots."""
+    item = _BY_CAPABILITY[capability]
+    if capability not in {"chapter.translate", "chapter.control", "chapter.review"}:
+        return ActionAccess(read_set=item.read_set, write_set=item.write_set)
+
+    if capability in {"chapter.translate", "chapter.control"}:
+        if not isinstance(parameters, ChapterBatchInput):
+            raise TypeError(f"{capability} requires ChapterBatchInput")
+        chapters = parameters.chapters
+    else:
+        if not isinstance(parameters, ReviewBatchInput):
+            raise TypeError("chapter.review requires ReviewBatchInput")
+        chapters = parameters.chapters
+
+    shared_reads = tuple(path for path in item.read_set if not path.startswith("chapters/"))
+    if capability == "chapter.translate":
+        chapter_reads = tuple(f"chapters/src/{chapter}.md" for chapter in chapters)
+        writes = tuple(f"chapters/translated/{chapter}.md" for chapter in chapters)
+    elif capability == "chapter.control":
+        chapter_reads = tuple(f"chapters/translated/{chapter}.md" for chapter in chapters)
+        writes = tuple(
+            path
+            for chapter in chapters
+            for path in (
+                f"chapters/controlled/{chapter}.md",
+                f"qa/chapter_controls/{chapter}.control.md",
+            )
+        )
+    else:
+        chapter_reads = tuple(
+            path
+            for chapter in chapters
+            for path in (
+                f"chapters/src/{chapter}.md",
+                f"chapters/controlled/{chapter}.md",
+            )
+        )
+        writes = tuple(
+            path
+            for chapter in chapters
+            for path in (
+                f"chapters/final/{chapter}.md",
+                f"qa/fidelity/{chapter}.md",
+                f"qa/readability/{chapter}.md",
+                f"qa/imagery/{chapter}.imagery.md",
+                f"qa/terminology/{chapter}.md",
+                f"qa/gates/{chapter}.gate.md",
+            )
+        )
+    return ActionAccess(
+        read_set=tuple(sorted((*chapter_reads, *shared_reads))),
+        write_set=tuple(sorted(writes)),
     )
 
 
@@ -495,6 +551,8 @@ def _prompt_snapshot(
     parameters: FrozenModel,
     *,
     capability: str,
+    tool_context: ToolContext,
+    permissions: ActionPathPermissions,
 ) -> ActionPromptSnapshot:
     project = context.project
     values = {
@@ -509,11 +567,21 @@ def _prompt_snapshot(
         return ActionPromptSnapshot(**values)
     source_parts = []
     for chapter in parameters.chapters:
-        path = project.chapters_src / f"{chapter}.md"
-        if path.exists():
-            source_parts.append(f"## {chapter}\n{path.read_text(encoding='utf-8')}")
-    rules = _style_rules(project.style_guide)
-    terms = _matched_terms(project.terms_csv, "\n".join(source_parts))
+        relpath = f"chapters/src/{chapter}.md"
+        try:
+            source = tool_context.read_authorized_bytes(
+                relpath, permissions
+            ).decode("utf-8")
+        except FileNotFoundError:
+            continue
+        source_parts.append(f"## {chapter}\n{source}")
+    rules = _style_rules(
+        _read_optional_text(tool_context, permissions, project.style_guide)
+    )
+    terms = _matched_terms(
+        _read_optional_text(tool_context, permissions, project.terms_csv),
+        "\n".join(source_parts),
+    )
     return ActionPromptSnapshot(
         **values,
         source_text="\n\n".join(source_parts),
@@ -522,11 +590,24 @@ def _prompt_snapshot(
     )
 
 
-def _style_rules(path: Path) -> tuple[str, ...]:
-    if not path.exists():
+def _read_optional_text(
+    tool_context: ToolContext,
+    permissions: ActionPathPermissions,
+    path: Path,
+) -> str | None:
+    try:
+        return tool_context.read_authorized_bytes(
+            path.relative_to(tool_context.project.root).as_posix(), permissions
+        ).decode("utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def _style_rules(text: str | None) -> tuple[str, ...]:
+    if text is None:
         return ()
     candidates = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith(("- ", "* ")):
             candidates.append(stripped[2:].strip())
@@ -535,11 +616,11 @@ def _style_rules(path: Path) -> tuple[str, ...]:
     return tuple(item for item in candidates if item)[:8]
 
 
-def _matched_terms(path: Path, source_text: str) -> tuple[str, ...]:
-    if not path.exists():
+def _matched_terms(text: str | None, source_text: str) -> tuple[str, ...]:
+    if text is None:
         return ()
     matches: list[str] = []
-    with path.open(encoding="utf-8", newline="") as handle:
+    with io.StringIO(text, newline="") as handle:
         for row in csv.DictReader(handle):
             parsed = _GlossaryTerm.model_validate(row)
             if parsed.term and parsed.term in source_text:
@@ -547,16 +628,22 @@ def _matched_terms(path: Path, source_text: str) -> tuple[str, ...]:
     return tuple(matches)
 
 
-def _skill_context(project: BookProject, skill_refs: tuple[str, ...]) -> str:
+def _skill_context(
+    tool_context: ToolContext,
+    skill_refs: tuple[str, ...],
+) -> str:
     sections: list[str] = []
     for skill_ref in skill_refs:
-        path = (project.root / skill_ref).resolve()
-        if not project.within(path) or not path.is_file():
+        try:
+            # Registry-bound skill_refs are their own static allowlist, independent
+            # of the planner-derived artifact read_set.
+            content = tool_context.read_authorized_bytes(skill_ref, None).decode("utf-8")
+        except (FileNotFoundError, IsADirectoryError) as exc:
             raise ValueError(
                 f"registered skill {skill_ref} is missing from the book project; "
                 "scaffold the project assets before executing this Action"
-            )
-        sections.append(f"## Skill: {skill_ref}\n{path.read_text(encoding='utf-8')}")
+            ) from exc
+        sections.append(f"## Skill: {skill_ref}\n{content}")
     return "\n\n".join(sections)
 
 
@@ -660,9 +747,11 @@ class AgentActionExecutor:
                 context,
                 parameters,
                 capability=self._capability,
+                tool_context=self._tool_context,
+                permissions=envelope.permissions,
             )
             user_prompt = self._prompts.render(self._capability, parameters, snapshot)
-            skill_context = _skill_context(context.project, envelope.skill_refs)
+            skill_context = _skill_context(self._tool_context, envelope.skill_refs)
             if skill_context:
                 user_prompt = f"{user_prompt}\n\n# Action skills\n{skill_context}"
         except (OSError, TypeError, ValueError) as exc:
@@ -1007,6 +1096,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
                 executor=executor,
                 validator=validator,
                 effect_expander=expand_expected_artifacts,
+                access_expander=_access_for,
             )
         )
     registry.validate_startup()

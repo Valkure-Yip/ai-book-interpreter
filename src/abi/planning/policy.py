@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 
-from abi.actions.contracts import ResolvedAction
+from abi.actions.contracts import ActionAccess, ResolvedAction
 from abi.actions.registry import ActionRegistry, RegistryConfigurationError
+from abi.planning.scheduler import access_sets_conflict
 from abi.types.orchestration import (
     AuthorizationDecision,
     AuthorizedAction,
@@ -16,6 +18,12 @@ from abi.types.orchestration import (
     canonical_model_json,
     sha256_canonical_json,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedCandidate:
+    action: ResolvedAction
+    access: ActionAccess
 
 
 class PolicyEngine:
@@ -31,15 +39,19 @@ class PolicyEngine:
             return AuthorizationDecision(
                 authorized=False, reason_codes=("invalid_plan_version",)
             )
-        reasons = self._collect_rejections(snapshot, patch)
+        reasons, resolved = self._collect_rejections(snapshot, patch)
         if reasons:
             return AuthorizationDecision(
                 authorized=False, reason_codes=tuple(sorted(reasons))
             )
-        actions = self._resolve_actions(snapshot, patch, next_plan_version)
+        actions = self._resolve_actions(
+            snapshot, patch, next_plan_version, resolved=resolved
+        )
         return AuthorizationDecision(authorized=True, actions=actions)
 
-    def _collect_rejections(self, snapshot: RunSnapshot, patch: PlanPatch) -> set[str]:
+    def _collect_rejections(
+        self, snapshot: RunSnapshot, patch: PlanPatch
+    ) -> tuple[set[str], dict[str, _ResolvedCandidate]]:
         proposals = patch.proposed_actions
         reasons: set[str] = set()
         if not 1 <= len(proposals) <= 5:
@@ -60,12 +72,13 @@ class PolicyEngine:
                 reasons.add("hard_prerequisite_failed")
 
         self._check_dependencies(snapshot, proposals, reasons)
-        self._check_budget(snapshot, resolved.values(), reasons)
-        self._check_conflicts(proposals, reasons)
-        self._check_failure_signatures(snapshot, resolved.values(), reasons)
-        self._check_terminal_release_policy(snapshot, resolved.values(), reasons)
+        resolved_actions = tuple(candidate.action for candidate in resolved.values())
+        self._check_budget(snapshot, resolved_actions, reasons)
+        self._check_conflicts(resolved.values(), reasons)
+        self._check_failure_signatures(snapshot, resolved_actions, reasons)
+        self._check_terminal_release_policy(snapshot, resolved_actions, reasons)
         self._check_repair_routes(snapshot, proposals, reasons)
-        return reasons
+        return reasons, resolved
 
     def _check_repair_routes(
         self,
@@ -99,16 +112,20 @@ class PolicyEngine:
 
     def _resolve_known_actions(
         self, proposals: tuple[ProposedAction, ...], reasons: set[str]
-    ) -> dict[str, ResolvedAction]:
-        resolved: dict[str, ResolvedAction] = {}
+    ) -> dict[str, _ResolvedCandidate]:
+        resolved: dict[str, _ResolvedCandidate] = {}
         for proposal in proposals:
             if not self._registry.contains(proposal.capability):
                 continue
             try:
-                resolved[proposal.proposal_id] = self._registry.resolve(
+                action = self._registry.resolve(
                     proposal.capability, proposal.arguments
                 )
-            except RegistryConfigurationError:
+                resolved[proposal.proposal_id] = _ResolvedCandidate(
+                    action=action,
+                    access=self._registry.access_for(action),
+                )
+            except (RegistryConfigurationError, TypeError, ValueError):
                 reasons.add("invalid_arguments")
         return resolved
 
@@ -169,23 +186,16 @@ class PolicyEngine:
             reasons.add("budget_exceeded")
 
     def _check_conflicts(
-        self, proposals: tuple[ProposedAction, ...], reasons: set[str]
+        self, resolved: Iterable[_ResolvedCandidate], reasons: set[str]
     ) -> None:
-        definitions = [
-            self._registry.get(proposal.capability)
-            for proposal in proposals
-            if self._registry.contains(proposal.capability)
-        ]
-        for index, left in enumerate(definitions):
-            left_reads = set(left.spec.read_set)
-            left_writes = set(left.spec.write_set)
-            for right in definitions[index + 1 :]:
-                right_reads = set(right.spec.read_set)
-                right_writes = set(right.spec.write_set)
-                if (
-                    left_writes & right_writes
-                    or left_writes & right_reads
-                    or left_reads & right_writes
+        actions = tuple(resolved)
+        for index, left in enumerate(actions):
+            for right in actions[index + 1 :]:
+                if access_sets_conflict(
+                    left.access.read_set,
+                    left.access.write_set,
+                    right.access.read_set,
+                    right.access.write_set,
                 ):
                     reasons.add("write_conflict")
 
@@ -224,7 +234,12 @@ class PolicyEngine:
                 reasons.add("terminal_release_policy")
 
     def _resolve_actions(
-        self, snapshot: RunSnapshot, patch: PlanPatch, next_plan_version: int
+        self,
+        snapshot: RunSnapshot,
+        patch: PlanPatch,
+        next_plan_version: int,
+        *,
+        resolved: Mapping[str, _ResolvedCandidate],
     ) -> tuple[AuthorizedAction, ...]:
         action_ids = {
             proposal.proposal_id: f"{snapshot.run_id}:{next_plan_version}:{proposal.proposal_id}"
@@ -232,26 +247,28 @@ class PolicyEngine:
         }
         authorized: list[AuthorizedAction] = []
         for proposal in patch.proposed_actions:
-            resolved = self._registry.resolve(proposal.capability, proposal.arguments)
+            candidate = resolved[proposal.proposal_id]
+            action = candidate.action
             action_id = action_ids[proposal.proposal_id]
             dependencies = tuple(
                 action_ids.get(dependency, dependency) for dependency in proposal.dependencies
             )
-            manifest = resolved.definition.effect_expander(
-                proposal.capability, action_id, resolved.parameters
+            manifest = action.definition.effect_expander(
+                proposal.capability, action_id, action.parameters
             )
-            retry_policy = resolved.definition.spec.retry_policy
+            access = candidate.access
+            retry_policy = action.definition.spec.retry_policy
             authorized.append(
                 AuthorizedAction(
                     action_id=action_id,
                     proposal_id=proposal.proposal_id,
                     plan_version=next_plan_version,
                     capability=proposal.capability,
-                    parameters_json=resolved.parameters_json,
+                    parameters_json=action.parameters_json,
                     dependencies=dependencies,
                     priority=proposal.priority,
-                    read_set=resolved.definition.spec.read_set,
-                    write_set=resolved.definition.spec.write_set,
+                    read_set=access.read_set,
+                    write_set=access.write_set,
                     idempotency_key=action_id,
                     expected_artifact_manifest=manifest,
                     expected_artifact_manifest_digest=sha256_canonical_json(
@@ -259,7 +276,7 @@ class PolicyEngine:
                     ),
                     expected_evidence_refs=tuple(
                         item.name
-                        for item in resolved.definition.spec.expected_evidence
+                        for item in action.definition.spec.expected_evidence
                         if item.required
                     ),
                     retry_policy=retry_policy,

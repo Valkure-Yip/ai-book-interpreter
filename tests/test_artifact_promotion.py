@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 
 import abi.project.artifacts as artifact_module
+from abi.actions.builtins.inputs import ChapterBatchInput
+from abi.actions.effects import expand_expected_artifacts
 from abi.actions.evidence import StagingEvidenceView
 from abi.project.artifacts import (
     ArtifactConflictError,
@@ -371,6 +373,93 @@ async def test_prepare_rejects_a_second_intent_for_one_canonical_path(tmp_path: 
             )
 
         assert await ledger.has_open_incident("artifact_checksum_conflict")
+
+
+@pytest.mark.asyncio
+async def test_real_translate_then_control_manifests_promote_without_canonical_overlap(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real built-in lineage against create-only promotion reservations."""
+    project = BookProject(tmp_path)
+    project.staging_root.mkdir(parents=True)
+    parameters = ChapterBatchInput(chapters=("001",))
+
+    def authorized(capability: str, action_id: str) -> AuthorizedAction:
+        manifest = expand_expected_artifacts(capability, action_id, parameters)
+        retry = RetryPolicySpec(max_attempts=1)
+        return AuthorizedAction(
+            action_id=action_id,
+            proposal_id=action_id,
+            plan_version=1,
+            capability=capability,
+            parameters_json=parameters.model_dump_json(),
+            read_set=("chapters/src/001.md",),
+            write_set=tuple(item.canonical_relpath for item in manifest.entries),
+            idempotency_key=action_id,
+            expected_artifact_manifest=manifest,
+            expected_artifact_manifest_digest=sha256_canonical_json(
+                canonical_manifest_json(manifest)
+            ),
+            expected_evidence_refs=("translation",),
+            retry_policy=retry,
+            retry_policy_fingerprint=sha256_canonical_json(canonical_model_json(retry)),
+        )
+
+    translate = authorized("chapter.translate", "chapter-translate")
+    control = authorized("chapter.control", "chapter-control")
+    async with RunLedger.open(project.run_db) as ledger:
+        await ledger.create_run(RunSeed(run_id="run-1"))
+        await ledger.append_plan(
+            "run-1",
+            PlanPatch(
+                objective="translate and control one chapter",
+                proposed_actions=(
+                    ProposedAction(proposal_id="translate", capability="chapter.translate"),
+                    ProposedAction(proposal_id="control", capability="chapter.control"),
+                ),
+                rationale="exercise real built-in artifact lineage",
+            ),
+        )
+        await ledger.authorize_actions("run-1", (translate, control))
+        store = ArtifactStore(project, ledger)
+        try:
+            for action, content in (
+                (translate, "first translation"),
+                (control, "controlled output"),
+            ):
+                await ledger.start_attempt(action.action_id)
+                writer = store.writer(action.action_id, 1)
+                for entry in action.expected_artifact_manifest.entries:
+                    writer.write_text(
+                        entry.canonical_relpath,
+                        content,
+                        media_type=entry.media_type,
+                        evidence_role=entry.evidence_role,
+                    )
+                await _persist_bundle_protocol(
+                    project, store, ledger, writer.artifact_bundle()
+                )
+                intents = tuple(
+                    intent
+                    for intent in await ledger.promotion_intents("run-1")
+                    if intent.action_id == action.action_id
+                )
+                for intent in intents:
+                    await store.promote(intent)
+        finally:
+            store.close()
+
+        control_intents = tuple(
+            intent
+            for intent in await ledger.promotion_intents("run-1")
+            if intent.action_id == control.action_id
+        )
+        assert {intent.canonical_relpath for intent in control_intents} == {
+            "chapters/controlled/001.md",
+            "qa/chapter_controls/001.control.md",
+        }
+        assert (tmp_path / "chapters/translated/001.md").read_text() == "first translation"
+        assert (tmp_path / "chapters/controlled/001.md").read_text() == "controlled output"
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ from abi.actions.evidence import StagingEvidenceView
 from abi.actions.validators import validate_evidence
 from abi.project.artifacts import ArtifactStore
 from abi.project.layout import BookProject
+from abi.tools.context import ToolContext
 from abi.types.orchestration import (
     ArtifactBundle,
     ArtifactBundleEntry,
@@ -173,11 +174,12 @@ async def test_independent_review_success_writes_not_required_revision_route(
             )
             return SimpleNamespace(outcome=provider_success())
 
-    tool_context = SimpleNamespace(
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
         project=project,
-        services=SimpleNamespace(agent=IndependentAgent()),
-        config=None,
-        resolve=lambda relpath: (project.root / relpath).resolve(),
+        services=SimpleNamespace(agent=IndependentAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
     )
     result = await build_action_registry(tool_context=tool_context).get(
         "review.independent"
@@ -187,7 +189,7 @@ async def test_independent_review_success_writes_not_required_revision_route(
             run_id="run-1",
             action_id="independent-1",
             attempt=1,
-            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            snapshot=snapshot,
         ),
         ReviewBatchInput(reviewers=("agent_a", "agent_b")),
     )
@@ -294,19 +296,20 @@ async def test_spotcheck_executor_buffers_two_reviewers_then_flushes_exact_bundl
             )
             return SimpleNamespace(outcome=provider_success())
 
-    tool_context = SimpleNamespace(
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
         project=project,
-        services=SimpleNamespace(agent=CompositeAgent()),
-        config=None,
-        resolve=lambda relpath: (project.root / relpath).resolve(),
+        services=SimpleNamespace(agent=CompositeAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
     )
-    registry = build_action_registry(tool_context=tool_context)  # type: ignore[arg-type]
+    registry = build_action_registry(tool_context=tool_context)
     result = await registry.get("review.spotcheck").executor(
         ActionExecutionContext(
             project=project,
             run_id="run-1",
             action_id="spot-1",
-            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+            snapshot=snapshot,
         ),
         parameters,
     )

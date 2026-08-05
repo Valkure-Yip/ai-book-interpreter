@@ -31,6 +31,39 @@ class SchedulableAction(Protocol):
 _ActionT = TypeVar("_ActionT", bound=SchedulableAction)
 
 
+def _resource_root(path: str) -> str:
+    return path[:-2] if path.endswith("/*") else path
+
+
+def resource_paths_overlap(left: str, right: str) -> bool:
+    """Return whether two exact/directory resource keys share one namespace."""
+    left_root = _resource_root(left)
+    right_root = _resource_root(right)
+    return (
+        left_root == right_root
+        or left_root.startswith(f"{right_root}/")
+        or right_root.startswith(f"{left_root}/")
+    )
+
+
+def _collections_overlap(left: Collection[str], right: Collection[str]) -> bool:
+    return any(resource_paths_overlap(a, b) for a in left for b in right)
+
+
+def access_sets_conflict(
+    left_reads: Collection[str],
+    left_writes: Collection[str],
+    right_reads: Collection[str],
+    right_writes: Collection[str],
+) -> bool:
+    """Apply one prefix-aware read/write conflict rule in policy and scheduler."""
+    return (
+        _collections_overlap(left_writes, right_writes)
+        or _collections_overlap(left_writes, right_reads)
+        or _collections_overlap(left_reads, right_writes)
+    )
+
+
 class Scheduler:
     """Select a stable batch whose admitted Actions cannot conflict."""
 
@@ -66,7 +99,7 @@ class Scheduler:
                 continue
             reads = set(action.read_set)
             writes = set(action.write_set)
-            if writes & batch_writes or writes & batch_reads or reads & batch_writes:
+            if access_sets_conflict(reads, writes, batch_reads, batch_writes):
                 continue
             selected.append(action)
             batch_reads.update(reads)

@@ -8,7 +8,7 @@ from collections.abc import Collection, Mapping
 
 from pydantic import ValidationError
 
-from abi.actions.contracts import ActionDefinition, ActionValidator, ResolvedAction
+from abi.actions.contracts import ActionAccess, ActionDefinition, ActionValidator, ResolvedAction
 from abi.actions.predicates import PredicateCatalog, PredicateConfigurationError
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.types._base import FrozenModel
@@ -225,6 +225,35 @@ class ActionRegistry:
             parameters=parameters,
             parameters_json=canonical_json,
         )
+
+    def access_for(self, resolved: ResolvedAction) -> ActionAccess:
+        """Return the one validated access expansion used by policy and authorization."""
+        definition = resolved.definition
+        access = (
+            ActionAccess(
+                read_set=definition.spec.read_set,
+                write_set=definition.spec.write_set,
+            )
+            if definition.access_expander is None
+            else definition.access_expander(
+                definition.spec.capability, resolved.parameters
+            )
+        )
+        for access_path in (*access.read_set, *access.write_set):
+            try:
+                canonical_artifact_key(access_path)
+            except ValueError as exc:
+                raise RegistryConfigurationError(
+                    f"expanded access path {access_path!r} for "
+                    f"{definition.spec.capability} is not portable lowercase ASCII"
+                ) from exc
+        if len(access.read_set) != len(set(access.read_set)) or len(
+            access.write_set
+        ) != len(set(access.write_set)):
+            raise RegistryConfigurationError(
+                f"expanded access paths for {definition.spec.capability} must be unique"
+            )
+        return access
 
     def _validate_definition(self, definition: ActionDefinition) -> None:
         spec = definition.spec

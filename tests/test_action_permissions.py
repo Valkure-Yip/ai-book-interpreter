@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,14 +16,18 @@ from abi.actions.builtins.inputs import (
     ChapterBatchInput,
     EmptyInput,
     ReviewBatchInput,
+    SourceIngestInput,
     SpotcheckInput,
 )
 from abi.actions.effects import expand_expected_artifacts
 from abi.project.artifacts import ArtifactStore
 from abi.project.layout import BookProject
+from abi.tools.content import make_content_tools
+from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
 from abi.tools.gates import make_gate_tools
 from abi.tools.permissions import ActionPathPermissions
+from abi.types.orchestration import RunSnapshot, RunStatus
 from abi.types.tools import GateRuntimeMetadata
 
 
@@ -36,6 +41,15 @@ def _context(root: Path) -> SimpleNamespace:
     return SimpleNamespace(
         project=project,
         resolve=lambda relpath: (root / relpath).resolve(),
+    )
+
+
+def _secure_context(root: Path) -> ToolContext:
+    return ToolContext(
+        project=BookProject(root),
+        services=SimpleNamespace(),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
     )
 
 
@@ -71,6 +85,140 @@ def test_filesystem_handler_rechecks_action_permissions(tmp_path: Path) -> None:
     assert not (tmp_path / "chapters/translated/001.md").exists()
     assert not (tmp_path / "glossary/terms.csv").exists()
     store.close()
+
+
+@pytest.mark.parametrize("link_kind", ["leaf", "directory"])
+def test_permissioned_read_rejects_symlink_components(
+    tmp_path: Path, link_kind: str
+) -> None:
+    references = tmp_path / "references"
+    metadata = tmp_path / "metadata"
+    references.mkdir()
+    metadata.mkdir()
+    secret = metadata / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    requested = references / "allowed.txt"
+    if link_kind == "leaf":
+        requested.symlink_to(secret)
+        relpath = "references/allowed.txt"
+    else:
+        linked = references / "linked"
+        linked.symlink_to(metadata, target_is_directory=True)
+        relpath = "references/linked/secret.txt"
+
+    read_file = next(
+        tool
+        for tool in make_fs_tools(
+            _secure_context(tmp_path),
+            permissions=ActionPathPermissions(read_dirs=("references",)),
+        )
+        if tool.name == "read_file"
+    )
+
+    with pytest.raises(PermissionError, match="symlink"):
+        read_file.callable(path=relpath)
+
+
+def test_content_ingest_rejects_symlinked_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    metadata = tmp_path / "metadata"
+    source.mkdir()
+    metadata.mkdir()
+    secret = metadata / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    (source / "source_text_raw.txt").symlink_to(secret)
+    parameters = SourceIngestInput()
+    permissions = build_action_envelope("source.ingest", parameters).permissions
+    ingest_source = next(
+        tool
+        for tool in make_content_tools(
+            _secure_context(tmp_path), permissions=permissions
+        )
+        if tool.name == "ingest_source"
+    )
+
+    with pytest.raises(PermissionError, match="symlink"):
+        ingest_source.callable()
+
+
+def test_permissioned_read_rejects_check_then_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = tmp_path / "references"
+    metadata = tmp_path / "metadata"
+    references.mkdir()
+    metadata.mkdir()
+    allowed = references / "allowed.txt"
+    allowed.write_text("PUBLIC", encoding="utf-8")
+    secret = metadata / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    context = _secure_context(tmp_path)
+    swapped = False
+
+    def swap_after_check(*_: object) -> Path:
+        nonlocal swapped
+        if not swapped:
+            allowed.unlink()
+            allowed.symlink_to(secret)
+            swapped = True
+        return allowed
+
+    monkeypatch.setattr(context, "authorize_read_path", swap_after_check, raising=False)
+    monkeypatch.setattr(context, "resolve", lambda _: swap_after_check())
+    read_file = next(
+        tool
+        for tool in make_fs_tools(
+            context,
+            permissions=ActionPathPermissions(read_dirs=("references",)),
+        )
+        if tool.name == "read_file"
+    )
+
+    with pytest.raises(PermissionError, match="symlink"):
+        read_file.callable(path="references/allowed.txt")
+
+
+def test_secure_read_fails_closed_without_no_follow_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "references/allowed.txt"
+    source.parent.mkdir()
+    source.write_text("PUBLIC", encoding="utf-8")
+    context = _secure_context(tmp_path)
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+
+    with pytest.raises(PermissionError, match="lacks secure no-follow"):
+        context.read_authorized_bytes(
+            "references/allowed.txt",
+            ActionPathPermissions(read_dirs=("references",)),
+        )
+
+
+def test_secure_read_closes_every_opened_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "references/allowed.txt"
+    source.parent.mkdir()
+    source.write_text("PUBLIC", encoding="utf-8")
+    context = _secure_context(tmp_path)
+    real_open = os.open
+    opened: list[int] = []
+
+    def recording_open(*args: object, **kwargs: object) -> int:
+        fd = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", recording_open)
+
+    assert context.read_authorized_bytes(
+        "references/allowed.txt",
+        ActionPathPermissions(read_dirs=("references",)),
+    ) == b"PUBLIC"
+    assert opened
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 @pytest.mark.parametrize("chapter", ("../001", "Chapter-01", "章节一", "001/other"))
