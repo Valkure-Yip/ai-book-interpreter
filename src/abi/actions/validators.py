@@ -428,29 +428,26 @@ def _chapter_control(
             "polysemy_unresolved_count": "0",
         }
         report_lines = text.rstrip().splitlines()
-        nonempty_indices = tuple(
-            index for index, line in enumerate(report_lines) if line.strip()
-        )
-        trailing_indices = nonempty_indices[-len(required_fields) :]
-        trailing_lines = tuple(report_lines[index].strip() for index in trailing_indices)
+        block_start = max(0, len(report_lines) - len(required_fields))
+        trailing_lines = tuple(line.strip() for line in report_lines[block_start:])
         expected_lines = tuple(
             f"{field}: {value}" for field, value in required_fields.items()
         )
-        block_start = trailing_indices[0] if trailing_indices else len(report_lines)
-        separator = max(
+        round_marker = re.compile(r"(?i)^\s*(?:#{1,6}\s*)?round\s*:?\s*\d+\b")
+        latest_round_start = max(
             (
-                index
+                index + 1
                 for index, line in enumerate(report_lines[:block_start])
-                if not line.strip()
+                if round_marker.search(line)
             ),
-            default=-1,
+            default=0,
         )
         field_prefix = re.compile(
             rf"(?i)^\s*(?:{'|'.join(map(re.escape, required_fields))})\s*:"
         )
         duplicate_in_latest_round = any(
             field_prefix.search(line)
-            for line in report_lines[separator + 1 : block_start]
+            for line in report_lines[latest_round_start:block_start]
         )
         if duplicate_in_latest_round or tuple(
             line.lower() for line in trailing_lines

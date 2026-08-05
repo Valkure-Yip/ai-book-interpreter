@@ -256,6 +256,61 @@ Latest round has no machine-readable disposition.
 """,
             False,
         ),
+        (
+            "Substantive controlled translation.",
+            """round: 2
+issues_found: 2
+latest_round_status: FAIL
+
+scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+""",
+            False,
+        ),
+        (
+            "Substantive controlled translation.",
+            """scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+""",
+            False,
+        ),
+        (
+            "Substantive controlled translation.",
+            """round: 1
+scope: FULL_CHAPTER
+issues_found: 2
+fixes_applied: 0
+unresolved_blocking_issues: 2
+latest_round_status: FAIL
+allow_next_chapter: false
+expert_translation_skill_used: true
+polysemy_unresolved_count: 1
+
+round: 2
+scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+""",
+            True,
+        ),
     ),
 )
 def test_chapter_control_requires_substantive_revision_and_complete_pass_report(
