@@ -20,7 +20,10 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Interrupt
 from pydantic import Field
 
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
@@ -261,13 +264,13 @@ class _ResumeAfterToolModel(_RecordingOutcomeModel):
         **kwargs: Any,
     ) -> ChatResult:
         self.human_counts.append(sum(message.type == "human" for message in messages))
-        completed = any(isinstance(message, ToolMessage) and message.name == "once" for message in messages)
+        completed = any(
+            isinstance(message, ToolMessage) and message.name == "once" for message in messages
+        )
         if not completed:
             message = AIMessage(
                 content="",
-                tool_calls=[
-                    {"name": "once", "args": {}, "id": "once-call", "type": "tool_call"}
-                ],
+                tool_calls=[{"name": "once", "args": {}, "id": "once-call", "type": "tool_call"}],
             )
             return ChatResult(generations=[ChatGeneration(message=message)])
         if self.fail_once:
@@ -429,6 +432,39 @@ def _request(
     )
 
 
+async def _pending_interrupt_ids(checkpoint_path: Path, thread_id: str) -> tuple[str, ...]:
+    config = {"configurable": {"thread_id": thread_id}}
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        checkpoint = await saver.aget_tuple(config)
+    assert checkpoint is not None
+    return tuple(
+        interrupt.id
+        for _task_id, channel, value in checkpoint.pending_writes or ()
+        if channel == "__interrupt__"
+        for interrupt in value
+        if isinstance(interrupt, Interrupt)
+    )
+
+
+def _hitl_interrupt(
+    interrupt_id: str,
+    *tool_names: str,
+) -> Interrupt:
+    return Interrupt(
+        value={
+            "action_requests": [{"name": tool_name, "args": {}} for tool_name in tool_names],
+            "review_configs": [
+                {
+                    "action_name": tool_name,
+                    "allowed_decisions": ["approve", "reject"],
+                }
+                for tool_name in tool_names
+            ],
+        },
+        id=interrupt_id,
+    )
+
+
 @pytest.mark.asyncio
 async def test_budget_pause_resumes_without_appending_a_human_message(tmp_path: Path) -> None:
     model = _RecordingOutcomeModel(human_counts=[])
@@ -525,6 +561,9 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
     first = await runtime.run_action(
         _request(tmp_path, tools=(tool,), side_effects=True, approval_tools=("deliver",))
     )
+    (interrupt_id,) = await _pending_interrupt_ids(
+        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
+    )
     resumed = await runtime.run_action(
         _request(
             tmp_path,
@@ -532,7 +571,12 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
             side_effects=True,
             approval_tools=("deliver",),
             resume=runner.HitlResume(
-                decisions=(runner.HitlDecision(decision="approve"),)
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
             ),
         )
     )
@@ -562,6 +606,9 @@ async def test_hitl_reject_resumes_without_executing_the_business_tool(
     first = await runtime.run_action(
         _request(tmp_path, tools=(tool,), side_effects=True, approval_tools=("deliver",))
     )
+    (interrupt_id,) = await _pending_interrupt_ids(
+        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
+    )
     rejected = await runtime.run_action(
         _request(
             tmp_path,
@@ -569,9 +616,12 @@ async def test_hitl_reject_resumes_without_executing_the_business_tool(
             side_effects=True,
             approval_tools=("deliver",),
             resume=runner.HitlResume(
-                decisions=(
-                    runner.HitlDecision(
-                        decision="reject", feedback="not authorized"
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=interrupt_id,
+                        decisions=(
+                            runner.HitlDecision(decision="reject", feedback="not authorized"),
+                        ),
                     ),
                 )
             ),
@@ -595,7 +645,123 @@ def test_hitl_resume_rejects_unsupported_decisions() -> None:
     with pytest.raises(ValueError):
         runner.HitlDecision(decision="edit")
     with pytest.raises(ValueError):
-        runner.HitlResume(decisions=())
+        runner.HitlInterruptDecision(interrupt_id="", decisions=())
+    with pytest.raises(ValueError):
+        runner.HitlResume(interrupts=())
+    with pytest.raises(ValueError, match="unique"):
+        runner.HitlResume(
+            interrupts=(
+                runner.HitlInterruptDecision(
+                    interrupt_id="same",
+                    decisions=(runner.HitlDecision(decision="approve"),),
+                ),
+                runner.HitlInterruptDecision(
+                    interrupt_id="same",
+                    decisions=(runner.HitlDecision(decision="reject"),),
+                ),
+            )
+        )
+
+
+def test_pending_hitl_interrupts_keep_task_and_id_and_ignore_resumed_tasks() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint = CheckpointTuple(
+        config={"configurable": {"thread_id": "thread-1"}},
+        checkpoint={},
+        metadata={},
+        pending_writes=[
+            ("task-a", "__interrupt__", (_hitl_interrupt("interrupt-a", "deliver_a"),)),
+            ("task-a", "__resume__", [{"decisions": [{"type": "approve"}]}]),
+            ("task-b", "__interrupt__", (_hitl_interrupt("interrupt-b", "deliver_b"),)),
+        ],
+    )
+
+    pending = runner._pending_hitl_interrupts(checkpoint)
+
+    assert pending is not None
+    assert [
+        (
+            interrupt.task_id,
+            interrupt.interrupt_id,
+            tuple(action.tool_name for action in interrupt.actions),
+        )
+        for interrupt in pending
+    ] == [("task-b", "interrupt-b", ("deliver_b",))]
+
+
+def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    tools = (
+        ToolBinding("deliver_a", "First delivery.", _NoopInput, lambda: "a"),
+        ToolBinding("deliver_b", "Second delivery.", _NoopInput, lambda: "b"),
+    )
+    checkpoint = CheckpointTuple(
+        config={"configurable": {"thread_id": "thread-1"}},
+        checkpoint={},
+        metadata={},
+        pending_writes=[
+            ("task-a", "__interrupt__", (_hitl_interrupt("interrupt-a", "deliver_a"),)),
+            ("task-b", "__interrupt__", (_hitl_interrupt("interrupt-b", "deliver_b"),)),
+        ],
+    )
+    one_group = runner.HitlInterruptDecision(
+        interrupt_id="interrupt-a",
+        decisions=(runner.HitlDecision(decision="approve"),),
+    )
+    two_groups = (
+        one_group,
+        runner.HitlInterruptDecision(
+            interrupt_id="interrupt-b",
+            decisions=(runner.HitlDecision(decision="reject"),),
+        ),
+    )
+
+    missing = runner._validate_hitl_resume(
+        _request(
+            tmp_path,
+            tools=tools,
+            approval_tools=("deliver_a", "deliver_b"),
+            resume=runner.HitlResume(interrupts=(one_group,)),
+        ),
+        checkpoint,
+    )
+    exact = runner._validate_hitl_resume(
+        _request(
+            tmp_path,
+            tools=tools,
+            approval_tools=("deliver_a", "deliver_b"),
+            resume=runner.HitlResume(interrupts=two_groups),
+        ),
+        checkpoint,
+    )
+
+    assert missing is not None
+    assert missing.outcome.kind == "repair_required"
+    assert missing.outcome.defect_codes == ("hitl_interrupt_id_mismatch",)
+    assert exact is None
+
+
+def test_hitl_resume_maps_single_and_multiple_interrupts_by_id() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    resume = runner.HitlResume(
+        interrupts=(
+            runner.HitlInterruptDecision(
+                interrupt_id="interrupt-a",
+                decisions=(runner.HitlDecision(decision="approve"),),
+            ),
+            runner.HitlInterruptDecision(
+                interrupt_id="interrupt-b",
+                decisions=(runner.HitlDecision(decision="reject", feedback="not authorized"),),
+            ),
+        )
+    )
+
+    command = runner._hitl_resume_command(resume)
+
+    assert command.resume == {
+        "interrupt-a": {"decisions": [{"type": "approve"}]},
+        "interrupt-b": {"decisions": [{"type": "reject", "message": "not authorized"}]},
+    }
 
 
 @pytest.mark.asyncio
@@ -636,13 +802,21 @@ async def test_hitl_resumes_multiple_tools_with_ordered_decisions(
     }
 
     paused = await runtime.run_action(_request(tmp_path, **request_args))
+    (interrupt_id,) = await _pending_interrupt_ids(
+        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
+    )
     resumed = await runtime.run_action(
         _request(
             tmp_path,
             **request_args,
             resume=runner.HitlResume(
-                decisions=tuple(
-                    runner.HitlDecision(decision=decision) for decision in decisions
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=interrupt_id,
+                        decisions=tuple(
+                            runner.HitlDecision(decision=decision) for decision in decisions
+                        ),
+                    ),
                 )
             ),
         )
@@ -669,6 +843,9 @@ async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -
         "approval_tools": ("deliver_a", "deliver_b"),
     }
     paused = await runtime.run_action(_request(tmp_path, **request_args))
+    (interrupt_id,) = await _pending_interrupt_ids(
+        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
+    )
     real_create_agent = runner.create_agent
     graph_creations = 0
 
@@ -685,7 +862,12 @@ async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -
                 tmp_path,
                 **request_args,
                 resume=runner.HitlResume(
-                    decisions=(runner.HitlDecision(decision="approve"),)
+                    interrupts=(
+                        runner.HitlInterruptDecision(
+                            interrupt_id=interrupt_id,
+                            decisions=(runner.HitlDecision(decision="approve"),),
+                        ),
+                    )
                 ),
             )
         )
@@ -763,9 +945,7 @@ async def test_invalid_tool_arguments_do_not_count_as_side_effect_start(
         return f"delivered to {recipient}"
 
     tool = ToolBinding("deliver", "Validated side effect.", _DeliveryInput, deliver)
-    result = await runtime.run_action(
-        _request(tmp_path, tools=(tool,), side_effects=True)
-    )
+    result = await runtime.run_action(_request(tmp_path, tools=(tool,), side_effects=True))
 
     assert result.outcome.kind == "retryable_failure"
     assert result.outcome.error_code == "provider_timeout"
@@ -1008,9 +1188,7 @@ def test_llm_callback_finalizes_each_run_id_only_once(tmp_path: Path) -> None:
     )
     run_id = uuid4()
 
-    callback.on_chat_model_start(
-        {}, [[HumanMessage(content="one attempt")]], run_id=run_id
-    )
+    callback.on_chat_model_start({}, [[HumanMessage(content="one attempt")]], run_id=run_id)
     callback.on_llm_error(ConnectionError("first delivery"), run_id=run_id)
     callback.on_llm_error(ConnectionError("duplicate delivery"), run_id=run_id)
 
@@ -1041,9 +1219,7 @@ async def test_checkpoint_resume_on_new_thread_returns_repair_instruction(
 
     monkeypatch.setattr(runner, "create_agent", tracked_create_agent)
 
-    result = await runtime.run_action(
-        _request(tmp_path, resume=runner.CheckpointResume())
-    )
+    result = await runtime.run_action(_request(tmp_path, resume=runner.CheckpointResume()))
 
     assert result.outcome.kind == "repair_required"
     assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
@@ -1091,7 +1267,12 @@ async def test_missing_hitl_resume_is_rejected_before_graph_model_or_tool_work(
         approval_tools = ()
     runtime = _runtime(tmp_path, model)
     resume = runner.HitlResume(
-        decisions=(runner.HitlDecision(decision="approve"),)
+        interrupts=(
+            runner.HitlInterruptDecision(
+                interrupt_id="missing-interrupt",
+                decisions=(runner.HitlDecision(decision="approve"),),
+            ),
+        )
     )
 
     result = await runtime.run_action(
@@ -1143,7 +1324,12 @@ async def test_hitl_resume_rejects_non_hitl_checkpoint_before_graph_work(
         _request(
             tmp_path,
             resume=runner.HitlResume(
-                decisions=(runner.HitlDecision(decision="approve"),)
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id="not-a-hitl-interrupt",
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
             ),
         )
     )
@@ -1177,6 +1363,9 @@ async def test_hitl_resume_rejects_pending_tool_removed_from_approval_allowlist(
     paused = await runtime.run_action(
         _request(tmp_path, tools=(tool,), approval_tools=("deliver",))
     )
+    (interrupt_id,) = await _pending_interrupt_ids(
+        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
+    )
     real_create_agent = runner.create_agent
     graph_creations = 0
 
@@ -1193,7 +1382,12 @@ async def test_hitl_resume_rejects_pending_tool_removed_from_approval_allowlist(
             tools=(tool,),
             approval_tools=(),
             resume=runner.HitlResume(
-                decisions=(runner.HitlDecision(decision="approve"),)
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
             ),
         )
     )
@@ -1226,15 +1420,18 @@ async def test_missing_resume_database_does_not_create_parent_or_connect_saver(
         saver_connections += 1
         return real_from_conn_string(path)
 
-    monkeypatch.setattr(
-        runner.AsyncSqliteSaver, "from_conn_string", tracked_from_conn_string
-    )
+    monkeypatch.setattr(runner.AsyncSqliteSaver, "from_conn_string", tracked_from_conn_string)
     resume: object
     if resume_kind == "checkpoint":
         resume = runner.CheckpointResume()
     else:
         resume = runner.HitlResume(
-            decisions=(runner.HitlDecision(decision="approve"),)
+            interrupts=(
+                runner.HitlInterruptDecision(
+                    interrupt_id="missing-interrupt",
+                    decisions=(runner.HitlDecision(decision="approve"),),
+                ),
+            )
         )
 
     result = await runtime.run_action(
@@ -1257,12 +1454,163 @@ async def test_fresh_invocation_may_create_checkpoint_parent_and_database(
     runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
     checkpoint_path = tmp_path / "fresh-checkpoints" / "state" / "graph.sqlite"
 
-    result = await runtime.run_action(
-        _request(tmp_path, checkpoint_path=checkpoint_path)
-    )
+    result = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
 
     assert result.outcome.kind == "succeeded"
     assert checkpoint_path.is_file()
+    with sqlite3.connect(checkpoint_path) as connection:
+        marker = connection.execute(
+            "SELECT format_version FROM abi_checkpoint_metadata WHERE marker_key = ?",
+            ("abi_action_checkpoint",),
+        ).fetchone()
+    assert marker == (1,)
+
+
+@pytest.mark.asyncio
+async def test_resume_preflight_rejects_unrelated_sqlite_without_mutating_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "unrelated.sqlite"
+    with sqlite3.connect(checkpoint_path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO unrelated VALUES ('preserve-me')")
+        connection.commit()
+        journal_before = connection.execute("PRAGMA journal_mode").fetchone()
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    bytes_before = checkpoint_path.read_bytes()
+    setup_calls = 0
+    real_setup = runner.AsyncSqliteSaver.setup
+
+    async def tracked_setup(self: Any) -> None:
+        nonlocal setup_calls
+        setup_calls += 1
+        await real_setup(self)
+
+    monkeypatch.setattr(runner.AsyncSqliteSaver, "setup", tracked_setup)
+    runtime = _runtime(
+        tmp_path,
+        _ExplodingModel(error=AssertionError("model must not run")),
+    )
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=checkpoint_path,
+            resume=runner.CheckpointResume(),
+        )
+    )
+
+    with sqlite3.connect(checkpoint_path) as connection:
+        journal_after = connection.execute("PRAGMA journal_mode").fetchone()
+        schema_after = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        preserved = connection.execute("SELECT value FROM unrelated").fetchall()
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_foreign_database",)
+    assert setup_calls == 0
+    assert journal_after == journal_before
+    assert schema_after == schema_before
+    assert checkpoint_path.read_bytes() == bytes_before
+    assert preserved == [("preserve-me",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias_kind", ["file", "parent"])
+async def test_resume_rejects_symlink_in_any_checkpoint_path_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alias_kind: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    target_dir = tmp_path / "checkpoint-target"
+    target_path = target_dir / "graph.sqlite"
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    first = await runtime.run_action(_request(tmp_path, checkpoint_path=target_path))
+    assert first.outcome.kind == "succeeded"
+    target_before = target_path.read_bytes()
+    if alias_kind == "file":
+        alias_path = tmp_path / "checkpoint-alias.sqlite"
+        try:
+            alias_path.symlink_to(target_path)
+        except OSError as error:
+            pytest.skip(f"symlink creation is unavailable: {type(error).__name__}")
+    else:
+        alias_parent = tmp_path / "checkpoint-parent-alias"
+        try:
+            alias_parent.symlink_to(target_dir, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlink creation is unavailable: {type(error).__name__}")
+        alias_path = alias_parent / "graph.sqlite"
+    saver_opens = 0
+    real_from_conn_string = runner.AsyncSqliteSaver.from_conn_string
+
+    def tracked_from_conn_string(path: str) -> Any:
+        nonlocal saver_opens
+        saver_opens += 1
+        return real_from_conn_string(path)
+
+    monkeypatch.setattr(runner.AsyncSqliteSaver, "from_conn_string", tracked_from_conn_string)
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=alias_path,
+            resume=runner.CheckpointResume(),
+        )
+    )
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_path_unsafe",)
+    assert saver_opens == 0
+    assert target_path.read_bytes() == target_before
+
+
+@pytest.mark.asyncio
+async def test_resume_precheck_and_invoke_share_one_saver_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "graph-checkpoints.sqlite"
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    first = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
+    assert first.outcome.kind == "succeeded"
+    real_from_conn_string = runner.AsyncSqliteSaver.from_conn_string
+    saver_opens = 0
+    replacement_hook_ran = False
+
+    def adversarial_from_conn_string(path: str) -> Any:
+        nonlocal saver_opens, replacement_hook_ran
+        saver_opens += 1
+        if saver_opens > 1:
+            replacement_hook_ran = True
+            checkpoint_path.unlink()
+            with sqlite3.connect(checkpoint_path) as connection:
+                connection.execute("CREATE TABLE replacement (value TEXT)")
+        return real_from_conn_string(path)
+
+    monkeypatch.setattr(
+        runner.AsyncSqliteSaver,
+        "from_conn_string",
+        adversarial_from_conn_string,
+    )
+
+    resumed = await runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=checkpoint_path,
+            resume=runner.CheckpointResume(),
+        )
+    )
+
+    assert resumed.outcome == first.outcome
+    assert saver_opens == 1
+    assert replacement_hook_ran is False
 
 
 def _sqlite_read_error(
@@ -1273,21 +1621,86 @@ def _sqlite_read_error(
     return error
 
 
+@pytest.mark.parametrize(
+    ("raw_code", "kind", "checkpoint_code"),
+    [
+        (3338, "repair_required", "checkpoint_permission_denied"),
+        (7178, "repair_required", "checkpoint_permission_denied"),
+        (266, "repair_required", "checkpoint_read_failed"),
+        (261, "retryable_failure", "checkpoint_busy"),
+        (262, "retryable_failure", "checkpoint_busy"),
+        (779, "repair_required", "checkpoint_corrupt"),
+        (sqlite3.SQLITE_NOTADB, "repair_required", "checkpoint_corrupt"),
+    ],
+)
+def test_checkpoint_sqlite_raw_codes_preserve_extended_meaning_before_base_code(
+    raw_code: int,
+    kind: str,
+    checkpoint_code: str,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    error = _sqlite_read_error(sqlite3.DatabaseError, raw_code, "storage-secret")
+
+    result = runner._checkpoint_read_failure(error)
+
+    assert result.outcome.kind == kind
+    if kind == "retryable_failure":
+        assert result.outcome.error_code == checkpoint_code
+    else:
+        assert result.outcome.defect_codes == (checkpoint_code,)
+    assert "storage-secret" not in result.outcome.message
+
+
+def test_checkpoint_sqlite_missing_extension_constants_fall_back_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    for name in ("SQLITE_IOERR_ACCESS", "SQLITE_IOERR_AUTH", "SQLITE_IOERR_READ"):
+        monkeypatch.delattr(sqlite3, name, raising=False)
+    error = _sqlite_read_error(sqlite3.DatabaseError, 3338, "storage-secret")
+
+    result = runner._checkpoint_read_failure(error)
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_read_failed",)
+    assert "storage-secret" not in result.outcome.message
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_preflight_preserves_busy_storage_classification() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    error = _sqlite_read_error(
+        sqlite3.OperationalError,
+        sqlite3.SQLITE_BUSY,
+        "preflight-storage-secret",
+    )
+
+    class _FailingConnection:
+        def execute(self, *args: Any, **kwargs: Any) -> Any:
+            raise error
+
+    class _FailingSaver:
+        conn = _FailingConnection()
+
+    result = await runner._preflight_checkpoint_database(_FailingSaver())
+
+    assert result is not None
+    assert result.outcome.kind == "retryable_failure"
+    assert result.outcome.error_code == "checkpoint_busy"
+    assert "preflight-storage-secret" not in result.outcome.message
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "kind", "checkpoint_code"),
     [
         (
-            _sqlite_read_error(
-                sqlite3.OperationalError, sqlite3.SQLITE_BUSY, "locked-secret"
-            ),
+            _sqlite_read_error(sqlite3.OperationalError, sqlite3.SQLITE_BUSY, "locked-secret"),
             "retryable_failure",
             "checkpoint_busy",
         ),
         (
-            _sqlite_read_error(
-                sqlite3.OperationalError, sqlite3.SQLITE_LOCKED, "busy-secret"
-            ),
+            _sqlite_read_error(sqlite3.OperationalError, sqlite3.SQLITE_LOCKED, "busy-secret"),
             "retryable_failure",
             "checkpoint_busy",
         ),
@@ -1297,16 +1710,12 @@ def _sqlite_read_error(
             "checkpoint_read_timeout",
         ),
         (
-            _sqlite_read_error(
-                sqlite3.DatabaseError, sqlite3.SQLITE_CORRUPT, "corrupt-secret"
-            ),
+            _sqlite_read_error(sqlite3.DatabaseError, sqlite3.SQLITE_CORRUPT, "corrupt-secret"),
             "repair_required",
             "checkpoint_corrupt",
         ),
         (
-            _sqlite_read_error(
-                sqlite3.DatabaseError, sqlite3.SQLITE_NOTADB, "malformed-secret"
-            ),
+            _sqlite_read_error(sqlite3.DatabaseError, sqlite3.SQLITE_NOTADB, "malformed-secret"),
             "repair_required",
             "checkpoint_corrupt",
         ),
@@ -1326,7 +1735,9 @@ async def test_checkpoint_read_failures_are_control_results_without_graph_work(
 ) -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     checkpoint_path = tmp_path / "graph-checkpoints.sqlite"
-    checkpoint_path.touch()
+    initializer = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    initialized = await initializer.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
+    assert initialized.outcome.kind == "succeeded"
     model = _ExplodingModel(error=AssertionError("model must not run"))
     runtime = _runtime(tmp_path, model)
     real_create_agent = runner.create_agent
@@ -1374,9 +1785,7 @@ async def test_completed_checkpoint_resume_returns_cached_success_without_new_wo
     runtime = _runtime(tmp_path, model)
 
     first = await runtime.run_action(_request(tmp_path))
-    resumed = await runtime.run_action(
-        _request(tmp_path, resume=runner.CheckpointResume())
-    )
+    resumed = await runtime.run_action(_request(tmp_path, resume=runner.CheckpointResume()))
 
     assert first.outcome.kind == "succeeded"
     assert resumed.outcome == first.outcome

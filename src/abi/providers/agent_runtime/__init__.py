@@ -7,6 +7,7 @@ from abi.providers.agent_runtime.runner import (
     AgentRuntime,
     CheckpointResume,
     HitlDecision,
+    HitlInterruptDecision,
     HitlResume,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "AgentRuntime",
     "CheckpointResume",
     "HitlDecision",
+    "HitlInterruptDecision",
     "HitlResume",
 ]

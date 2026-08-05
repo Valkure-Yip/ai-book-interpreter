@@ -560,19 +560,46 @@ ABI 现在的持久化有三类，和 LangGraph 两个原语只是**部分重叠
 "agent 不能自判通过"的边界；③ 唯一真相从领域模型 `Status` 漂移到框架内部状态。**宏观进度继续用
 `pipeline_state.json`。**
 
-### 6.2 用持久化 Checkpointer 增强**阶段内**恢复 — 合理增量
+### 6.2 持久化 Checkpointer 增强**Action 内**恢复
 
-现状痛点：每阶段用临时 `InMemorySaver` 且 thread_id 按 attempt 区分、跑完即弃。一个
-`max_iterations=120` 的翻译阶段若在第 80 步崩溃，`resume` 只能整段重跑该阶段（已落盘的章节靠
-文件系统保住，但 agent 推理上下文全丢）。
+Action harness 已使用 `AsyncSqliteSaver` 和调用者提供的稳定 `thread_id`。它保存模型消息、工具结果、
+待处理 interrupt 与结构化结果，让预算暂停、迭代上限、提供方瞬态失败和 HITL 都能在同一 Action
+边界续跑。checkpointer 仍只是"微观加速器"；`pipeline_state.json` 继续是宏观进度唯一真相。
 
-把 `InMemorySaver` 换成 `AsyncSqliteSaver`（落到 `project_root/state/agent_checkpoints.sqlite`）
-并稳定 thread_id，可解锁：① 阶段内 super-step 级续跑；② LangGraph `interrupt()` 做 HITL
-兜底（ABI 默认 `human_required=false`，这是给"卡死"留的逃生口）；③ `get_state_history()`
-time-travel 调试。改动**只在 `AgentRuntime`**。需处理：成功后归档/清理 checkpoint 防膨胀；
-thread_id 稳定后重试要显式 reset，避免失败上下文污染重试。
+#### Checkpoint 所有权与只读预检
 
-checkpointer 是"微观加速器"，`pipeline_state.json` 仍是宏观真相——双层不冲突。
+fresh invocation 仅认领经路径检查后确认不存在的直接文件；它在一个 saver context 内首次初始化
+LangGraph 的 `checkpoints` / `writes` 表，并写入
+`abi_checkpoint_metadata(marker_key='abi_action_checkpoint', format_version=1)`。若 fresh 指向已存在文件，
+也必须先通过下述只读预检。未带 marker 的旧数据库
+没有兼容要求；它与任意外部 SQLite 一样返回 `RepairRequired(checkpoint_foreign_database)`，不能被
+`AsyncSqliteSaver.setup()` 顺手切换 WAL 或创建表。
+
+resume 的顺序是强制不变量：
+
+1. 对绝对化后的每个现存路径组件执行 `lstat`；任意 symlink、非目录中间组件或非普通最终文件均
+   fail closed，缺失目标也不创建；
+2. 只打开**一个** `AsyncSqliteSaver` context / SQLite 连接；
+3. 在该连接上仅用 `SELECT` 检查 LangGraph 必需列和 ABI marker，期间不调用 saver `setup()`，不执行
+   PRAGMA/CREATE，也不改变外部数据库的 journal mode 或表；
+4. 预检通过后，仍用同一个 saver 实例调用 `aget_tuple`、编译 agent 并 `ainvoke`，不关闭后重开。
+
+上述路径保证以 ABI 的本地单进程执行平台为边界：同一进程内不通过路径别名或 symlink 换目标，且
+"预检→执行"没有第二次 saver open 的替换窗口。它不声称防御另一进程或分布式攻击者在系统调用之间
+替换文件；若平台未来引入多进程写入，需要升级为描述符级身份校验/锁协议，而不是在本地方案上增加
+无界对抗模型。
+
+#### 多 interrupt HITL
+
+`CheckpointTuple.pending_writes` 中的 pending HITL 以 `(task_id, Interrupt.id)` 标识。同一 `task_id`
+已有 `__resume__` 写入时，其旧 `__interrupt__` 不再算 pending。ABI 的 `HitlResume` 按 interrupt id
+携带一组组强类型决策；请求 id 集合必须与真实 pending id 集合精确相等，每组再按自己的 HITL payload
+验证工具数量、Action approval allowlist 与 allowed decisions。全部验证在构图前完成，随后统一映射为
+`Command(resume={interrupt_id: {"decisions": [...]}, ...})`；单 interrupt 不走特殊分支。
+
+SQLite 错误先匹配完整扩展码，再退回 base code：`IOERR_ACCESS` / `IOERR_AUTH` 等权限扩展返回
+`checkpoint_permission_denied`，busy/locked 可重试，corrupt/not-a-database 要求修复，其余读取 I/O
+失败不冒充数据损坏。扩展常量通过安全 `getattr` 获取，以兼容不同 Python/SQLite 构建。
 
 ### 6.3 用 Store 做**跨书长期记忆** — store 的甜区，但要权衡
 

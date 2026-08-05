@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
@@ -22,7 +23,7 @@ from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import EmptyInputError, GraphRecursionError
 from langgraph.types import Command, Interrupt
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, model_validator
 
 from abi.providers.agent_runtime.tooling import to_langchain_tool
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
@@ -59,11 +60,25 @@ class HitlDecision(FrozenModel):
     feedback: str | None = None
 
 
+class HitlInterruptDecision(FrozenModel):
+    """Ordered decisions addressed to one concrete LangGraph interrupt."""
+
+    interrupt_id: str = Field(min_length=1)
+    decisions: tuple[HitlDecision, ...] = Field(min_length=1)
+
+
 class HitlResume(FrozenModel):
-    """Typed ordered decisions for one multi-tool graph interrupt."""
+    """Typed decisions for the exact set of pending graph interrupts."""
 
     kind: Literal["hitl"] = "hitl"
-    decisions: tuple[HitlDecision, ...] = Field(min_length=1)
+    interrupts: tuple[HitlInterruptDecision, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _interrupt_ids_are_unique(self) -> HitlResume:
+        interrupt_ids = [item.interrupt_id for item in self.interrupts]
+        if len(interrupt_ids) != len(set(interrupt_ids)):
+            raise ValueError("HITL interrupt ids must be unique")
+        return self
 
 
 AgentResume: TypeAlias = CheckpointResume | HitlResume
@@ -81,8 +96,8 @@ class _CheckpointReviewConfig(FrozenModel):
     """Validated decision policy paired with one interrupted action."""
 
     action_name: str
-    allowed_decisions: tuple[Literal["approve", "edit", "reject", "respond"], ...] = (
-        Field(min_length=1)
+    allowed_decisions: tuple[Literal["approve", "edit", "reject", "respond"], ...] = Field(
+        min_length=1
     )
     args_schema: dict[str, object] | None = None
 
@@ -92,6 +107,23 @@ class _CheckpointHitlRequest(FrozenModel):
 
     action_requests: tuple[_CheckpointActionRequest, ...] = Field(min_length=1)
     review_configs: tuple[_CheckpointReviewConfig, ...] = Field(min_length=1)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingHitlAction:
+    """One validated tool review inside a pending interrupt."""
+
+    tool_name: str
+    allowed_decisions: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingHitlInterrupt:
+    """One unresolved checkpoint interrupt with task identity preserved."""
+
+    task_id: str
+    interrupt_id: str
+    actions: tuple[_PendingHitlAction, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,16 +148,12 @@ class AgentActionRequest:
             )
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be at least 1; configure a bounded Action loop")
-        if self.resume is not None and not isinstance(
-            self.resume, (CheckpointResume, HitlResume)
-        ):
+        if self.resume is not None and not isinstance(self.resume, (CheckpointResume, HitlResume)):
             raise TypeError("resume must be a typed CheckpointResume or HitlResume")
         tool_names = {tool.name for tool in self.tools}
         if len(tool_names) != len(self.tools):
             duplicates = sorted(
-                name
-                for name in tool_names
-                if sum(tool.name == name for tool in self.tools) > 1
+                name for name in tool_names if sum(tool.name == name for tool in self.tools) > 1
             )
             raise ValueError(f"duplicate tool names are forbidden: {', '.join(duplicates)}")
         unknown_approval_tools = set(self.approval_tools) - tool_names
@@ -214,6 +242,37 @@ def _checkpoint_not_resumable() -> AgentRunResult:
     )
 
 
+def _checkpoint_path_unsafe() -> AgentRunResult:
+    return _empty_result(
+        RepairRequired(
+            defect_codes=("checkpoint_path_unsafe",),
+            message=(
+                "The checkpoint path contains a symbolic link or unsafe component. "
+                "Use a direct regular-file path before resuming."
+            ),
+        )
+    )
+
+
+def _checkpoint_foreign_database() -> AgentRunResult:
+    return _empty_result(
+        RepairRequired(
+            defect_codes=("checkpoint_foreign_database",),
+            message=(
+                "The checkpoint path is not an ABI Action checkpoint database. "
+                "Use the checkpoint created by a fresh ABI Action invocation."
+            ),
+        )
+    )
+
+
+def _sqlite_codes(*names: str) -> frozenset[int]:
+    """Return available platform SQLite constants without assuming extensions."""
+    return frozenset(
+        value for name in names if isinstance(value := getattr(sqlite3, name, None), int)
+    )
+
+
 def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
     """Classify checkpoint storage failures without provider inference or text."""
     raw_sqlite_code = getattr(error, "sqlite_errorcode", None)
@@ -225,7 +284,44 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
                 message="The checkpoint read timed out. Retry the Action continuation.",
             )
         )
-    if sqlite_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+    if raw_sqlite_code in _sqlite_codes("SQLITE_IOERR_ACCESS", "SQLITE_IOERR_AUTH"):
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("checkpoint_permission_denied",),
+                message=(
+                    "The checkpoint store is not readable. Repair its permissions before resuming."
+                ),
+            )
+        )
+    if raw_sqlite_code in _sqlite_codes("SQLITE_IOERR_CORRUPTFS", "SQLITE_IOERR_DATA"):
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("checkpoint_corrupt",),
+                message=(
+                    "The checkpoint data is malformed or corrupt. Restore a valid "
+                    "checkpoint before resuming."
+                ),
+            )
+        )
+    if raw_sqlite_code in _sqlite_codes(
+        "SQLITE_IOERR_READ",
+        "SQLITE_IOERR_SHORT_READ",
+        "SQLITE_IOERR_FSTAT",
+        "SQLITE_IOERR_SEEK",
+        "SQLITE_IOERR_MMAP",
+        "SQLITE_IOERR_CONVPATH",
+        "SQLITE_IOERR_VNODE",
+    ):
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("checkpoint_read_failed",),
+                message=(
+                    "The checkpoint could not be read safely. Repair the checkpoint store "
+                    "before resuming."
+                ),
+            )
+        )
+    if sqlite_code in _sqlite_codes("SQLITE_BUSY", "SQLITE_LOCKED"):
         return _empty_result(
             RetryableFailure(
                 error_code="checkpoint_busy",
@@ -233,16 +329,32 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
             )
         )
     if isinstance(error, PermissionError) or sqlite_code in {
-        sqlite3.SQLITE_AUTH,
-        sqlite3.SQLITE_CANTOPEN,
-        sqlite3.SQLITE_PERM,
-        sqlite3.SQLITE_READONLY,
+        *_sqlite_codes("SQLITE_AUTH", "SQLITE_CANTOPEN", "SQLITE_PERM", "SQLITE_READONLY")
     }:
         return _empty_result(
             RepairRequired(
                 defect_codes=("checkpoint_permission_denied",),
                 message=(
-                    "The checkpoint store is not readable. Repair its permissions "
+                    "The checkpoint store is not readable. Repair its permissions before resuming."
+                ),
+            )
+        )
+    if sqlite_code in _sqlite_codes("SQLITE_CORRUPT", "SQLITE_NOTADB"):
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("checkpoint_corrupt",),
+                message=(
+                    "The checkpoint data is malformed or corrupt. Restore a valid "
+                    "checkpoint before resuming."
+                ),
+            )
+        )
+    if sqlite_code in _sqlite_codes("SQLITE_IOERR"):
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("checkpoint_read_failed",),
+                message=(
+                    "The checkpoint could not be read safely. Repair the checkpoint store "
                     "before resuming."
                 ),
             )
@@ -271,18 +383,117 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
     )
 
 
-def _pending_hitl_actions(
+def _inspect_checkpoint_path(
+    checkpoint_path: Path,
+    *,
+    require_exists: bool,
+) -> tuple[Path, bool] | AgentRunResult:
+    """Use lstat on every existing component and never follow path aliases."""
+    if ".." in checkpoint_path.parts:
+        return _checkpoint_path_unsafe()
+    absolute_path = (
+        checkpoint_path if checkpoint_path.is_absolute() else Path.cwd() / checkpoint_path
+    )
+    anchor = Path(absolute_path.anchor)
+    components = [anchor]
+    current = anchor
+    for part in absolute_path.parts[1:]:
+        current /= part
+        components.append(current)
+    for index, component in enumerate(components):
+        is_final = index == len(components) - 1
+        try:
+            mode = component.lstat().st_mode
+        except FileNotFoundError:
+            if require_exists:
+                return _checkpoint_not_resumable()
+            return absolute_path, False
+        except OSError as error:
+            return _checkpoint_read_failure(error)
+        if stat.S_ISLNK(mode):
+            return _checkpoint_path_unsafe()
+        if is_final:
+            if not stat.S_ISREG(mode):
+                return _checkpoint_path_unsafe()
+        elif not stat.S_ISDIR(mode):
+            return _checkpoint_path_unsafe()
+    return absolute_path, True
+
+
+_CHECKPOINT_MARKER_KEY = "abi_action_checkpoint"
+_CHECKPOINT_FORMAT_VERSION = 1
+
+
+async def _preflight_checkpoint_database(
+    checkpointer: AsyncSqliteSaver,
+) -> AgentRunResult | None:
+    """Validate schema and ABI ownership using SELECT-only operations."""
+    try:
+        required_queries = (
+            "SELECT thread_id, checkpoint_ns, checkpoint_id, "
+            "parent_checkpoint_id, type, checkpoint, metadata "
+            "FROM checkpoints WHERE 0",
+            "SELECT thread_id, checkpoint_ns, checkpoint_id, task_id, idx, "
+            "channel, type, value FROM writes WHERE 0",
+        )
+        for query in required_queries:
+            async with checkpointer.conn.execute(query) as cursor:
+                await cursor.fetchone()
+        async with checkpointer.conn.execute(
+            "SELECT format_version FROM abi_checkpoint_metadata WHERE marker_key = ?",
+            (_CHECKPOINT_MARKER_KEY,),
+        ) as cursor:
+            marker = await cursor.fetchone()
+    except sqlite3.DatabaseError as error:
+        raw_code = getattr(error, "sqlite_errorcode", None)
+        base_code = raw_code & 0xFF if isinstance(raw_code, int) else None
+        if base_code in _sqlite_codes("SQLITE_ERROR"):
+            return _checkpoint_foreign_database()
+        return _checkpoint_read_failure(error)
+    except Exception as error:
+        return _checkpoint_read_failure(error)
+    if marker != (_CHECKPOINT_FORMAT_VERSION,):
+        return _checkpoint_foreign_database()
+    return None
+
+
+async def _initialize_checkpoint_database(
+    checkpointer: AsyncSqliteSaver,
+) -> None:
+    """Create LangGraph storage and mark a newly owned ABI database."""
+    await checkpointer.setup()
+    async with checkpointer.lock, checkpointer.conn.cursor() as cursor:
+        await cursor.execute(
+            "CREATE TABLE IF NOT EXISTS abi_checkpoint_metadata ("
+            "marker_key TEXT PRIMARY KEY, format_version INTEGER NOT NULL)"
+        )
+        await cursor.execute(
+            "INSERT OR REPLACE INTO abi_checkpoint_metadata "
+            "(marker_key, format_version) VALUES (?, ?)",
+            (_CHECKPOINT_MARKER_KEY, _CHECKPOINT_FORMAT_VERSION),
+        )
+        await checkpointer.conn.commit()
+
+
+def _pending_hitl_interrupts(
     checkpoint_tuple: CheckpointTuple,
-) -> tuple[tuple[str, frozenset[str]], ...] | None:
-    """Parse current public pending writes into ordered HITL action policies."""
-    pending: list[tuple[str, frozenset[str]]] = []
-    for _task_id, channel, value in checkpoint_tuple.pending_writes or ():
+) -> tuple[_PendingHitlInterrupt, ...] | None:
+    """Parse unresolved HITL writes without losing task or interrupt identity."""
+    writes = checkpoint_tuple.pending_writes or ()
+    resumed_task_ids = {task_id for task_id, channel, _value in writes if channel == "__resume__"}
+    pending: list[_PendingHitlInterrupt] = []
+    interrupt_ids: set[str] = set()
+    for task_id, channel, value in writes:
         if channel != "__interrupt__":
+            continue
+        if task_id in resumed_task_ids:
             continue
         if not isinstance(value, (list, tuple)):
             return None
         for interrupt_value in value:
             if not isinstance(interrupt_value, Interrupt):
+                return None
+            if not interrupt_value.id or interrupt_value.id in interrupt_ids:
                 return None
             try:
                 request = _CheckpointHitlRequest.model_validate(interrupt_value.value)
@@ -290,12 +501,24 @@ def _pending_hitl_actions(
                 return None
             if len(request.action_requests) != len(request.review_configs):
                 return None
-            for action, review in zip(
-                request.action_requests, request.review_configs, strict=True
-            ):
+            actions: list[_PendingHitlAction] = []
+            for action, review in zip(request.action_requests, request.review_configs, strict=True):
                 if action.name != review.action_name:
                     return None
-                pending.append((action.name, frozenset(review.allowed_decisions)))
+                actions.append(
+                    _PendingHitlAction(
+                        tool_name=action.name,
+                        allowed_decisions=frozenset(review.allowed_decisions),
+                    )
+                )
+            interrupt_ids.add(interrupt_value.id)
+            pending.append(
+                _PendingHitlInterrupt(
+                    task_id=task_id,
+                    interrupt_id=interrupt_value.id,
+                    actions=tuple(actions),
+                )
+            )
     return tuple(pending) or None
 
 
@@ -306,22 +529,49 @@ def _validate_hitl_resume(
     """Fail closed unless this exact checkpoint has an allowed HITL interrupt."""
     if not isinstance(request.resume, HitlResume):
         return None
-    pending = _pending_hitl_actions(checkpoint_tuple)
+    pending = _pending_hitl_interrupts(checkpoint_tuple)
     if pending is None:
         return _checkpoint_not_resumable()
-    if len(request.resume.decisions) != len(pending):
+    pending_by_id = {item.interrupt_id: item for item in pending}
+    supplied_by_id = {item.interrupt_id: item for item in request.resume.interrupts}
+    if supplied_by_id.keys() != pending_by_id.keys():
+        return _empty_result(
+            RepairRequired(
+                defect_codes=("hitl_interrupt_id_mismatch",),
+                message=(
+                    "The supplied HITL interrupt ids do not exactly match the pending "
+                    "checkpoint interrupts. Refresh the pending approvals and retry."
+                ),
+            )
+        )
+    count_mismatch = next(
+        (
+            (supplied, pending_interrupt)
+            for interrupt_id, pending_interrupt in pending_by_id.items()
+            if len(supplied := supplied_by_id[interrupt_id].decisions)
+            != len(pending_interrupt.actions)
+        ),
+        None,
+    )
+    if count_mismatch is not None:
+        supplied, pending_interrupt = count_mismatch
         return _empty_result(
             RepairRequired(
                 defect_codes=("hitl_decision_count_mismatch",),
                 message=(
-                    f"Provided {len(request.resume.decisions)} HITL decisions for "
-                    f"{len(pending)} pending tools. Provide one ordered approve/reject "
+                    f"Provided {len(supplied)} HITL decisions for "
+                    f"{len(pending_interrupt.actions)} pending tools. Provide one "
+                    "ordered approve/reject "
                     "decision per pending tool."
                 ),
             )
         )
     allowed_tools = frozenset(request.approval_tools)
-    if any(tool_name not in allowed_tools for tool_name, _decisions in pending):
+    if any(
+        action.tool_name not in allowed_tools
+        for interrupt in pending
+        for action in interrupt.actions
+    ):
         return _empty_result(
             RepairRequired(
                 defect_codes=("hitl_tool_not_allowed",),
@@ -332,9 +582,12 @@ def _validate_hitl_resume(
             )
         )
     if any(
-        decision.decision not in allowed_decisions
-        for decision, (_tool_name, allowed_decisions) in zip(
-            request.resume.decisions, pending, strict=True
+        decision.decision not in action.allowed_decisions
+        for interrupt in pending
+        for decision, action in zip(
+            supplied_by_id[interrupt.interrupt_id].decisions,
+            interrupt.actions,
+            strict=True,
         )
     ):
         return _empty_result(
@@ -349,24 +602,18 @@ def _validate_hitl_resume(
     return None
 
 
-async def _read_resume_checkpoint(
-    checkpoint_path: Path,
-    config: RunnableConfig,
-) -> CheckpointTuple | AgentRunResult:
-    """Read an existing resume target in an isolated checkpoint boundary."""
-    try:
-        if not checkpoint_path.is_file():
-            return _checkpoint_not_resumable()
-    except OSError as error:
-        return _checkpoint_read_failure(error)
-    try:
-        async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
-            checkpoint_tuple = await saver.aget_tuple(config)
-    except Exception as error:
-        return _checkpoint_read_failure(error)
-    if checkpoint_tuple is None:
-        return _checkpoint_not_resumable()
-    return checkpoint_tuple
+def _hitl_resume_command(resume: HitlResume) -> Command[Any]:
+    """Map every ABI decision group to its addressed interrupt id."""
+    provider_resume: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for interrupt in resume.interrupts:
+        provider_decisions: list[dict[str, str]] = []
+        for item in interrupt.decisions:
+            decision: dict[str, str] = {"type": item.decision}
+            if item.decision == "reject" and item.feedback:
+                decision["message"] = item.feedback
+            provider_decisions.append(decision)
+        provider_resume[interrupt.interrupt_id] = {"decisions": provider_decisions}
+    return Command(resume=provider_resume)
 
 
 class _CostCallback(BaseCallbackHandler):
@@ -435,9 +682,7 @@ class _CostCallback(BaseCallbackHandler):
             outcome="ok",
         )
 
-    def on_llm_error(
-        self, error: BaseException, *, run_id: UUID, **kwargs: Any
-    ) -> None:
+    def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         self._record_failed_attempt(run_id, _runtime_error_classification(error))
 
     def record_pending_failure(self, classification: str) -> None:
@@ -460,9 +705,7 @@ class _CostCallback(BaseCallbackHandler):
             error_classification=classification,
         )
 
-    def record_tool_start(
-        self, binding: ToolBinding, arguments: dict[str, object]
-    ) -> None:
+    def record_tool_start(self, binding: ToolBinding, arguments: dict[str, object]) -> None:
         """Record a validated ABI handler immediately before it is invoked."""
         self.tool_log.append(
             ToolCallRecord(
@@ -579,71 +822,79 @@ class AgentRuntime:
             )
             return result
 
-        if request.resume is not None:
-            checkpoint_read = await _read_resume_checkpoint(
-                request.checkpoint_path, config
-            )
-            if isinstance(checkpoint_read, AgentRunResult):
-                return finish(checkpoint_read)
-            hitl_failure = _validate_hitl_resume(request, checkpoint_read)
-            if hitl_failure is not None:
-                return finish(hitl_failure)
-        else:
+        path_inspection = _inspect_checkpoint_path(
+            request.checkpoint_path,
+            require_exists=request.resume is not None,
+        )
+        if isinstance(path_inspection, AgentRunResult):
+            return finish(path_inspection)
+        checkpoint_path, checkpoint_existed = path_inspection
+        if not checkpoint_existed:
             try:
-                request.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as error:
                 return finish(_checkpoint_read_failure(error))
 
+        checkpoint_phase: Literal[
+            "saver_enter", "checkpoint_read", "graph_invoke", "saver_exit", "graph_result"
+        ] = "saver_enter"
         try:
-            async with AsyncSqliteSaver.from_conn_string(
-                str(request.checkpoint_path)
-            ) as checkpointer:
-                agent = create_agent(
-                    model=self._get_model(),
-                    tools=[
-                        to_langchain_tool(
-                            tool, on_actual_start=callback.record_tool_start
-                        )
-                        for tool in request.tools
-                    ],
-                    system_prompt=request.system_prompt,
-                    response_format=ActionOutcomeEnvelope,
-                    checkpointer=checkpointer,
-                    name=request.agent_name,
-                    middleware=(
-                        [
-                            HumanInTheLoopMiddleware(
-                                interrupt_on={
-                                    name: True for name in request.approval_tools
-                                }
-                            )
-                        ]
-                        if request.approval_tools
-                        else ()
-                    ),
-                )
-                graph_input: Any
-                if request.resume is None:
-                    graph_input = {
-                        "messages": [
-                            {"role": "user", "content": request.user_prompt}
-                        ]
-                    }
-                elif isinstance(request.resume, CheckpointResume):
-                    graph_input = None
+            raw_result: dict[str, Any] | None = None
+            control_result: AgentRunResult | None = None
+            async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+                checkpoint_phase = "checkpoint_read"
+                if checkpoint_existed:
+                    control_result = await _preflight_checkpoint_database(checkpointer)
                 else:
-                    provider_decisions: list[dict[str, str]] = []
-                    for item in request.resume.decisions:
-                        decision: dict[str, str] = {"type": item.decision}
-                        if item.decision == "reject" and item.feedback:
-                            decision["message"] = item.feedback
-                        provider_decisions.append(decision)
-                    graph_input = Command(resume={"decisions": provider_decisions})
-                async with self._sem:
-                    raw_result = cast(
-                        dict[str, Any],
-                        await agent.ainvoke(graph_input, config=config),
+                    await _initialize_checkpoint_database(checkpointer)
+                if control_result is None and request.resume is not None:
+                    checkpoint_tuple = await checkpointer.aget_tuple(config)
+                    if checkpoint_tuple is None:
+                        control_result = _checkpoint_not_resumable()
+                    else:
+                        control_result = _validate_hitl_resume(request, checkpoint_tuple)
+                if control_result is None:
+                    checkpoint_phase = "graph_invoke"
+                    agent = create_agent(
+                        model=self._get_model(),
+                        tools=[
+                            to_langchain_tool(tool, on_actual_start=callback.record_tool_start)
+                            for tool in request.tools
+                        ],
+                        system_prompt=request.system_prompt,
+                        response_format=ActionOutcomeEnvelope,
+                        checkpointer=checkpointer,
+                        name=request.agent_name,
+                        middleware=(
+                            [
+                                HumanInTheLoopMiddleware(
+                                    interrupt_on={name: True for name in request.approval_tools}
+                                )
+                            ]
+                            if request.approval_tools
+                            else ()
+                        ),
                     )
+                    graph_input: Any
+                    if request.resume is None:
+                        graph_input = {
+                            "messages": [{"role": "user", "content": request.user_prompt}]
+                        }
+                    elif isinstance(request.resume, CheckpointResume):
+                        graph_input = None
+                    else:
+                        graph_input = _hitl_resume_command(request.resume)
+                    async with self._sem:
+                        raw_result = cast(
+                            dict[str, Any],
+                            await agent.ainvoke(graph_input, config=config),
+                        )
+                checkpoint_phase = "saver_exit"
+            checkpoint_phase = "graph_result"
+            if control_result is not None:
+                return finish(control_result)
+            if raw_result is None:
+                raise RuntimeError("graph invocation returned no result")
             if raw_result.get("__interrupt__"):
                 result = AgentRunResult(
                     outcome=Paused(
@@ -656,24 +907,20 @@ class AgentRuntime:
                     stopped_reason="paused",
                 )
             else:
-                envelope = ActionOutcomeEnvelope.model_validate(
-                    raw_result["structured_response"]
-                )
+                envelope = ActionOutcomeEnvelope.model_validate(raw_result["structured_response"])
                 tool_log = tuple(callback.tool_log)
                 result = AgentRunResult(
                     outcome=envelope.outcome,
                     llm_calls=callback.llm_calls,
                     tool_calls=len(tool_log),
                     cost_usd=callback.cost_usd,
-                    stopped_reason=(
-                        "paused" if envelope.outcome.kind == "paused" else "completed"
-                    ),
+                    stopped_reason=("paused" if envelope.outcome.kind == "paused" else "completed"),
                     tool_log=tool_log,
                 )
         except Exception as error:
-            classification = _runtime_error_classification(
-                error, resume=request.resume
-            )
+            if checkpoint_phase in {"saver_enter", "checkpoint_read", "saver_exit"}:
+                return finish(_checkpoint_read_failure(error))
+            classification = _runtime_error_classification(error, resume=request.resume)
             callback.record_pending_failure(classification)
             failure: ActionOutcome
             stopped_reason: Literal["iteration_limit", "paused", "error"] = "error"
@@ -690,17 +937,13 @@ class AgentRuntime:
                     failure = RetryableFailure(
                         error_code=classification,
                         message=(
-                            "The model provider timed out before completion. "
-                            "Retry the Action."
+                            "The model provider timed out before completion. Retry the Action."
                         ),
                     )
             elif classification == "transient_provider_error":
                 failure = RetryableFailure(
                     error_code=classification,
-                    message=(
-                        "The model provider is temporarily unavailable. "
-                        "Retry the Action."
-                    ),
+                    message=("The model provider is temporarily unavailable. Retry the Action."),
                 )
             elif classification == "permanent_provider_error":
                 failure = PermanentFailure(
@@ -714,8 +957,7 @@ class AgentRuntime:
                 failure = Paused(
                     reason="budget",
                     message=(
-                        "The Action budget is exhausted. Increase the budget before "
-                        "resuming."
+                        "The Action budget is exhausted. Increase the budget before resuming."
                     ),
                 )
                 stopped_reason = "paused"
