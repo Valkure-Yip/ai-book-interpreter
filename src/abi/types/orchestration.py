@@ -237,10 +237,29 @@ class Indeterminate(FrozenModel):
     message: str
 
 
+class PendingHitlActionReview(FrozenModel):
+    """One ordered ABI review request surfaced while an Action is paused."""
+
+    tool_name: str
+    arguments_json: str
+    description: str | None = None
+    allowed_decisions: tuple[Literal["approve", "edit", "reject", "respond"], ...] = Field(
+        min_length=1
+    )
+
+
+class PendingHitlInterrupt(FrozenModel):
+    """SDK-free description of one pending durable HITL interrupt."""
+
+    interrupt_id: str = Field(min_length=1)
+    action_reviews: tuple[PendingHitlActionReview, ...] = Field(min_length=1)
+
+
 class Paused(FrozenModel):
     kind: Literal["paused"] = "paused"
     reason: Literal["budget", "hitl"]
     message: str
+    pending_hitl_interrupts: tuple[PendingHitlInterrupt, ...] = ()
 
 
 ActionOutcome = Annotated[

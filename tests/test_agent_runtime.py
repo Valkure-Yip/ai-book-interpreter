@@ -20,11 +20,12 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import GraphRecursionError
-from langgraph.types import Interrupt
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Interrupt, PregelTask, StateSnapshot, interrupt
 from pydantic import Field
+from typing_extensions import TypedDict
 
 from abi.providers.llm.budget import BudgetExceeded, BudgetGate
 from abi.providers.observability.events import EventLogger, MetricsAggregator
@@ -141,6 +142,11 @@ class _DeliveryInput(FrozenModel):
     recipient: str
 
 
+class _SequentialInterruptState(TypedDict, total=False):
+    messages: list[object]
+    structured_response: object
+
+
 class _LoopingModel(BaseChatModel):
     @property
     def _llm_type(self) -> str:
@@ -253,6 +259,22 @@ class _RecordingOutcomeModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=_success_message())])
 
 
+class _LabeledOutcomeModel(_RecordingOutcomeModel):
+    label: str
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        return ChatResult(
+            generations=[ChatGeneration(message=_success_message(evidence=[self.label]))]
+        )
+
+
 class _ResumeAfterToolModel(_RecordingOutcomeModel):
     fail_once: bool = True
 
@@ -322,6 +344,41 @@ class _ApprovalModel(_RecordingOutcomeModel):
             ],
         )
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class _SequentialApprovalModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        completed_tools = {message.name for message in messages if isinstance(message, ToolMessage)}
+        if "deliver_a" not in completed_tools:
+            tool_name = "deliver_a"
+        elif "deliver_b" not in completed_tools:
+            tool_name = "deliver_b"
+        else:
+            return ChatResult(generations=[ChatGeneration(message=_success_message())])
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": tool_name,
+                                "args": {},
+                                "id": f"{tool_name}-call",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        )
 
 
 class _TwoApprovalModel(_RecordingOutcomeModel):
@@ -465,6 +522,19 @@ def _hitl_interrupt(
     )
 
 
+def _state_snapshot(*tasks: PregelTask) -> StateSnapshot:
+    return StateSnapshot(
+        values={},
+        next=tuple(task.name for task in tasks),
+        config={"configurable": {"thread_id": "thread-1"}},
+        metadata={},
+        created_at=None,
+        parent_config=None,
+        tasks=tasks,
+        interrupts=tuple(interrupt_value for task in tasks for interrupt_value in task.interrupts),
+    )
+
+
 @pytest.mark.asyncio
 async def test_budget_pause_resumes_without_appending_a_human_message(tmp_path: Path) -> None:
     model = _RecordingOutcomeModel(human_counts=[])
@@ -561,9 +631,38 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
     first = await runtime.run_action(
         _request(tmp_path, tools=(tool,), side_effects=True, approval_tools=("deliver",))
     )
-    (interrupt_id,) = await _pending_interrupt_ids(
-        tmp_path / "graph-checkpoints.sqlite", "run-1/a1/1"
-    )
+    assert first.outcome.kind == "paused"
+    assert first.outcome.reason == "hitl"
+    (pending_interrupt,) = first.outcome.pending_hitl_interrupts
+    assert pending_interrupt.interrupt_id
+    assert [
+        (
+            review.tool_name,
+            review.arguments_json,
+            review.allowed_decisions,
+        )
+        for review in pending_interrupt.action_reviews
+    ] == [
+        (
+            "deliver",
+            "{}",
+            ("approve", "edit", "reject", "respond"),
+        )
+    ]
+    serialized = first.model_dump(mode="json")
+    assert serialized["outcome"]["pending_hitl_interrupts"] == [
+        {
+            "interrupt_id": pending_interrupt.interrupt_id,
+            "action_reviews": [
+                {
+                    "tool_name": "deliver",
+                    "arguments_json": "{}",
+                    "description": pending_interrupt.action_reviews[0].description,
+                    "allowed_decisions": ["approve", "edit", "reject", "respond"],
+                }
+            ],
+        }
+    ]
     resumed = await runtime.run_action(
         _request(
             tmp_path,
@@ -573,7 +672,7 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
             resume=runner.HitlResume(
                 interrupts=(
                     runner.HitlInterruptDecision(
-                        interrupt_id=interrupt_id,
+                        interrupt_id=pending_interrupt.interrupt_id,
                         decisions=(runner.HitlDecision(decision="approve"),),
                     ),
                 )
@@ -581,8 +680,6 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
         )
     )
 
-    assert first.outcome.kind == "paused"
-    assert first.outcome.reason == "hitl"
     assert resumed.outcome.kind == "succeeded"
     assert executions == 1
     assert set(model.human_counts) == {1}
@@ -634,6 +731,163 @@ async def test_hitl_reject_resumes_without_executing_the_business_tool(
     assert set(model.human_counts) == {1}
 
 
+@pytest.mark.asyncio
+async def test_same_action_resumes_two_sequential_public_hitl_interrupts(
+    tmp_path: Path,
+) -> None:
+    model = _SequentialApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions: list[str] = []
+
+    def deliver_a() -> str:
+        executions.append("deliver_a")
+        return "a"
+
+    def deliver_b() -> str:
+        executions.append("deliver_b")
+        return "b"
+
+    tools = (
+        ToolBinding("deliver_a", "First approved delivery.", _NoopInput, deliver_a),
+        ToolBinding("deliver_b", "Second approved delivery.", _NoopInput, deliver_b),
+    )
+    request_args = {
+        "tools": tools,
+        "side_effects": True,
+        "approval_tools": ("deliver_a", "deliver_b"),
+    }
+
+    first = await runtime.run_action(_request(tmp_path, **request_args))
+    assert first.outcome.kind == "paused"
+    (first_interrupt,) = first.outcome.pending_hitl_interrupts
+    assert [review.tool_name for review in first_interrupt.action_reviews] == ["deliver_a"]
+
+    second = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=first_interrupt.interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
+            ),
+        )
+    )
+    assert second.outcome.kind == "paused"
+    (second_interrupt,) = second.outcome.pending_hitl_interrupts
+    assert [review.tool_name for review in second_interrupt.action_reviews] == ["deliver_b"]
+
+    completed = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=second_interrupt.interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
+            ),
+        )
+    )
+
+    assert completed.outcome.kind == "succeeded"
+    assert executions == ["deliver_a", "deliver_b"]
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_same_node_resumes_second_interrupt_despite_historical_resume_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    effects: list[str] = []
+
+    def approval_node(_state: _SequentialInterruptState) -> _SequentialInterruptState:
+        interrupt(_hitl_interrupt("ignored-provider-id", "deliver_a").value)
+        if "deliver_a" not in effects:
+            effects.append("deliver_a")
+        interrupt(_hitl_interrupt("ignored-provider-id", "deliver_b").value)
+        if "deliver_b" not in effects:
+            effects.append("deliver_b")
+        return {
+            "structured_response": {
+                "outcome": {
+                    "kind": "succeeded",
+                    "staging_relpath": "state/staging/a1/1/result.json",
+                    "evidence_refs": ["two-approved-effects"],
+                }
+            }
+        }
+
+    def real_node_agent(*args: Any, **kwargs: Any) -> Any:
+        return (
+            StateGraph(_SequentialInterruptState)
+            .add_node("approval", approval_node)
+            .add_edge(START, "approval")
+            .add_edge("approval", END)
+            .compile(checkpointer=kwargs["checkpointer"])
+        )
+
+    monkeypatch.setattr(runner, "create_agent", real_node_agent)
+    tools = (
+        ToolBinding("deliver_a", "First approved effect.", _NoopInput, lambda: "a"),
+        ToolBinding("deliver_b", "Second approved effect.", _NoopInput, lambda: "b"),
+    )
+    request_args = {
+        "tools": tools,
+        "side_effects": True,
+        "approval_tools": ("deliver_a", "deliver_b"),
+    }
+
+    first = await runtime.run_action(_request(tmp_path, **request_args))
+    assert first.outcome.kind == "paused"
+    (first_interrupt,) = first.outcome.pending_hitl_interrupts
+    second = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=first_interrupt.interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
+            ),
+        )
+    )
+    assert second.outcome.kind == "paused"
+    (second_interrupt,) = second.outcome.pending_hitl_interrupts
+    assert [review.tool_name for review in second_interrupt.action_reviews] == ["deliver_b"]
+
+    completed = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                interrupts=(
+                    runner.HitlInterruptDecision(
+                        interrupt_id=second_interrupt.interrupt_id,
+                        decisions=(runner.HitlDecision(decision="approve"),),
+                    ),
+                )
+            ),
+        )
+    )
+
+    assert completed.outcome.kind == "succeeded"
+    assert completed.outcome.evidence_refs == ("two-approved-effects",)
+    assert effects == ["deliver_a", "deliver_b"]
+
+
 def test_resume_boundary_rejects_untyped_dicts(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="typed"):
         _request(tmp_path, resume={"decision": "approve"})
@@ -663,20 +917,19 @@ def test_hitl_resume_rejects_unsupported_decisions() -> None:
         )
 
 
-def test_pending_hitl_interrupts_keep_task_and_id_and_ignore_resumed_tasks() -> None:
+def test_pending_hitl_interrupts_use_current_public_tasks_for_parallel_partial_resume() -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
-    checkpoint = CheckpointTuple(
-        config={"configurable": {"thread_id": "thread-1"}},
-        checkpoint={},
-        metadata={},
-        pending_writes=[
-            ("task-a", "__interrupt__", (_hitl_interrupt("interrupt-a", "deliver_a"),)),
-            ("task-a", "__resume__", [{"decisions": [{"type": "approve"}]}]),
-            ("task-b", "__interrupt__", (_hitl_interrupt("interrupt-b", "deliver_b"),)),
-        ],
+    snapshot = _state_snapshot(
+        PregelTask(id="task-a", name="approval", path=(), interrupts=()),
+        PregelTask(
+            id="task-b",
+            name="approval",
+            path=(),
+            interrupts=(_hitl_interrupt("interrupt-b", "deliver_b"),),
+        ),
     )
 
-    pending = runner._pending_hitl_interrupts(checkpoint)
+    pending = runner._pending_hitl_interrupts(snapshot)
 
     assert pending is not None
     assert [
@@ -695,14 +948,19 @@ def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> 
         ToolBinding("deliver_a", "First delivery.", _NoopInput, lambda: "a"),
         ToolBinding("deliver_b", "Second delivery.", _NoopInput, lambda: "b"),
     )
-    checkpoint = CheckpointTuple(
-        config={"configurable": {"thread_id": "thread-1"}},
-        checkpoint={},
-        metadata={},
-        pending_writes=[
-            ("task-a", "__interrupt__", (_hitl_interrupt("interrupt-a", "deliver_a"),)),
-            ("task-b", "__interrupt__", (_hitl_interrupt("interrupt-b", "deliver_b"),)),
-        ],
+    snapshot = _state_snapshot(
+        PregelTask(
+            id="task-a",
+            name="approval",
+            path=(),
+            interrupts=(_hitl_interrupt("interrupt-a", "deliver_a"),),
+        ),
+        PregelTask(
+            id="task-b",
+            name="approval",
+            path=(),
+            interrupts=(_hitl_interrupt("interrupt-b", "deliver_b"),),
+        ),
     )
     one_group = runner.HitlInterruptDecision(
         interrupt_id="interrupt-a",
@@ -723,7 +981,7 @@ def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> 
             approval_tools=("deliver_a", "deliver_b"),
             resume=runner.HitlResume(interrupts=(one_group,)),
         ),
-        checkpoint,
+        snapshot,
     )
     exact = runner._validate_hitl_resume(
         _request(
@@ -732,7 +990,7 @@ def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> 
             approval_tools=("deliver_a", "deliver_b"),
             resume=runner.HitlResume(interrupts=two_groups),
         ),
-        checkpoint,
+        snapshot,
     )
 
     assert missing is not None
@@ -876,7 +1134,7 @@ async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -
     assert result.outcome.kind == "repair_required"
     assert result.outcome.defect_codes == ("hitl_decision_count_mismatch",)
     assert "two" in result.outcome.message.lower() or "2" in result.outcome.message
-    assert graph_creations == 0
+    assert graph_creations == 1
     assert model.human_counts == [1]
 
 
@@ -1296,7 +1554,7 @@ async def test_missing_hitl_resume_is_rejected_before_graph_model_or_tool_work(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("checkpoint_state", ["completed", "budget"])
-async def test_hitl_resume_rejects_non_hitl_checkpoint_before_graph_work(
+async def test_hitl_resume_rejects_non_hitl_checkpoint_before_model_or_tool_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     checkpoint_state: str,
@@ -1340,7 +1598,7 @@ async def test_hitl_resume_rejects_non_hitl_checkpoint_before_graph_work(
     assert result.llm_calls == 0
     assert result.tool_calls == 0
     assert result.tool_log == ()
-    assert graph_creations == 0
+    assert graph_creations == 1
     assert model.human_counts == ([] if checkpoint_state == "budget" else [1])
 
 
@@ -1398,7 +1656,7 @@ async def test_hitl_resume_rejects_pending_tool_removed_from_approval_allowlist(
     assert result.llm_calls == 0
     assert result.tool_calls == 0
     assert handler_calls == 0
-    assert graph_creations == 0
+    assert graph_creations == 1
 
 
 @pytest.mark.asyncio
@@ -1467,7 +1725,7 @@ async def test_fresh_invocation_may_create_checkpoint_parent_and_database(
 
 
 @pytest.mark.asyncio
-async def test_resume_preflight_rejects_unrelated_sqlite_without_mutating_it(
+async def test_resume_rejects_unmarked_external_sqlite_as_invalid_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1477,11 +1735,6 @@ async def test_resume_preflight_rejects_unrelated_sqlite_without_mutating_it(
         connection.execute("CREATE TABLE unrelated (value TEXT NOT NULL)")
         connection.execute("INSERT INTO unrelated VALUES ('preserve-me')")
         connection.commit()
-        journal_before = connection.execute("PRAGMA journal_mode").fetchone()
-        schema_before = connection.execute(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-    bytes_before = checkpoint_path.read_bytes()
     setup_calls = 0
     real_setup = runner.AsyncSqliteSaver.setup
 
@@ -1504,19 +1757,190 @@ async def test_resume_preflight_rejects_unrelated_sqlite_without_mutating_it(
         )
     )
 
-    with sqlite3.connect(checkpoint_path) as connection:
-        journal_after = connection.execute("PRAGMA journal_mode").fetchone()
-        schema_after = connection.execute(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-        preserved = connection.execute("SELECT value FROM unrelated").fetchall()
     assert result.outcome.kind == "repair_required"
     assert result.outcome.defect_codes == ("checkpoint_foreign_database",)
     assert setup_calls == 0
-    assert journal_after == journal_before
-    assert schema_after == schema_before
-    assert checkpoint_path.read_bytes() == bytes_before
-    assert preserved == [("preserve-me",)]
+
+
+@pytest.mark.asyncio
+async def test_shared_first_initialization_hides_schema_until_marker_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "shared" / "graph.sqlite"
+    schema_ready = asyncio.Event()
+    allow_marker_commit = asyncio.Event()
+    second_started = asyncio.Event()
+    real_initializer = runner._initialize_checkpoint_database
+    real_from_conn_string = runner.AsyncSqliteSaver.from_conn_string
+    saver_factories = 0
+
+    async def paused_initializer(checkpointer: Any) -> None:
+        await checkpointer.setup()
+        schema_ready.set()
+        await allow_marker_commit.wait()
+        await real_initializer(checkpointer)
+
+    def tracked_from_conn_string(path: str) -> Any:
+        nonlocal saver_factories
+        saver_factories += 1
+        return real_from_conn_string(path)
+
+    monkeypatch.setattr(runner, "_initialize_checkpoint_database", paused_initializer)
+    monkeypatch.setattr(
+        runner.AsyncSqliteSaver,
+        "from_conn_string",
+        tracked_from_conn_string,
+    )
+    first_model = _RecordingOutcomeModel(human_counts=[])
+    second_model = _RecordingOutcomeModel(human_counts=[])
+    first_runtime = _runtime(tmp_path, first_model)
+    second_runtime = _runtime(tmp_path, second_model)
+    real_second_event = second_runtime._events.event
+
+    def track_second_start(event_type: str, **payload: Any) -> None:
+        real_second_event(event_type, **payload)
+        if event_type == "agent.run.start":
+            second_started.set()
+
+    monkeypatch.setattr(second_runtime._events, "event", track_second_start)
+    first_task = asyncio.create_task(
+        first_runtime.run_action(
+            _request(
+                tmp_path,
+                checkpoint_path=checkpoint_path,
+                thread_id="run-1/a1/1",
+            )
+        )
+    )
+    await schema_ready.wait()
+    second_task = asyncio.create_task(
+        second_runtime.run_action(
+            _request(
+                tmp_path,
+                checkpoint_path=checkpoint_path,
+                thread_id="run-1/a2/1",
+            )
+        )
+    )
+    await second_started.wait()
+    second_waited_before_opening = saver_factories == 1 and not second_task.done()
+    allow_marker_commit.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert second_waited_before_opening
+    assert saver_factories == 2
+    assert first.outcome.kind == "succeeded"
+    assert second.outcome.kind == "succeeded"
+    assert first_model.human_counts == [1]
+    assert second_model.human_counts == [1]
+
+
+@pytest.mark.asyncio
+async def test_failed_first_initialization_can_be_completed_by_fresh_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "recoverable" / "graph.sqlite"
+    real_initializer = runner._initialize_checkpoint_database
+    initialization_attempts = 0
+
+    async def fail_after_schema_once(checkpointer: Any) -> None:
+        nonlocal initialization_attempts
+        initialization_attempts += 1
+        if initialization_attempts == 1:
+            await checkpointer.setup()
+            raise RuntimeError("injected failure before ABI marker commit")
+        await real_initializer(checkpointer)
+
+    monkeypatch.setattr(
+        runner,
+        "_initialize_checkpoint_database",
+        fail_after_schema_once,
+    )
+    first_runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
+    retry_model = _RecordingOutcomeModel(human_counts=[])
+    retry_runtime = _runtime(tmp_path, retry_model)
+
+    failed = await first_runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=checkpoint_path,
+            thread_id="run-1/a1/1",
+        )
+    )
+    recovered = await retry_runtime.run_action(
+        _request(
+            tmp_path,
+            checkpoint_path=checkpoint_path,
+            thread_id="run-1/a2/1",
+        )
+    )
+
+    assert failed.outcome.kind == "repair_required"
+    assert failed.outcome.defect_codes == ("checkpoint_read_failed",)
+    assert recovered.outcome.kind == "succeeded"
+    assert initialization_attempts == 2
+    assert retry_model.human_counts == [1]
+
+
+@pytest.mark.asyncio
+async def test_multiple_runtimes_share_first_initialization_and_isolate_threads(
+    tmp_path: Path,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    checkpoint_path = tmp_path / "concurrent" / "graph.sqlite"
+    labels = tuple(f"thread-{index}" for index in range(4))
+    models = tuple(_LabeledOutcomeModel(human_counts=[], label=label) for label in labels)
+    runtimes = tuple(_runtime(tmp_path, model) for model in models)
+
+    fresh_results = await asyncio.gather(
+        *(
+            runtime.run_action(
+                _request(
+                    tmp_path,
+                    checkpoint_path=checkpoint_path,
+                    thread_id=f"run-1/{label}/1",
+                )
+            )
+            for runtime, label in zip(runtimes, labels, strict=True)
+        )
+    )
+
+    assert [result.outcome.kind for result in fresh_results] == ["succeeded"] * 4
+    assert [result.outcome.evidence_refs for result in fresh_results] == [
+        (label,) for label in labels
+    ]
+    assert [model.human_counts for model in models] == [[1], [1], [1], [1]]
+
+    resume_runtimes = tuple(
+        _runtime(
+            tmp_path,
+            _ExplodingModel(error=AssertionError("cached thread must not call a model")),
+        )
+        for _label in labels
+    )
+    resumed_results = await asyncio.gather(
+        *(
+            runtime.run_action(
+                _request(
+                    tmp_path,
+                    checkpoint_path=checkpoint_path,
+                    thread_id=f"run-1/{label}/1",
+                    resume=runner.CheckpointResume(),
+                )
+            )
+            for runtime, label in zip(resume_runtimes, labels, strict=True)
+        )
+    )
+
+    assert [result.outcome.kind for result in resumed_results] == ["succeeded"] * 4
+    assert [result.outcome.evidence_refs for result in resumed_results] == [
+        (label,) for label in labels
+    ]
+    assert all(result.llm_calls == 0 for result in resumed_results)
 
 
 @pytest.mark.asyncio

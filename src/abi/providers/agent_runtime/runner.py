@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import stat
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
@@ -19,10 +21,9 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.errors import EmptyInputError, GraphRecursionError
-from langgraph.types import Command, Interrupt
+from langgraph.types import Command, Interrupt, StateSnapshot
 from pydantic import Field, ValidationError, model_validator
 
 from abi.providers.agent_runtime.tooling import to_langchain_tool
@@ -38,6 +39,8 @@ from abi.types.orchestration import (
     AgentRunResult,
     Indeterminate,
     Paused,
+    PendingHitlActionReview,
+    PendingHitlInterrupt,
     PermanentFailure,
     RepairRequired,
     RetryableFailure,
@@ -114,7 +117,9 @@ class _PendingHitlAction:
     """One validated tool review inside a pending interrupt."""
 
     tool_name: str
-    allowed_decisions: frozenset[str]
+    arguments_json: str
+    description: str | None
+    allowed_decisions: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +129,79 @@ class _PendingHitlInterrupt:
     task_id: str
     interrupt_id: str
     actions: tuple[_PendingHitlAction, ...]
+
+
+def _parse_pending_hitl_interrupt(
+    interrupt_value: Interrupt,
+    *,
+    task_id: str,
+) -> _PendingHitlInterrupt | None:
+    """Parse one provider interrupt into the stable internal HITL shape."""
+    if not interrupt_value.id:
+        return None
+    try:
+        request = _CheckpointHitlRequest.model_validate(interrupt_value.value)
+    except ValidationError:
+        return None
+    if len(request.action_requests) != len(request.review_configs):
+        return None
+    actions: list[_PendingHitlAction] = []
+    for action, review in zip(request.action_requests, request.review_configs, strict=True):
+        if action.name != review.action_name:
+            return None
+        actions.append(
+            _PendingHitlAction(
+                tool_name=action.name,
+                arguments_json=json.dumps(action.args, ensure_ascii=False, sort_keys=True),
+                description=action.description,
+                allowed_decisions=tuple(review.allowed_decisions),
+            )
+        )
+    return _PendingHitlInterrupt(
+        task_id=task_id,
+        interrupt_id=interrupt_value.id,
+        actions=tuple(actions),
+    )
+
+
+def _public_pending_hitl_interrupts(
+    pending: tuple[_PendingHitlInterrupt, ...],
+) -> tuple[PendingHitlInterrupt, ...]:
+    """Remove provider task identity and expose only ABI-owned review models."""
+    return tuple(
+        PendingHitlInterrupt(
+            interrupt_id=interrupt.interrupt_id,
+            action_reviews=tuple(
+                PendingHitlActionReview(
+                    tool_name=action.tool_name,
+                    arguments_json=action.arguments_json,
+                    description=action.description,
+                    allowed_decisions=action.allowed_decisions,
+                )
+                for action in interrupt.actions
+            ),
+        )
+        for interrupt in pending
+    )
+
+
+def _pending_hitl_interrupt_values(
+    values: object,
+) -> tuple[_PendingHitlInterrupt, ...] | None:
+    """Parse the current interrupts returned by a graph invocation."""
+    if not isinstance(values, (list, tuple)):
+        return None
+    pending: list[_PendingHitlInterrupt] = []
+    interrupt_ids: set[str] = set()
+    for value in values:
+        if not isinstance(value, Interrupt):
+            return None
+        parsed = _parse_pending_hitl_interrupt(value, task_id="")
+        if parsed is None or parsed.interrupt_id in interrupt_ids:
+            return None
+        interrupt_ids.add(parsed.interrupt_id)
+        pending.append(parsed)
+    return tuple(pending) or None
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,17 +461,22 @@ def _checkpoint_read_failure(error: BaseException) -> AgentRunResult:
     )
 
 
+def _absolute_checkpoint_path(checkpoint_path: Path) -> Path | AgentRunResult:
+    if ".." in checkpoint_path.parts:
+        return _checkpoint_path_unsafe()
+    return checkpoint_path if checkpoint_path.is_absolute() else Path.cwd() / checkpoint_path
+
+
 def _inspect_checkpoint_path(
     checkpoint_path: Path,
     *,
     require_exists: bool,
 ) -> tuple[Path, bool] | AgentRunResult:
     """Use lstat on every existing component and never follow path aliases."""
-    if ".." in checkpoint_path.parts:
-        return _checkpoint_path_unsafe()
-    absolute_path = (
-        checkpoint_path if checkpoint_path.is_absolute() else Path.cwd() / checkpoint_path
-    )
+    absolute_result = _absolute_checkpoint_path(checkpoint_path)
+    if isinstance(absolute_result, AgentRunResult):
+        return absolute_result
+    absolute_path = absolute_result
     anchor = Path(absolute_path.anchor)
     components = [anchor]
     current = anchor
@@ -422,6 +505,114 @@ def _inspect_checkpoint_path(
 
 _CHECKPOINT_MARKER_KEY = "abi_action_checkpoint"
 _CHECKPOINT_FORMAT_VERSION = 1
+_CHECKPOINT_OWNER_BYTES = b"abi_action_checkpoint:1\n"
+
+
+@dataclass(slots=True)
+class _CheckpointInitializationEntry:
+    """One event-loop lock shared by every runtime using the same local path."""
+
+    lock: asyncio.Lock
+    users: int = 0
+
+
+@dataclass(slots=True)
+class _CheckpointInitializationLease:
+    """Reference-counted lease for a path initialization lock."""
+
+    key: str
+    entry: _CheckpointInitializationEntry
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.entry.lock.release()
+        with _CHECKPOINT_INITIALIZATIONS_GUARD:
+            self.entry.users -= 1
+            if self.entry.users == 0:
+                current = _CHECKPOINT_INITIALIZATIONS.get(self.key)
+                if current is self.entry:
+                    del _CHECKPOINT_INITIALIZATIONS[self.key]
+
+
+_CHECKPOINT_INITIALIZATIONS: dict[str, _CheckpointInitializationEntry] = {}
+_CHECKPOINT_INITIALIZATIONS_GUARD = threading.Lock()
+
+
+async def _acquire_checkpoint_initialization(
+    checkpoint_path: Path,
+) -> _CheckpointInitializationLease:
+    """Serialize only first-use inspection and marker publication per local path."""
+    key = os.fspath(checkpoint_path)
+    with _CHECKPOINT_INITIALIZATIONS_GUARD:
+        entry = _CHECKPOINT_INITIALIZATIONS.get(key)
+        if entry is None:
+            entry = _CheckpointInitializationEntry(lock=asyncio.Lock())
+            _CHECKPOINT_INITIALIZATIONS[key] = entry
+        entry.users += 1
+    try:
+        await entry.lock.acquire()
+    except BaseException:
+        with _CHECKPOINT_INITIALIZATIONS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and _CHECKPOINT_INITIALIZATIONS.get(key) is entry:
+                del _CHECKPOINT_INITIALIZATIONS[key]
+        raise
+    return _CheckpointInitializationLease(key=key, entry=entry)
+
+
+def _checkpoint_owner_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_name(f"{checkpoint_path.name}.abi-owner")
+
+
+def _inspect_checkpoint_owner(checkpoint_path: Path) -> bool | AgentRunResult:
+    """Return whether the durable ABI ownership sidecar is valid without following it."""
+    owner_path = _checkpoint_owner_path(checkpoint_path)
+    try:
+        mode = owner_path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        return _checkpoint_read_failure(error)
+    if not stat.S_ISREG(mode):
+        return _checkpoint_path_unsafe()
+    try:
+        owner_bytes = owner_path.read_bytes()
+    except OSError as error:
+        return _checkpoint_read_failure(error)
+    if owner_bytes != _CHECKPOINT_OWNER_BYTES:
+        return _checkpoint_foreign_database()
+    return True
+
+
+def _claim_checkpoint_owner(checkpoint_path: Path) -> AgentRunResult | None:
+    """Create the ABI ownership sidecar once before SQLite initialization."""
+    owner_path = _checkpoint_owner_path(checkpoint_path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_descriptor = os.open(owner_path, flags, 0o600)
+    except FileExistsError:
+        inspected = _inspect_checkpoint_owner(checkpoint_path)
+        if inspected is True:
+            return None
+        if isinstance(inspected, AgentRunResult):
+            return inspected
+        return _checkpoint_foreign_database()
+    except OSError as error:
+        return _checkpoint_read_failure(error)
+    try:
+        view = memoryview(_CHECKPOINT_OWNER_BYTES)
+        while view:
+            written = os.write(file_descriptor, view)
+            view = view[written:]
+        os.fsync(file_descriptor)
+    except OSError as error:
+        return _checkpoint_read_failure(error)
+    finally:
+        os.close(file_descriptor)
+    return None
 
 
 async def _preflight_checkpoint_database(
@@ -476,60 +667,29 @@ async def _initialize_checkpoint_database(
 
 
 def _pending_hitl_interrupts(
-    checkpoint_tuple: CheckpointTuple,
+    state_snapshot: StateSnapshot,
 ) -> tuple[_PendingHitlInterrupt, ...] | None:
-    """Parse unresolved HITL writes without losing task or interrupt identity."""
-    writes = checkpoint_tuple.pending_writes or ()
-    resumed_task_ids = {task_id for task_id, channel, _value in writes if channel == "__resume__"}
+    """Parse the current public task interrupts without consulting write history."""
     pending: list[_PendingHitlInterrupt] = []
     interrupt_ids: set[str] = set()
-    for task_id, channel, value in writes:
-        if channel != "__interrupt__":
-            continue
-        if task_id in resumed_task_ids:
-            continue
-        if not isinstance(value, (list, tuple)):
-            return None
-        for interrupt_value in value:
-            if not isinstance(interrupt_value, Interrupt):
+    for task in state_snapshot.tasks:
+        for interrupt_value in task.interrupts:
+            parsed = _parse_pending_hitl_interrupt(interrupt_value, task_id=task.id)
+            if parsed is None or parsed.interrupt_id in interrupt_ids:
                 return None
-            if not interrupt_value.id or interrupt_value.id in interrupt_ids:
-                return None
-            try:
-                request = _CheckpointHitlRequest.model_validate(interrupt_value.value)
-            except ValidationError:
-                return None
-            if len(request.action_requests) != len(request.review_configs):
-                return None
-            actions: list[_PendingHitlAction] = []
-            for action, review in zip(request.action_requests, request.review_configs, strict=True):
-                if action.name != review.action_name:
-                    return None
-                actions.append(
-                    _PendingHitlAction(
-                        tool_name=action.name,
-                        allowed_decisions=frozenset(review.allowed_decisions),
-                    )
-                )
-            interrupt_ids.add(interrupt_value.id)
-            pending.append(
-                _PendingHitlInterrupt(
-                    task_id=task_id,
-                    interrupt_id=interrupt_value.id,
-                    actions=tuple(actions),
-                )
-            )
+            interrupt_ids.add(parsed.interrupt_id)
+            pending.append(parsed)
     return tuple(pending) or None
 
 
 def _validate_hitl_resume(
     request: AgentActionRequest,
-    checkpoint_tuple: CheckpointTuple,
+    state_snapshot: StateSnapshot,
 ) -> AgentRunResult | None:
     """Fail closed unless this exact checkpoint has an allowed HITL interrupt."""
     if not isinstance(request.resume, HitlResume):
         return None
-    pending = _pending_hitl_interrupts(checkpoint_tuple)
+    pending = _pending_hitl_interrupts(state_snapshot)
     if pending is None:
         return _checkpoint_not_resumable()
     pending_by_id = {item.interrupt_id: item for item in pending}
@@ -822,39 +982,65 @@ class AgentRuntime:
             )
             return result
 
-        path_inspection = _inspect_checkpoint_path(
-            request.checkpoint_path,
-            require_exists=request.resume is not None,
-        )
-        if isinstance(path_inspection, AgentRunResult):
-            return finish(path_inspection)
-        checkpoint_path, checkpoint_existed = path_inspection
-        if not checkpoint_existed:
-            try:
-                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                return finish(_checkpoint_read_failure(error))
+        absolute_result = _absolute_checkpoint_path(request.checkpoint_path)
+        if isinstance(absolute_result, AgentRunResult):
+            return finish(absolute_result)
+        initialization_lease = await _acquire_checkpoint_initialization(absolute_result)
 
         checkpoint_phase: Literal[
             "saver_enter", "checkpoint_read", "graph_invoke", "saver_exit", "graph_result"
         ] = "saver_enter"
         try:
+            path_inspection = _inspect_checkpoint_path(
+                absolute_result,
+                require_exists=request.resume is not None,
+            )
+            if isinstance(path_inspection, AgentRunResult):
+                return finish(path_inspection)
+            checkpoint_path, checkpoint_existed = path_inspection
+            if not checkpoint_existed:
+                try:
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as error:
+                    return finish(_checkpoint_read_failure(error))
+            owner_inspection = _inspect_checkpoint_owner(checkpoint_path)
+            if isinstance(owner_inspection, AgentRunResult):
+                return finish(owner_inspection)
+            owner_claimed = owner_inspection
+            if not checkpoint_existed and not owner_claimed:
+                claim_failure = _claim_checkpoint_owner(checkpoint_path)
+                if claim_failure is not None:
+                    return finish(claim_failure)
+                owner_claimed = True
+
             raw_result: dict[str, Any] | None = None
             control_result: AgentRunResult | None = None
             async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
                 checkpoint_phase = "checkpoint_read"
                 if checkpoint_existed:
                     control_result = await _preflight_checkpoint_database(checkpointer)
+                    if (
+                        request.resume is None
+                        and owner_claimed
+                        and control_result is not None
+                        and isinstance(control_result.outcome, RepairRequired)
+                        and control_result.outcome.defect_codes == ("checkpoint_foreign_database",)
+                    ):
+                        await _initialize_checkpoint_database(checkpointer)
+                        control_result = None
                 else:
                     await _initialize_checkpoint_database(checkpointer)
+                initialization_lease.release()
                 if control_result is None and request.resume is not None:
                     checkpoint_tuple = await checkpointer.aget_tuple(config)
                     if checkpoint_tuple is None:
                         control_result = _checkpoint_not_resumable()
-                    else:
-                        control_result = _validate_hitl_resume(request, checkpoint_tuple)
                 if control_result is None:
-                    checkpoint_phase = "graph_invoke"
+                    hitl_middleware_tools = (
+                        tuple(tool.name for tool in request.tools)
+                        if isinstance(request.resume, HitlResume)
+                        else request.approval_tools
+                    )
                     agent = create_agent(
                         model=self._get_model(),
                         tools=[
@@ -868,13 +1054,18 @@ class AgentRuntime:
                         middleware=(
                             [
                                 HumanInTheLoopMiddleware(
-                                    interrupt_on={name: True for name in request.approval_tools}
+                                    interrupt_on={name: True for name in hitl_middleware_tools}
                                 )
                             ]
-                            if request.approval_tools
+                            if hitl_middleware_tools or isinstance(request.resume, HitlResume)
                             else ()
                         ),
                     )
+                    if isinstance(request.resume, HitlResume):
+                        state_snapshot = await agent.aget_state(config)
+                        control_result = _validate_hitl_resume(request, state_snapshot)
+                if control_result is None:
+                    checkpoint_phase = "graph_invoke"
                     graph_input: Any
                     if request.resume is None:
                         graph_input = {
@@ -895,11 +1086,15 @@ class AgentRuntime:
                 return finish(control_result)
             if raw_result is None:
                 raise RuntimeError("graph invocation returned no result")
-            if raw_result.get("__interrupt__"):
+            if raw_interrupts := raw_result.get("__interrupt__"):
+                pending_interrupts = _pending_hitl_interrupt_values(raw_interrupts)
+                if pending_interrupts is None:
+                    return finish(_checkpoint_not_resumable())
                 result = AgentRunResult(
                     outcome=Paused(
                         reason="hitl",
                         message="Action paused for approval before a tool call.",
+                        pending_hitl_interrupts=_public_pending_hitl_interrupts(pending_interrupts),
                     ),
                     llm_calls=callback.llm_calls,
                     tool_calls=0,
@@ -1001,6 +1196,8 @@ class AgentRuntime:
                 stopped_reason=stopped_reason,
                 tool_log=tuple(callback.tool_log),
             )
+        finally:
+            initialization_lease.release()
         return finish(result)
 
 

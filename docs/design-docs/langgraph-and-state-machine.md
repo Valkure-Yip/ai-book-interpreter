@@ -566,36 +566,53 @@ Action harness 已使用 `AsyncSqliteSaver` 和调用者提供的稳定 `thread_
 待处理 interrupt 与结构化结果，让预算暂停、迭代上限、提供方瞬态失败和 HITL 都能在同一 Action
 边界续跑。checkpointer 仍只是"微观加速器"；`pipeline_state.json` 继续是宏观进度唯一真相。
 
-#### Checkpoint 所有权与只读预检
+#### Checkpoint 所有权与初始化协调
 
-fresh invocation 仅认领经路径检查后确认不存在的直接文件；它在一个 saver context 内首次初始化
-LangGraph 的 `checkpoints` / `writes` 表，并写入
-`abi_checkpoint_metadata(marker_key='abi_action_checkpoint', format_version=1)`。若 fresh 指向已存在文件，
-也必须先通过下述只读预检。未带 marker 的旧数据库
-没有兼容要求；它与任意外部 SQLite 一样返回 `RepairRequired(checkpoint_foreign_database)`，不能被
-`AsyncSqliteSaver.setup()` 顺手切换 WAL 或创建表。
+checkpoint path 是 ABI 管理的本地文件路径，不是“可安全探测任意 SQLite”的公共接口。fresh invocation
+在打开 SQLite 前先创建同目录 ownership sidecar（`<checkpoint>.abi-owner`，格式版本 1），随后在一个
+saver context 内初始化 LangGraph 的 `checkpoints` / `writes` 表并提交
+`abi_checkpoint_metadata(marker_key='abi_action_checkpoint', format_version=1)`。进程级 coordinator 按
+绝对 checkpoint path 在所有 `AgentRuntime` 实例间共享 async lock；lock 覆盖路径检查、ownership
+claim、saver enter、schema 初始化/预检和 DB marker commit，marker 可见后即释放，不串行后续 graph
+执行。每次 invocation 仍只打开一个 saver context。
 
-resume 的顺序是强制不变量：
+若 schema 初始化后、DB marker 提交前失败，valid sidecar 证明该 partial DB 是本进程认领的 ABI 路径；
+后续 **fresh** invocation 可在同一协调边界内补完初始化，不会永久误判为 foreign。等待中的同路径调用
+只能看到“初始化完成”或“前一初始化失败后由自己安全补完”，看不到 schema-before-marker 中间态。
+resume 不创建缺失数据库，也不把 partial DB 当成可恢复 thread。
 
-1. 对绝对化后的每个现存路径组件执行 `lstat`；任意 symlink、非目录中间组件或非普通最终文件均
-   fail closed，缺失目标也不创建；
-2. 只打开**一个** `AsyncSqliteSaver` context / SQLite 连接；
-3. 在该连接上仅用 `SELECT` 检查 LangGraph 必需列和 ABI marker，期间不调用 saver `setup()`，不执行
-   PRAGMA/CREATE，也不改变外部数据库的 journal mode 或表；
-4. 预检通过后，仍用同一个 saver 实例调用 `aget_tuple`、编译 agent 并 `ainvoke`，不关闭后重开。
+路径与打开顺序是强制不变量：
 
-上述路径保证以 ABI 的本地单进程执行平台为边界：同一进程内不通过路径别名或 symlink 换目标，且
-"预检→执行"没有第二次 saver open 的替换窗口。它不声称防御另一进程或分布式攻击者在系统调用之间
-替换文件；若平台未来引入多进程写入，需要升级为描述符级身份校验/锁协议，而不是在本地方案上增加
-无界对抗模型。
+1. 对绝对化后的每个现存 checkpoint 路径组件执行 `lstat`；任意 symlink、非目录中间组件或非普通
+   最终文件均 fail closed；ownership sidecar 也必须是内容匹配的普通文件；
+2. 已存在数据库先用同一连接上的 `SELECT` 检查 LangGraph 必需列和 ABI DB marker；预检通过后仍用
+   同一个 saver 实例调用 `aget_tuple` / `aget_state`、编译 agent 并 `ainvoke`，不关闭后重开；
+3. 没有 DB marker 且没有 valid ABI sidecar 的文件返回
+   `RepairRequired(checkpoint_foreign_database)`；未标记旧数据库不兼容；
+4. symlink 始终 fail closed，SQLite busy/locked/corrupt/permission 分类继续走 checkpoint control result。
+
+任意外部、foreign 或带 hot journal 的 SQLite 都是越界输入。ABI 不会主动对无 ownership 的文件调用
+`AsyncSqliteSaver.setup()`，但**不承诺** SQLite open/inspection 对这类错误输入 byte-for-byte、schema 或
+journal mutation-free；调用者必须只提供 ABI-owned、quiescent local checkpoint path。
+
+上述保证以本地单进程平台为边界：它不提供 multiprocess/distributed locking，也不声称防御另一进程
+在系统调用之间替换文件。若平台未来引入多进程写入，需要升级为描述符级身份校验/跨进程锁协议。
 
 #### 多 interrupt HITL
 
-`CheckpointTuple.pending_writes` 中的 pending HITL 以 `(task_id, Interrupt.id)` 标识。同一 `task_id`
-已有 `__resume__` 写入时，其旧 `__interrupt__` 不再算 pending。ABI 的 `HitlResume` 按 interrupt id
-携带一组组强类型决策；请求 id 集合必须与真实 pending id 集合精确相等，每组再按自己的 HITL payload
-验证工具数量、Action approval allowlist 与 allowed decisions。全部验证在构图前完成，随后统一映射为
-`Command(resume={interrupt_id: {"decisions": [...]}, ...})`；单 interrupt 不走特殊分支。
+`CheckpointTuple.pending_writes` 是写入历史，不能用“同一 task 曾出现任意 `__resume__`”判断当前
+pending；一个 node 可在保留旧 resume list 的同时产生第二个 interrupt。ABI 在构图后、任何
+`ainvoke` / 模型 / 工具执行前读取 LangGraph 公共 `aget_state(config)`，以
+`StateSnapshot.tasks[*].interrupts` 作为当前 pending 真相。parallel task 中已恢复项不会出现在该集合，
+同 task 的后续 interrupt 则仍然保留。
+
+实际 pause 返回的 SDK interrupt 会立即转换为 ABI-owned `PendingHitlInterrupt`：包含稳定
+`interrupt_id` 和按原顺序排列的 `PendingHitlActionReview`（tool、JSON arguments、description、
+allowed decisions），放入 public `Paused.pending_hitl_interrupts`。controller 只读 public result 即可构造
+`HitlResume`，无需读取 saver 或 import LangGraph。请求 id 集合必须与公共 snapshot 的真实 pending id
+集合精确相等，每组再验证工具数量、Action approval allowlist 与 allowed decisions，随后统一映射为
+`Command(resume={interrupt_id: {"decisions": [...]}, ...})`；单 interrupt 不走特殊分支。错误 resume 在
+模型和工具执行前返回 `RepairRequired`。
 
 SQLite 错误先匹配完整扩展码，再退回 base code：`IOERR_ACCESS` / `IOERR_AUTH` 等权限扩展返回
 `checkpoint_permission_denied`，busy/locked 可重试，corrupt/not-a-database 要求修复，其余读取 I/O

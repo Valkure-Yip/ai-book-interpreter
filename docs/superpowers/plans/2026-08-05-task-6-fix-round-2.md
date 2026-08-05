@@ -105,3 +105,37 @@
 - [x] Run architecture linter, Ruff, strict mypy Python 3.12, full pytest, and diff check.
 - [x] Append Round 2 RED/GREEN evidence to the ignored shared report.
 - [ ] Commit the tracked implementation, tests, and plan in one new commit.
+
+### Breaker Exception: Public HITL and shared first initialization
+
+**Human ruling (2026-08-05):** The platform contract is local and single-process.
+Checkpoint paths must be ABI-owned. Arbitrary external or dirty/hot-journal SQLite
+files are invalid input and no longer receive a mutation-free inspection guarantee;
+symlinks still fail closed. Do not add multiprocess or distributed locking.
+
+**Files:**
+- Modify: `src/abi/types/orchestration.py`
+- Modify: `src/abi/types/__init__.py`
+- Modify: `src/abi/providers/agent_runtime/runner.py`
+- Modify: `tests/test_agent_runtime.py`
+- Modify: `docs/design-docs/langgraph-and-state-machine.md`
+- Modify: `docs/design-docs/dynamic-agent-orchestration.md`
+- Modify: `.superpowers/sdd/2026-08-04-constrained-dynamic-orchestration/task-6-report.md`
+- Modify: `.superpowers/sdd/2026-08-04-constrained-dynamic-orchestration/progress.md`
+
+- [x] RED: fresh real-SQLite HITL pause does not expose an interrupt ID through
+  the SDK-free public result.
+- [x] GREEN: expose stable `PendingHitlInterrupt` / ordered action-review models
+  and resume using only the public pause result.
+- [x] RED: a real same-node second interrupt is rejected when historical
+  `__resume__` causes pending-write filtering.
+- [x] GREEN: validate current `StateSnapshot.tasks[*].interrupts` before any
+  model/tool execution; retain parallel exact-ID and partial-resume coverage.
+- [x] RED: another runtime observes schema-before-marker as foreign, and a
+  failed first initializer leaves fresh retry permanently foreign.
+- [x] GREEN: coordinate all runtimes per local checkpoint path and persist an
+  ABI ownership sidecar so waiting/retry initialization safely completes.
+- [x] Narrow the foreign/dirty SQLite contract while preserving symlink and
+  checkpoint-storage classifications.
+- [x] Run focused/offline, architecture, Ruff, strict mypy 3.12, full pytest,
+  diff checks; append evidence and commit.
