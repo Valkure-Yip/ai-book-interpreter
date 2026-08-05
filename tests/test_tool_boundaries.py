@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from abi.providers.agent_runtime.tooling import to_langchain_tool
 from abi.tools.belt import build_belt
@@ -108,6 +109,43 @@ async def test_provider_adapter_awaits_async_callable_objects_and_wrappers() -> 
 
     assert await object_tool.ainvoke({"value": "x"}) == "object:x"
     assert await wrapped_tool.ainvoke({"value": "y"}) == "wrapped:y"
+
+
+@pytest.mark.asyncio
+async def test_actual_start_hook_runs_after_schema_validation_for_all_callable_shapes() -> None:
+    starts: list[tuple[str, dict[str, object]]] = []
+
+    def started(binding: ToolBinding, arguments: dict[str, object]) -> None:
+        starts.append((binding.name, arguments))
+
+    async def async_echo(value: str) -> str:
+        return value
+
+    class AsyncEcho:
+        async def __call__(self, value: str) -> str:
+            return value
+
+    bindings = (
+        ToolBinding("sync", "sync", _EchoInput, lambda value: value),
+        ToolBinding("async", "async", _EchoInput, async_echo),
+        ToolBinding("object", "object", _EchoInput, AsyncEcho()),
+    )
+    tools = tuple(
+        to_langchain_tool(binding, on_actual_start=started) for binding in bindings
+    )
+
+    for tool in tools:
+        with pytest.raises(ValidationError):
+            await tool.ainvoke({"wrong": "not validated"})
+    assert starts == []
+
+    for tool in tools:
+        assert await tool.ainvoke({"value": tool.name}) == tool.name
+    assert starts == [
+        ("sync", {"value": "sync"}),
+        ("async", {"value": "async"}),
+        ("object", {"value": "object"}),
+    ]
 
 
 @pytest.mark.asyncio

@@ -11,12 +11,13 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import openai
 import pytest
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
@@ -117,6 +118,10 @@ class _ExplodingModel(BaseChatModel):
 
 class _NoopInput(FrozenModel):
     """No arguments are accepted."""
+
+
+class _DeliveryInput(FrozenModel):
+    recipient: str
 
 
 class _LoopingModel(BaseChatModel):
@@ -302,6 +307,71 @@ class _ApprovalModel(_RecordingOutcomeModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
+class _TwoApprovalModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self.human_counts.append(sum(message.type == "human" for message in messages))
+        if sum(isinstance(message, ToolMessage) for message in messages) >= 2:
+            return ChatResult(generations=[ChatGeneration(message=_success_message())])
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "deliver_a",
+                                "args": {},
+                                "id": "delivery-a",
+                                "type": "tool_call",
+                            },
+                            {
+                                "name": "deliver_b",
+                                "args": {},
+                                "id": "delivery-b",
+                                "type": "tool_call",
+                            },
+                        ],
+                    )
+                )
+            ]
+        )
+
+
+class _InvalidToolThenTimeoutModel(_RecordingOutcomeModel):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if any(isinstance(message, ToolMessage) for message in messages):
+            raise TimeoutError("provider timeout after rejected tool arguments")
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "deliver",
+                                "args": {"wrong": "invalid"},
+                                "id": "invalid-delivery",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        )
+
+
 def _runtime(tmp_path: Path, model: BaseChatModel, *, cap: float | None = None) -> Any:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
     assert hasattr(runner, "AgentActionRequest")
@@ -446,7 +516,9 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
             tools=(tool,),
             side_effects=True,
             approval_tools=("deliver",),
-            resume=runner.HitlResume(decision="approve"),
+            resume=runner.HitlResume(
+                decisions=(runner.HitlDecision(decision="approve"),)
+            ),
         )
     )
 
@@ -481,7 +553,13 @@ async def test_hitl_reject_resumes_without_executing_the_business_tool(
             tools=(tool,),
             side_effects=True,
             approval_tools=("deliver",),
-            resume=runner.HitlResume(decision="reject", feedback="not authorized"),
+            resume=runner.HitlResume(
+                decisions=(
+                    runner.HitlDecision(
+                        decision="reject", feedback="not authorized"
+                    ),
+                )
+            ),
         )
     )
 
@@ -500,7 +578,95 @@ def test_hitl_resume_rejects_unsupported_decisions() -> None:
     runner = importlib.import_module("abi.providers.agent_runtime.runner")
 
     with pytest.raises(ValueError):
-        runner.HitlResume(decision="edit")
+        runner.HitlDecision(decision="edit")
+    with pytest.raises(ValueError):
+        runner.HitlResume(decisions=())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decisions", "expected_executions"),
+    [
+        (("approve", "approve"), ("deliver_a", "deliver_b")),
+        (("reject", "reject"), ()),
+        (("approve", "reject"), ("deliver_a",)),
+    ],
+)
+async def test_hitl_resumes_multiple_tools_with_ordered_decisions(
+    tmp_path: Path,
+    decisions: tuple[str, str],
+    expected_executions: tuple[str, ...],
+) -> None:
+    model = _TwoApprovalModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    executions: list[str] = []
+
+    def deliver_a() -> str:
+        executions.append("deliver_a")
+        return "a"
+
+    def deliver_b() -> str:
+        executions.append("deliver_b")
+        return "b"
+
+    tools = (
+        ToolBinding("deliver_a", "First delivery.", _NoopInput, deliver_a),
+        ToolBinding("deliver_b", "Second delivery.", _NoopInput, deliver_b),
+    )
+    request_args = {
+        "tools": tools,
+        "side_effects": True,
+        "approval_tools": ("deliver_a", "deliver_b"),
+    }
+
+    paused = await runtime.run_action(_request(tmp_path, **request_args))
+    resumed = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                decisions=tuple(
+                    runner.HitlDecision(decision=decision) for decision in decisions
+                )
+            ),
+        )
+    )
+
+    assert paused.outcome.kind == "paused"
+    assert resumed.outcome.kind == "succeeded"
+    assert tuple(executions) == expected_executions
+    assert set(model.human_counts) == {1}
+
+
+@pytest.mark.asyncio
+async def test_hitl_decision_count_mismatch_is_repair_required(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, _TwoApprovalModel(human_counts=[]))
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    tools = (
+        ToolBinding("deliver_a", "First delivery.", _NoopInput, lambda: "a"),
+        ToolBinding("deliver_b", "Second delivery.", _NoopInput, lambda: "b"),
+    )
+    request_args = {
+        "tools": tools,
+        "side_effects": True,
+        "approval_tools": ("deliver_a", "deliver_b"),
+    }
+    await runtime.run_action(_request(tmp_path, **request_args))
+
+    result = await runtime.run_action(
+        _request(
+            tmp_path,
+            **request_args,
+            resume=runner.HitlResume(
+                decisions=(runner.HitlDecision(decision="approve"),)
+            ),
+        )
+    )
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("hitl_decision_count_mismatch",)
+    assert "two" in result.outcome.message.lower() or "2" in result.outcome.message
 
 
 @pytest.mark.asyncio
@@ -542,6 +708,30 @@ async def test_action_harness_maps_tool_side_effect_timeout_to_indeterminate(
     assert result.outcome.operation_key == "run-1/a1/1"
     assert result.tool_calls == 1
     assert result.stopped_reason == "error"
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_do_not_count_as_side_effect_start(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path, _InvalidToolThenTimeoutModel(human_counts=[]))
+    executions = 0
+
+    def deliver(recipient: str) -> str:
+        nonlocal executions
+        executions += 1
+        return f"delivered to {recipient}"
+
+    tool = ToolBinding("deliver", "Validated side effect.", _DeliveryInput, deliver)
+    result = await runtime.run_action(
+        _request(tmp_path, tools=(tool,), side_effects=True)
+    )
+
+    assert result.outcome.kind == "retryable_failure"
+    assert result.outcome.error_code == "provider_timeout"
+    assert result.tool_calls == 0
+    assert result.tool_log == ()
+    assert executions == 0
 
 
 @pytest.mark.asyncio
@@ -617,6 +807,130 @@ async def test_openai_4xx_is_permanent_and_failed_call_is_observable_without_sec
     assert failed_calls[-1]["outcome"] == "error"
     assert failed_calls[-1]["error_classification"] == "permanent_provider_error"
     assert secret not in event_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "kind", "error_code"),
+    [
+        (400, "permanent_failure", "permanent_provider_error"),
+        (401, "permanent_failure", "permanent_provider_error"),
+        (403, "permanent_failure", "permanent_provider_error"),
+        (404, "permanent_failure", "permanent_provider_error"),
+        (429, "retryable_failure", "transient_provider_error"),
+        (500, "retryable_failure", "transient_provider_error"),
+        (502, "retryable_failure", "transient_provider_error"),
+        (503, "retryable_failure", "transient_provider_error"),
+        (504, "retryable_failure", "transient_provider_error"),
+    ],
+)
+async def test_api_status_errors_are_classified_by_http_status_without_body_leakage(
+    tmp_path: Path,
+    status_code: int,
+    kind: str,
+    error_code: str,
+) -> None:
+    secret = f"provider-body-secret-{status_code}"
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("POST", "https://provider.invalid/v1/chat"),
+    )
+    error = openai.APIStatusError(secret, response=response, body={"secret": secret})
+    runtime = _runtime(tmp_path, _ExplodingModel(error=error))
+
+    result = await runtime.run_action(_request(tmp_path))
+
+    assert result.outcome.kind == kind
+    assert result.outcome.error_code == error_code
+    assert result.llm_calls == 1
+    assert secret not in (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert secret not in result.outcome.message
+
+
+def test_action_request_rejects_duplicate_tool_names_before_checkpoint_work(
+    tmp_path: Path,
+) -> None:
+    executions = 0
+
+    def handler() -> str:
+        nonlocal executions
+        executions += 1
+        return "ok"
+
+    tool = ToolBinding("duplicate", "Duplicate binding.", _NoopInput, handler)
+
+    with pytest.raises(ValueError, match="duplicate tool"):
+        _request(tmp_path, tools=(tool, tool))
+
+    assert executions == 0
+    assert not (tmp_path / "graph-checkpoints.sqlite").exists()
+
+
+def test_llm_callback_finalizes_each_run_id_only_once(tmp_path: Path) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    events = EventLogger(tmp_path / "events.jsonl", "run-1")
+    metrics = MetricsAggregator(tmp_path / "metrics.json", "run-1", "book-1")
+    callback = runner._CostCallback(
+        model="gpt-4o-mini",
+        budget=BudgetGate(None),
+        events=events,
+        metrics=metrics,
+        agent_name="idempotency-test",
+        max_output_tokens=128,
+    )
+    run_id = uuid4()
+
+    callback.on_chat_model_start(
+        {}, [[HumanMessage(content="one attempt")]], run_id=run_id
+    )
+    callback.on_llm_error(ConnectionError("first delivery"), run_id=run_id)
+    callback.on_llm_error(ConnectionError("duplicate delivery"), run_id=run_id)
+
+    assert callback.llm_calls == 1
+    assert metrics.snapshot()["llm_calls"] == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len([record for record in records if record["event"] == "agent.call"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_resume_on_new_thread_returns_repair_instruction(
+    tmp_path: Path,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    model = _RecordingOutcomeModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+
+    result = await runtime.run_action(
+        _request(tmp_path, resume=runner.CheckpointResume())
+    )
+
+    assert result.outcome.kind == "repair_required"
+    assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
+    assert "fresh" in result.outcome.message.lower()
+    assert model.human_counts == []
+
+
+@pytest.mark.asyncio
+async def test_completed_checkpoint_resume_returns_cached_success_without_new_work(
+    tmp_path: Path,
+) -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    model = _RecordingOutcomeModel(human_counts=[])
+    runtime = _runtime(tmp_path, model)
+
+    first = await runtime.run_action(_request(tmp_path))
+    resumed = await runtime.run_action(
+        _request(tmp_path, resume=runner.CheckpointResume())
+    )
+
+    assert first.outcome.kind == "succeeded"
+    assert resumed.outcome == first.outcome
+    assert resumed.llm_calls == 0
+    assert resumed.tool_calls == 0
+    assert model.human_counts == [1]
 
 
 def test_architecture_linter_reports_forbidden_sdk_import(tmp_path: Path) -> None:
