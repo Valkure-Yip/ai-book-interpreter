@@ -13,14 +13,17 @@ from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.planning.context import SnapshotBuilder
 from abi.planning.planner import Planner
+from abi.planning.policy import PolicyEngine
 from abi.project.run_ledger import ArtifactCommit, RunLedger, RunSeed, SuccessCommit
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionKind,
     ActionOutcomeEnvelope,
     ActionSpec,
+    ArtifactRef,
     GateDecision,
     GateEvidence,
+    PlanningContext,
     PlanPatch,
     PlanRejectionView,
     ProposedAction,
@@ -55,6 +58,31 @@ def _registry() -> ActionRegistry:
                 description="Create immutable source-manifest evidence.",
                 input_schema="EmptyInput",
                 action_kind=ActionKind.DETERMINISTIC,
+                validator="source_manifest",
+            ),
+            input_model=EmptyInput,
+            executor=_execute_unused,
+            validator=_validate_unused,
+        )
+    )
+    return registry
+
+
+def _artifact_gated_registry() -> ActionRegistry:
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(
+            {"source_exists": lambda snapshot, arguments: bool(snapshot.artifacts)}
+        ),
+        validators={"source_manifest": _validate_unused},
+    )
+    registry.register(
+        ActionDefinition(
+            spec=ActionSpec(
+                capability="source.ingest",
+                description="Create immutable source-manifest evidence.",
+                input_schema="EmptyInput",
+                action_kind=ActionKind.DETERMINISTIC,
+                prerequisites=({"name": "source_exists"},),
                 validator="source_manifest",
             ),
             input_model=EmptyInput,
@@ -136,16 +164,34 @@ async def test_snapshot_contains_hashes_not_book_body_and_applies_limits(tmp_pat
     body = "SECRET BOOK BODY"
     async with RunLedger.open(tmp_path / "run.db") as ledger:
         await _seed_committed_artifacts(ledger, body)
+        await ledger.create_run(RunSeed(run_id="run-2", budget_usd=5.0))
+        await ledger.append_plan(
+            "run-2",
+            PlanPatch(
+                objective="other run",
+                proposed_actions=(ProposedAction(proposal_id="other", capability="source.ingest"),),
+                rationale="run isolation fixture",
+            ),
+        )
+        await ledger.record_plan_rejection(
+            "run-2", plan_version=1, reason_codes=("other_run_only",)
+        )
 
-        snapshot = await SnapshotBuilder(
+        builder = SnapshotBuilder(
             ledger=ledger,
             registry=_registry(),
             artifact_limit=1,
             incident_limit=1,
             rejection_limit=1,
-        ).build("run-1")
+            action_limit=0,
+            gate_evidence_limit=0,
+        )
+        context = await builder.build("run-1")
+        repeated = await builder.build("run-1")
 
+    snapshot = context.planner_snapshot
     payload = snapshot.model_dump_json()
+    assert context == repeated
     assert body not in payload
     assert snapshot.artifacts == (
         snapshot.artifacts[0].model_copy(
@@ -157,6 +203,39 @@ async def test_snapshot_contains_hashes_not_book_body_and_applies_limits(tmp_pat
     assert snapshot.remaining_budget_usd == 3.75
     assert snapshot.eligible_actions[0].capability == "source.ingest"
     assert snapshot.plan_rejections[0].reason_codes == ("invalid_horizon",)
+    assert "other_run_only" not in payload
+    assert snapshot.actions == ()
+    assert snapshot.gate_evidence == ()
+    assert len(context.policy_snapshot.actions) == 1
+    assert len(context.policy_snapshot.gate_evidence) == 1
+
+
+@pytest.mark.asyncio
+async def test_context_keeps_full_policy_facts_while_planner_view_is_bounded(tmp_path: Path) -> None:
+    """Catch sampled planner evidence becoming the policy authorization input."""
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed_committed_artifacts(ledger, "SECRET BOOK BODY")
+        registry = _artifact_gated_registry()
+        builder = SnapshotBuilder(ledger=ledger, registry=registry, artifact_limit=0)
+
+        context = await builder.build("run-1")
+        repeated = await builder.build("run-1")
+
+    patch = PlanPatch(
+        objective="use source evidence",
+        proposed_actions=(ProposedAction(proposal_id="ingest", capability="source.ingest"),),
+        rationale="source artifact is a durable policy fact",
+    )
+    policy = PolicyEngine(registry)
+
+    assert context == repeated
+    assert len(context.policy_snapshot.artifacts) == 2
+    assert context.planner_snapshot.artifacts == ()
+    assert context.planner_snapshot.eligible_actions[0].capability == "source.ingest"
+    assert policy.authorize(context.policy_snapshot, patch, next_plan_version=2).authorized is True
+    assert policy.authorize(context.planner_snapshot, patch, next_plan_version=2).reason_codes == (
+        "hard_prerequisite_failed",
+    )
 
 
 class DeterministicPlannerProvider:
@@ -173,14 +252,29 @@ class DeterministicPlannerProvider:
         return self.result, None
 
 
-def _snapshot_with_ingest_eligible() -> RunSnapshot:
-    return RunSnapshot(
+def _context_with_ingest_eligible() -> PlanningContext:
+    snapshot = RunSnapshot(
         run_id="run-1",
         status=RunStatus.RUNNING,
         eligible_actions=_registry().eligible(
             RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
         ),
         plan_rejections=(PlanRejectionView(plan_version=1, reason_codes=("invalid_horizon",)),),
+    )
+    return PlanningContext(
+        policy_snapshot=snapshot.model_copy(
+            update={
+                "artifacts": (
+                    ArtifactRef(
+                        artifact_id="policy-only",
+                        relpath="state/private-policy-evidence.json",
+                        sha256="policy-only-checksum",
+                        producer_action_id="policy-only",
+                    ),
+                )
+            }
+        ),
+        planner_snapshot=snapshot,
     )
 
 
@@ -201,7 +295,7 @@ async def test_planner_returns_valid_patch_from_structured_provider_boundary() -
         )
     )
 
-    patch = await Planner(router=router).plan(_snapshot_with_ingest_eligible())
+    patch = await Planner(router=router).plan(_context_with_ingest_eligible())
 
     assert patch.proposed_actions[0].capability == "source.ingest"
     assert patch.objective == "produce missing source evidence"
@@ -213,6 +307,7 @@ async def test_planner_returns_valid_patch_from_structured_provider_boundary() -
     assert "prior rejection reasons as hard feedback" in str(messages[0].content)
     assert '"eligible_actions"' in str(messages[1].content)
     assert '"invalid_horizon"' in str(messages[1].content)
+    assert "private-policy-evidence" not in str(messages[1].content)
     assert kwargs == {
         "agent_name": "orchestration.planner",
         "prompt_version": "dynamic-plan-v1",
@@ -235,4 +330,4 @@ async def test_planner_rejects_provider_patch_beyond_five_actions() -> None:
     )
 
     with pytest.raises(ValueError, match="at most 5 actions"):
-        await Planner(router=router).plan(_snapshot_with_ingest_eligible())
+        await Planner(router=router).plan(_context_with_ingest_eligible())

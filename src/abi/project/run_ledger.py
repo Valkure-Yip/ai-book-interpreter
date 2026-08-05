@@ -12,7 +12,7 @@ from typing import Literal, Self, cast
 from uuid import uuid4
 
 import aiosqlite
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.ledger_schema import SCHEMA_SQL
@@ -251,10 +251,6 @@ class RunLedger:
         if not reason_codes:
             raise LedgerTransitionError(
                 "plan rejection needs at least one reason; record the deterministic policy reason code"
-            )
-        if len(set(reason_codes)) != len(reason_codes):
-            raise LedgerTransitionError(
-                "plan rejection reason codes repeat; deduplicate the stable policy reasons before recording"
             )
         rejection = PlanRejectionView(plan_version=plan_version, reason_codes=reason_codes)
         now = self._now()
@@ -839,10 +835,7 @@ class RunLedger:
                 for row in incidents
             ),
             plan_rejections=tuple(
-                PlanRejectionView(
-                    plan_version=row["plan_version"],
-                    reason_codes=tuple(json.loads(row["reason_codes_json"])),
-                )
+                self._plan_rejection_from_row(row)
                 for row in rejections
             ),
             remaining_budget_usd=remaining,
@@ -1074,6 +1067,26 @@ class RunLedger:
             created_at=_parse_time(row["created_at"]),
             resolved_at=None if row["resolved_at"] is None else _parse_time(row["resolved_at"]),
         )
+
+    @staticmethod
+    def _plan_rejection_from_row(row: aiosqlite.Row) -> PlanRejectionView:
+        """Parse stored code-only rejection feedback before it reaches a Planner prompt."""
+        try:
+            raw_codes = json.loads(row["reason_codes_json"])
+        except json.JSONDecodeError as exc:
+            raise LedgerError(
+                "durable plan rejection contains invalid JSON; repair the ledger row before replanning"
+            ) from exc
+        if not isinstance(raw_codes, list) or not all(isinstance(code, str) for code in raw_codes):
+            raise LedgerError(
+                "durable plan rejection must contain a JSON list of stable reason codes; repair the ledger row"
+            )
+        try:
+            return PlanRejectionView(plan_version=row["plan_version"], reason_codes=tuple(raw_codes))
+        except ValidationError as exc:
+            raise LedgerError(
+                "durable plan rejection has invalid reason codes; repair the ledger row before replanning"
+            ) from exc
 
     @staticmethod
     def _attempt_from_row(row: aiosqlite.Row) -> ActionAttemptRecord:

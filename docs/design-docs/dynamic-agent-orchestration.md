@@ -293,19 +293,27 @@ Registry 取得对应 `TypeAdapter`，将 `value_json` 解析成 capability 专�
 再生成 `AuthorizedAction`。解析失败即拒绝计划；未解析的 JSON、`dict` 或 `Any` 不得进入 Dispatcher
 或持久化为已授权参数。
 
-### 7.3 `RunSnapshot`
+### 7.3 `RunSnapshot` 与 `PlanningContext`
 
-Planner 看到的是压缩后的证据视图：
+`RunSnapshot` 是来自 ledger 的完整、不可变 policy facts。每轮由一次 ledger
+读取构造 `PlanningContext`：`policy_snapshot` 保留完整事实，只交给
+`PolicyEngine` 复验；`planner_snapshot` 从前者派生为受限证据视图，只会被
+序列化给 Planner。两者不能互换，尤其不得用采样后的 `planner_snapshot` 重算
+predicate 或授权。
+
+Planner 看到的是 `planner_snapshot` 的压缩证据视图：
 
 - 已提交 Action 与当前 plan version；
 - gate evidence 摘要；
 - artifact manifest、checksum 与统计，不含整本正文；
-- 未解决 incident 及其错误分类；
+- 未解决 incident 及其错误分类（消息截断）；
+- 最近、稳定的 policy rejection code（不含任意错误文本）；
 - 剩余预算、并发资源与人工约束；
 - 本轮合法 capability 及其简短说明。
 
-如果需要阅读更多材料，Planner 必须提出注册的 `inspect_*` 或 `research_*` Action，而不是直接获得
-业务工具。
+artifact、action、gate、incident 和 rejection 都按配置采样；eligible
+capability 始终基于完整 `policy_snapshot` 计算后复制到 Planner view。若需要
+阅读更多材料，Planner 必须提出注册的 `inspect_*` 或 `research_*` Action，而不是直接获得业务工具。
 
 ### 7.4 `ActionOutcome`
 
@@ -342,7 +350,8 @@ Planner 是结构化模型调用，不是拥有业务工具的通用 agent。它
 
 ### 8.2 PolicyEngine
 
-PolicyEngine 是纯确定性模块，输入 `RunSnapshot + ActionRegistry + PlanPatch`，输出
+PolicyEngine 是纯确定性模块，输入
+`PlanningContext.policy_snapshot + ActionRegistry + PlanPatch`，输出
 `AuthorizationDecision`。它强制：
 
 - capability 在 registry 且当前 eligible；

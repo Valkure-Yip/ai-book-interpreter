@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from abi.prompts.planner import PLANNER_SYSTEM_PROMPT
 from abi.providers.llm.factory import system_message, user_message
-from abi.types.orchestration import PlanPatch, RunSnapshot
+from abi.types.orchestration import PlanningContext, PlanPatch
 
 
 class StructuredPlanRouter(Protocol):
@@ -32,11 +32,11 @@ class Planner:
         self._router = router
         self._horizon = horizon
 
-    async def plan(self, snapshot: RunSnapshot) -> PlanPatch:
+    async def plan(self, context: PlanningContext) -> PlanPatch:
         """Produce one bounded proposal without granting it any mutable authority."""
         messages: list[Any] = [
             system_message(PLANNER_SYSTEM_PROMPT),
-            user_message(snapshot.model_dump_json()),
+            user_message(context.planner_snapshot.model_dump_json()),
         ]
         patch, _ = await self._router.invoke_structured(
             PlanPatch,

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from abi.types._base import FrozenModel
 
@@ -127,6 +128,22 @@ class PlanRejectionView(FrozenModel):
     plan_version: int = Field(ge=1)
     reason_codes: tuple[str, ...] = Field(min_length=1)
 
+    @field_validator("reason_codes")
+    @classmethod
+    def _validate_reason_codes(cls, reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+        stable_codes: list[str] = []
+        seen: set[str] = set()
+        for code in reason_codes:
+            if len(code) > 64 or re.fullmatch(r"[a-z0-9_.-]+", code) is None:
+                raise ValueError(
+                    "reason codes must use 1-64 lowercase ASCII [a-z0-9_.-] characters; "
+                    "record a stable policy code instead of arbitrary text"
+                )
+            if code not in seen:
+                stable_codes.append(code)
+                seen.add(code)
+        return tuple(stable_codes)
+
 
 class ActionView(FrozenModel):
     action_id: str
@@ -154,6 +171,13 @@ class RunSnapshot(FrozenModel):
     eligible_actions: tuple[EligibleAction, ...] = ()
     remaining_budget_usd: float | None = Field(default=None, ge=0)
     failure_signatures: tuple[str, ...] = ()
+
+
+class PlanningContext(FrozenModel):
+    """Full policy facts paired with the separately bounded Planner evidence view."""
+
+    policy_snapshot: RunSnapshot
+    planner_snapshot: RunSnapshot
 
 
 class AuthorizedAction(FrozenModel):

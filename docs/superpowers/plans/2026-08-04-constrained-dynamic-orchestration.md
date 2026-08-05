@@ -807,7 +807,11 @@ git commit -m "feat: reconcile staged artifact promotion"
 
 **Interfaces:**
 - Consumes: `RunLedger.load_snapshot()`, `ActionRegistry.eligible()`, and `LLMRouter.invoke_structured()`.
-- Produces: `SnapshotBuilder.build(run_id) -> RunSnapshot` and `Planner.plan(snapshot) -> PlanPatch`.
+- Produces: `SnapshotBuilder.build(run_id) -> PlanningContext` and
+  `Planner.plan(context) -> PlanPatch`. `PlanningContext.policy_snapshot` is
+  the complete durable evidence view for PolicyEngine revalidation;
+  `planner_snapshot` is the separately bounded, code-only view serialized to
+  the LLM.
 
 - [ ] **Step 1: Write snapshot minimization and structured-output tests**
 
@@ -838,7 +842,15 @@ Expected: collection fails because the planner modules do not exist.
 
 - [ ] **Step 3: Implement compressed snapshot construction**
 
-Read only committed ledger facts and artifact metadata. Include unresolved incidents, remaining budget, plan rejections, and eligible capability descriptions. Limit incident messages to 500 characters, artifact samples to configured counts, and Planner horizon to five. Loading additional content is represented by an eligible `inspect.*` Action rather than direct file access.
+Read one complete durable ledger snapshot, derive eligible capabilities from
+that full policy view, then construct a separately bounded Planner view. Keep
+the full `policy_snapshot` for PolicyEngine; never substitute the sampled
+planner view during authorization. The Planner view contains only artifact
+metadata, bounded actions/gates/incidents/rejection codes, remaining budget,
+and eligible capability descriptions—never book body or arbitrary rejection
+messages. Limit incident messages to 500 characters, samples to configured
+counts, and Planner horizon to five. Loading additional content is represented
+by an eligible `inspect.*` Action rather than direct file access.
 
 - [ ] **Step 4: Implement the Planner prompt and structured call**
 
