@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1052,19 +1053,21 @@ async def test_started_hitl_replay_blocks_old_pending_without_second_resume(
     assert incidents[-1].repair_source == "integrity_guard"
     assert incidents[-1].reason_code == "hitl_resume_indeterminate"
 
-    recovery = await lifecycle.unblock(
-        project_root=project_root,
-        request=lifecycle.UnblockRequest(
-            reason="operator verified the external side effect and chose a new Action identity",
-            evidence_refs=("operator-side-effect-check-1",),
-            source_action_id="hitl-action",
-        ),
+    inspection = await lifecycle.inspect_run(project_root=project_root)
+    assert "--source-action hitl-action" in inspection.next_safe_recovery
+    assert "--resolved-canonical" not in inspection.next_safe_recovery
+    copied_command = shlex.split(inspection.next_safe_recovery)
+    assert copied_command[:2] == ["abi", "unblock"]
+    copied_command[copied_command.index("REASON")] = "operator-verified-side-effect"
+    copied_command[copied_command.index("SIDE_EFFECT_EVIDENCE")] = (
+        "operator-side-effect-check-1"
     )
-    assert recovery.replacement_action_id is not None
-    assert recovery.staging_relpath == (
-        f"state/staging/{recovery.replacement_action_id}/1"
-    )
+    executed = await asyncio.to_thread(CliRunner().invoke, app, copied_command[1:])
+    assert executed.exit_code == 0, executed.output
+
     async with RunLedger.open(project_root / "state/run.db") as ledger:
+        actions = await ledger.list_actions("hitl-run")
+        replacement = next(action for action in actions if action.action_id != "hitl-action")
         old_action = await ledger.get_action("hitl-action")
         old_attempt = await ledger.get_attempt("hitl-action", 1)
         old_receipt = await ledger.get_attempt_outcome("hitl-action", 1)
@@ -1072,7 +1075,6 @@ async def test_started_hitl_replay_blocks_old_pending_without_second_resume(
         continuations = await ledger.list_hitl_continuation_receipts(
             "hitl-action", 1
         )
-        replacement = await ledger.get_action(recovery.replacement_action_id)
     assert old_action.status is ActionStatus.INDETERMINATE
     assert old_attempt.status is ActionStatus.INDETERMINATE
     assert isinstance(
@@ -1084,6 +1086,7 @@ async def test_started_hitl_replay_blocks_old_pending_without_second_resume(
     assert old_claim.status == "STARTED"
     assert continuations == ()
     assert replacement.status is ActionStatus.AUTHORIZED
+    assert replacement.action_id in executed.output
 
 
 @pytest.mark.asyncio

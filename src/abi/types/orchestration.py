@@ -292,12 +292,16 @@ class ActionView(FrozenModel):
     @model_validator(mode="after")
     def _repair_fields_together(self) -> Self:
         values = (self.repair_class, self.repair_source, self.reason_code)
+        classified_statuses = {
+            ActionStatus.REPAIR_REQUIRED,
+            ActionStatus.INDETERMINATE,
+        }
         if self.status is ActionStatus.REPAIR_REQUIRED and not all(values):
-            raise ValueError("REPAIR_REQUIRED actions need class/source/reason")
-        if self.status is not ActionStatus.REPAIR_REQUIRED and any(
-            item is not None for item in values
-        ):
-            raise ValueError("non-repair actions may not carry repair classification")
+            raise ValueError("repair actions need class/source/reason")
+        if self.status is ActionStatus.INDETERMINATE and any(values) and not all(values):
+            raise ValueError("classified indeterminate actions need class/source/reason")
+        if self.status not in classified_statuses and any(item is not None for item in values):
+            raise ValueError("unclassified actions may not carry repair classification")
         return self
 
 

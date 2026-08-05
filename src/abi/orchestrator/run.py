@@ -781,6 +781,31 @@ def _next_recovery(
         return "No current public HITL interrupt; inspect durable outcome bindings"
     if status is RunStatus.PAUSED_BUDGET:
         return f"abi unblock {project.root} --reason REASON --evidence-ref BUDGET_CHANGE"
+    hitl_indeterminate = next(
+        (
+            incident
+            for incident in incidents
+            if incident.reason_code == "hitl_resume_indeterminate"
+            and incident.action_id is not None
+        ),
+        None,
+    )
+    if status is RunStatus.BLOCKED and hitl_indeterminate is not None:
+        source_action_id = hitl_indeterminate.action_id
+        assert source_action_id is not None
+        return " ".join(
+            (
+                "abi",
+                "unblock",
+                shlex.quote(str(project.root)),
+                "--source-action",
+                shlex.quote(source_action_id),
+                "--reason",
+                "REASON",
+                "--evidence-ref",
+                "SIDE_EFFECT_EVIDENCE",
+            )
+        )
     if status is RunStatus.BLOCKED and any(
         incident.repair_class == "integrity" for incident in incidents
     ):
