@@ -2,6 +2,11 @@
 
 > **状态：已批准，待实现。** 2026-08-04；书面设计于 2026-08-04 经用户确认。
 >
+> **协议修订：已批准、具有约束力。** 2026-08-05；artifact bundle、attempt-scoped staging、
+> staging-aware validation、multi-intent commit 与 typed probe resolution 是对 Tasks 1/4/7/8/9
+> 的授权 breaker amendment。修订后的接口不兼容此前草案或已生成的任务/状态，不保留旧的
+> 单文件 `Succeeded` 形状。
+>
 > 本文定义 ABI 下一代宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定 `HAPPY_PATH`。实现完成前，当前行为仍以
 > [`agentic-pipeline.md`](./agentic-pipeline.md) 和
@@ -23,7 +28,8 @@ ABI 将保留“LLM 负责开放式工作、确定性代码负责裁决”的原
 - `ActionRegistry` 取代 `STAGE_SEQUENCE`，声明每种能力的 schema、前置条件、效果、权限、
   validator、重试和并发规则。
 - Dispatcher 每轮执行一个 Action，或一组读写集合互不冲突的 Action。
-- Validator 只根据确定性证据裁决；Committer 在事务中提交业务事实。
+- Validator 只在 staging-aware evidence view 上根据确定性证据裁决；Committer 先持久化完整
+  bundle 的全部 promotion intents，再逐项提升，最后才在一个 SQLite 事务中提交业务事实与成功状态。
 - SQLite `RunLedger` 是唯一业务真相；LangGraph checkpointer 只保存运行时游标与 agent 上下文。
 - 业务提交追求 exactly-once；Action 执行允许 at-least-once，但必须幂等或可对账。
 - 不兼容旧 `pipeline_state.json`、旧 run 或旧状态枚举；不提供迁移器。
@@ -119,7 +125,7 @@ flowchart TB
         PLAN["Planner<br/>输出结构化 PlanPatch"]
         POLICY["Policy Engine<br/>验证依赖、门禁、预算与权限"]
         SCHED["Scheduler / Dispatcher<br/>选择无冲突 Action batch"]
-        COMMIT["Committer<br/>原子提交结果"]
+        COMMIT["Committer<br/>multi-intent promotion<br/>完整 bundle 后 ledger success"]
         INCIDENT["Incident Manager<br/>记录失败与修复证据"]
 
         ORCH --> RECON --> OBS --> ELIG --> PLAN --> POLICY --> SCHED
@@ -147,19 +153,22 @@ flowchart TB
     end
 
     subgraph EVIDENCE["工件与确定性证据"]
-        ART["Artifact Workspace<br/>source · chapters · glossary · EPUB"]
-        VALID["Deterministic Validators<br/>完整性 · 质量 · EPUBCheck · 发布"]
+        STAGING["Attempt-scoped Staging Bundle<br/>state/staging/action/attempt"]
+        ART["Committed Canonical Workspace<br/>source · chapters · glossary · EPUB"]
+        VALID["Staging-aware Validators<br/>本 attempt 覆盖 canonical 输出"]
         GATE["Gate Evidence<br/>报告 · checksum · provenance"]
 
-        DET --> ART
-        HARNESS --> ART
-        SUB --> ART
-        ART --> VALID
+        DET --> STAGING
+        HARNESS --> STAGING
+        SUB --> STAGING
+        STAGING --> VALID
+        ART -. "其余依赖只读" .-> VALID
         VALID --> GATE
     end
 
-    GATE -- "PASS" --> COMMIT
+    GATE -- "PASS + bundle digest" --> COMMIT
     GATE -- "FAIL" --> INCIDENT
+    COMMIT -- "create all intents, then promote all" --> ART
 
     subgraph DURABLE["持久化与运行保障"]
         LEDGER["RunLedger / run.db<br/>唯一业务真相"]
@@ -168,7 +177,7 @@ flowchart TB
         BUDGET["Budget · Rate · Concurrency Gates"]
     end
 
-    COMMIT --> LEDGER
+    COMMIT -- "完整 bundle 后单事务" --> LEDGER
     INCIDENT --> LEDGER
     LEDGER --> RECON
     CHECKPOINT -. "恢复控制循环" .-> RECON
@@ -207,7 +216,9 @@ flowchart TD
     AGENT --> OUTCOME
     MULTI --> OUTCOME
 
-    OUTCOME{"执行结果"} -- "产生工件" --> VALIDATE["确定性 validator<br/>检查证据与 checksum"]
+    OUTCOME{"执行结果"} -- "Succeeded(bundle)" --> BUNDLE["验证 typed bundle<br/>identity · permissions · exact effects"]
+    BUNDLE --> VIEW["构造 staging-aware evidence view<br/>本 attempt 输出覆盖 canonical"]
+    VIEW --> VALIDATE["确定性 validator<br/>绑定 bundle digest 与 checksum"]
     OUTCOME -- "可重试异常" --> RETRY{"重试额度剩余？"}
     RETRY -- "是" --> PRECP
     RETRY -- "否" --> INCIDENT["提交 incident<br/>标记 REPAIR_REQUIRED"]
@@ -215,6 +226,11 @@ flowchart TD
 
     OUTCOME -- "预算耗尽" --> PB["PAUSED_BUDGET"]
     OUTCOME -- "需要人工判断" --> PH["PAUSED_HITL"]
+    OUTCOME -- "Indeterminate" --> PROBE["只读 probe Action<br/>返回 ProbeResolution"]
+    PROBE --> RESOLVE{"disposition"}
+    RESOLVE -- "succeeded" --> PROBEOK["原 Action = SUCCEEDED<br/>禁止重发"]
+    RESOLVE -- "absent" --> RETRY
+    RESOLVE -- "unknown" --> BLOCKED
     PB --> RESUME["外部条件更新后恢复"]
     PH --> RESUME
     RESUME --> RECON
@@ -223,12 +239,17 @@ flowchart TD
     PASS -- "否" --> REPAIR["提交 gate failure 与修复证据"]
     REPAIR --> OBS
 
-    PASS -- "是" --> COMMIT["事务提交<br/>Action SUCCEEDED<br/>工件、gate、成本与 provenance"]
+    PASS -- "是" --> INTENTS["一个 SQLite 事务创建<br/>bundle 全部 promotion intents"]
+    INTENTS --> PROMOTE["逐项 promote / reconcile<br/>文件系统非原子"]
+    PROMOTE --> ALL{"全部 intents COMMITTED？"}
+    ALL -- "否 / CONFLICT" --> INCIDENT
+    ALL -- "是" --> COMMIT["一个 SQLite 事务<br/>artifact + gate + attempt/action success"]
     COMMIT --> COMPLETE{"所有硬门禁和必需产物完成？"}
 
     COMPLETE -- "否" --> OBS
     COMPLETE -- "是" --> DONE(["RUN_COMPLETED"])
 
+    PROBEOK --> COMPLETE
     INCIDENT --> RECOVERABLE{"仍可自动或外部恢复？"}
     RECOVERABLE -- "是" --> OBS
     RECOVERABLE -- "否" --> BLOCKED["BLOCKED<br/>保留完整恢复点"]
@@ -259,10 +280,13 @@ class ActionSpec(BaseModel):
     retry_policy: RetryPolicySpec
     validator: str
     resource_class: str
+    probe_capability: str | None
 ```
 
 Registry 启动时校验 capability 唯一、schema 可序列化、validator 存在、工具与 skill 引用有效、
-read/write 集合合法。Registry 校验失败时进程拒绝启动。
+read/write 集合合法。每个会产出工件的 ActionDefinition 还必须注册确定性的 effect expander，把已解析
+参数展开为 `ExpectedArtifactManifest`；manifest 不能含目录或 glob，且必须落在 write set 内。Registry
+校验失败时进程拒绝启动。probe capability 的附加只读约束见 7.4 节。
 
 ### 7.2 `PlanPatch`
 
@@ -318,12 +342,41 @@ capability 始终基于完整 `policy_snapshot` 计算后复制到 Planner view�
 ### 7.4 `ActionOutcome`
 
 ```python
+class ArtifactMetadata(BaseModel):
+    name: str
+    value_json: str
+
+class ArtifactBundleEntry(BaseModel):
+    staged_relpath: str
+    canonical_relpath: str
+    media_type: str
+    evidence_role: str
+    metadata: tuple[ArtifactMetadata, ...] = ()
+
+class ArtifactBundle(BaseModel):
+    action_id: str
+    attempt: int
+    entries: tuple[ArtifactBundleEntry, ...]
+
+class Succeeded(BaseModel):
+    kind: Literal["succeeded"] = "succeeded"
+    artifact_bundle: ArtifactBundle
+    evidence_refs: tuple[str, ...] = ()
+
+class ProbeResolution(BaseModel):
+    kind: Literal["probe_resolution"] = "probe_resolution"
+    operation_key: str
+    disposition: Literal["succeeded", "absent", "unknown"]
+    evidence_refs: tuple[str, ...]
+    message: str
+
 ActionOutcome = Annotated[
     Succeeded
     | RetryableFailure
     | RepairRequired
     | PermanentFailure
     | Indeterminate
+    | ProbeResolution
     | Paused,
     Field(discriminator="kind"),
 ]
@@ -331,6 +384,40 @@ ActionOutcome = Annotated[
 
 ActionRunner 必须返回该联合类型。未能解析为 `ActionOutcome` 本身是 `ModelBehaviorFailure`，按
 ActionSpec 的模型错误策略处理，不能隐式视为成功。
+
+以上模型均继承项目的 frozen、forbid-extra 基类。普通成功的 bundle 至少有一项；不允许空 bundle，
+也不保留旧单文件 outcome 的兼容字段。每一项必须同时声明当前 attempt 下的 staged regular-file
+relpath、精确的 portable-lowercase canonical relpath、media type、稳定 evidence role，以及由
+`ArtifactMetadata` 表达的必要元数据。目录、glob、重复 staged path、重复 canonical path、绝对路径、
+跨 attempt 路径或任何非 regular file 都 fail closed。
+
+bundle 以 `(canonical_relpath, staged_relpath)` 排序；每项 metadata 按 `name` 排序且 name 唯一。
+序列化使用 Pydantic JSON 模式、UTF-8、sorted keys 和紧凑 separators，禁止浮动表示、隐式路径归一化
+或实现自选顺序。该 canonical JSON 计算 `sha256` 得到 `bundle_digest`，并且 JSON 内的
+`action_id + attempt` 必须与 ledger 当前 attempt、`ActionOutcomeEnvelope` 完全一致。canonical 路径
+精确保留输入的小写 key，不做 casefold、Unicode normalization 或 dot normalization。
+
+参数展开必须生成同样排序的 `ExpectedArtifactManifest`，其中列出 ActionSpec 允许且本次参数实际要求的
+canonical path、media type、evidence role 和必需 metadata keys。实际 bundle 与 expected manifest
+必须逐项精确相等；额外、缺失或重复条目都拒绝。`write_set` 只是权限上界，不能代替 expected manifest。
+
+`ProbeResolution` 是专用 evidence-only outcome，而不是空的 `Succeeded`。Registry 启动时要求
+`probe_capability` 指向独立 capability；该 probe 的 write/effect set 为空、`may_have_side_effects=False`，
+executor 只能读取外部状态并提交 evidence refs。probe Action 的授权参数必须绑定原 ActionSpec、原
+`action_id` 和 `operation_key`；普通 capability 返回 `ProbeResolution` 或 probe capability 返回普通
+`Succeeded` 都是边界错误。
+
+### 7.5 Staging-aware evidence contracts
+
+`StagingEvidenceView` 是 validator 唯一允许读取的项目视图。它将本 `action_id + attempt` bundle 中每个
+逻辑 canonical 输出映射到对应 staged regular file；未被当前 bundle 覆盖的依赖只能从已提交 canonical
+artifact manifest 读取。view 不提供任意项目根路径，也不能看到未提交的其他 attempt。validator 因而不能
+依靠 action 预先写 canonical 来通过。
+
+`GateDecision` 除 pass/reason/message 外必须携带 `bundle_digest`、按 bundle 顺序排列的
+`artifact_checksums` 和稳定 `evidence_refs`（或等价的 typed evidence records）。Committer 只接受与当前
+bundle digest、当前 staged checksum 和 validator version 完全绑定的 PASS；任一引用缺失或重放到另一
+attempt 都 fail closed。
 
 ## 8. Planner 与 PolicyEngine
 
@@ -415,7 +502,10 @@ plan_versions
 actions
 action_attempts
 artifacts
+artifact_bundles
 gate_evidence
+promotion_intents
+probe_resolutions
 incidents
 interrupts
 budget_entries
@@ -428,6 +518,10 @@ event_outbox
 - Action 状态只能经仓储方法和合法 transition 更新。
 - Gate 必须关联 evidence ID、validator version 和输入 artifact checksums。
 - Artifact 记录路径、hash、producer action、attempt 和 committed_at。
+- artifact bundle 记录 canonical JSON/digest、`action_id + attempt`；同一成功 attempt 只能有一个完全一致的
+  bundle，重复不同内容 fail closed。
+- probe resolution 表唯一绑定原 action/attempt、probe action/attempt 和 operation key；重复相同 resolution
+  幂等，任何冲突 disposition/evidence 都拒绝。
 - 业务 commit 与 outbox event 写入同一事务；事件发布后标记 delivered。
 - `events.jsonl`、`metrics.json`、`state/status.json` 是可重建投影，不是真相源。
 
@@ -444,6 +538,23 @@ CANCELLED
 
 不再有不可恢复的全局 `FAILED`。失败属于 Action attempt 或 incident；`BLOCKED` 在外部条件变化后
 仍可恢复。
+
+`RunLedger.resolve_indeterminate()` 是解析外部副作用不确定性的唯一原子 API。调用前由 Registry/
+ProbeResolver 验证 probe capability 与原 ActionSpec 的绑定，并把原 retry policy 的稳定 fingerprint 与
+已授权 action 一起交给 ledger；事务内再次验证原 attempt/action 均为 `INDETERMINATE`、operation key
+一致、probe attempt 仍为 `RUNNING`、probe capability/evidence identity 正确、retry policy fingerprint
+匹配 durable authorization：
+
+- `succeeded`：evidence-only 提交 probe attempt/action，并把原 attempt/action 解析为 `SUCCEEDED`；原操作
+  不重发。
+- `absent`：evidence-only 提交 probe attempt/action；仅当原 retry policy、attempt count 和 error code 允许
+  时把原 Action 转为 `RETRY_WAIT`，否则转为 `BLOCKED` 并记录 incident。
+- `unknown`：evidence-only 提交 probe attempt/action，原 attempt/action 保持 `INDETERMINATE`，run 转为
+  `BLOCKED` 并记录等待人工核对的 incident。
+
+这三条状态变化、probe evidence、`probe_resolutions` 行和 outbox 事件在同一 SQLite 事务中完成。重复提交
+完全相同的 resolution 返回已有事实；不同 disposition、operation key、evidence 或 retry fingerprint
+触发 durable conflict，不得“最后写入者获胜”。
 
 ## 11. Checkpoint 与恢复
 
@@ -473,12 +584,16 @@ LangGraph checkpoint
 | --- | --- |
 | Action 执行前 | 重新派发 |
 | 执行中且没有工件 | 按 retry policy 重试 |
-| staging 已写但 promotion 仍为 `PENDING` | 按第 12 节的 create-only 协议验证并补完，或保留证据进入 `CONFLICT` |
+| bundle 已返回、全部 intents 尚未 durable | attempt 保持 `RUNNING`；不复制 canonical，按同一 bundle 重建全部 intents |
+| bundle 全部 intents 已 durable、部分仍为 `PENDING` | 按第 12 节逐项 create-only 补完；不重跑 Action，不提前提交成功 |
+| 任一 bundle intent 为 `CONFLICT` | attempt 不成功，记录 subject-scoped incident，继续对账该 run/action/attempt 的其余 intents |
+| 全部 promotion 已 `COMMITTED` 但 Action 尚未成功 | Reconciler 复核完整 bundle 与 gate binding，在一个 SQLite 事务中提交 artifacts/evidence/attempt/action success |
 | promotion 已 `COMMITTED` 但进程尚未完成文件系统后验 | Reconciler 只重做 canonical inode/checksum/目录链检查；canonical drift 时补偿为 `CONFLICT`，staging 残留不参与裁决 |
 | ledger 已 commit 但 graph 未 checkpoint | Reconciler 发现已成功并跳过执行 |
 | gate FAIL | 保留证据并 replan 修复动作 |
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
 | 需要人工判断 | `PAUSED_HITL`；以 interrupt/Command 恢复 |
+| 原 Action 为 `INDETERMINATE` | 只授权其绑定的 evidence-only probe；用 `ProbeResolution` 原子解析，禁止重发原操作 |
 | 外部条件缺失 | `BLOCKED`；条件修复后恢复 |
 
 业务事实提供 exactly-once commit。执行是 at-least-once，因此所有 Action 必须有稳定
@@ -503,6 +618,12 @@ Action 不直接覆盖 canonical artifacts。每次 attempt 的 staging 命名�
 state/staging/{action_id}/{attempt}/...
 ```
 
+这是所有 built-in、agent tool handler 和 deterministic builder 的唯一写入命名空间。Agent 仍以逻辑
+canonical relpath 请求写文件，但 ABI handler 必须通过当前 `AttemptStagingWriter` 映射到上述目录并记录
+typed effect；agent 不接触真实 canonical writer。确定性 parser/builder/linter 必须接收 staged sink 或
+`AttemptOutputView`，禁止通过 `BookProject.root / canonical_relpath` 直接写出。任何绕过 writer 的 canonical
+写入都是协议违规，即使最后 bytes 与期望相同也不能用于通过 validator。
+
 `ArtifactStore` 生命周期内固定持有项目根目录 fd 及其 device/inode；staging 与 canonical 的所有
 遍历均相对该 fd，使用 `O_DIRECTORY | O_NOFOLLOW`，并在关键边界重开 durable 路径确认根目录和
 目录链仍绑定到原 inode。`staging_dir()` 只返回展示路径，不授予安全写能力。
@@ -513,20 +634,34 @@ staging 写入采用 create-only 协议：`write_staged_bytes()` 通过 no-follo
 公共 `sha256_file()` 同样以 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` 打开，`fstat` 后只接受 regular
 file，并在所有成功/异常路径关闭 fd；symlink 被拒绝，FIFO 不得阻塞。
 
-validator PASS 后按以下顺序提升：
+Committer 对一个普通成功 bundle 按以下顺序处理，顺序是 binding contract：
 
-1. 通过安全 staging fd 计算 checksum，验证 staged 路径并通过上述词法边界验证 canonical key，
-   然后在 ledger 中唯一预留该 canonical key，写入 `PENDING` promotion intent；
-2. 固定持有 canonical parent dirfd，复核项目根、目录链、staging checksum；
-3. canonical 名称若已存在，只读验证 regular-file/inode/checksum；相同 checksum 是幂等候选，不同
-   checksum 立即进入 `CONFLICT`；
-4. canonical 名称若不存在，直接以
+1. 验证 frozen bundle、唯一排序/canonical JSON、`bundle_digest`、`action_id + attempt`、所有 staged
+   regular files、portable canonical keys、media type/evidence role/metadata、write permissions，并与参数展开
+   得到的 `ExpectedArtifactManifest` 精确匹配；
+2. 构造 staging-aware evidence view，运行确定性 validator，取得绑定相同 bundle digest、staged checksums、
+   validator version 和 evidence refs 的 `GateDecision(PASS)`；
+3. 在一个 SQLite 事务中为 bundle **所有**条目创建 `PENDING` promotion intents。该事务全部成功后才允许
+   对任何 canonical 文件执行复制；不允许一边创建 intent 一边 promote；
+4. 对每项固定持有 canonical parent dirfd，复核项目根、目录链、staging checksum。canonical 名称若已
+   存在，只读验证 regular-file/inode/checksum；相同 checksum 是幂等候选，不同 checksum 进入
+   `CONFLICT`；
+5. canonical 名称若不存在，直接以
    `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK` 打开**最终名称一次**，从已验证的 staged fd
    复制，fsync 并对 canonical fd 计算 checksum；
-5. 证明 canonical 名称仍指向该 fd 的 inode，目录链仍绑定到 pinned root，然后在一个 SQLite 事务
-   中提交 `PENDING → COMMITTED`；
-6. ledger commit 返回后再次检查 canonical fd checksum、名称/inode 和目录链。任何失败都立即在
+6. 证明 canonical 名称仍指向该 fd 的 inode，目录链仍绑定到 pinned root，然后提交该 intent 的
+   `PENDING → COMMITTED`；逐项重复直至 bundle 全部 intents 已处理；
+7. 每项 intent commit 返回后再次检查 canonical fd checksum、名称/inode 和目录链。任何失败都立即在
    SQLite 中原子补偿 `COMMITTED → CONFLICT` 并创建 subject-scoped incident。
+8. 只有所有 intents 都为 `COMMITTED` 时，才在**一个 SQLite 事务**中写 artifact rows、bundle-bound
+   gate evidence、成本/outbox，并把当前 attempt 与 Action 标记 `SUCCEEDED`。任何 `PENDING` 或
+   `CONFLICT` 都禁止成功提交。
+
+文件系统多文件 promotion 明确不是原子操作；第 8 步提供的是 ledger 完整性边界，而不是跨介质或
+跨文件原子性。第 3–8 步任一点崩溃时 attempt 保持 `RUNNING`。启动 Reconciler 按
+`run_id/action_id/attempt` 加载完整 bundle 与全部 intents，恢复未完成 promotions，并在完整 bundle 达标后
+调用同一个 success transaction；它不得重新执行 Action。任一 intent 为 `CONFLICT` 时 attempt/action
+不成功，记录 incident，且仍继续对账其他 intents 以保留完整证据。
 
 权威边界随 durable 状态变化：`PENDING` 期间 staged 是 promotion 输入，所有现有 checksum、regular
 file、dirfd 与目录链检查继续生效；canonical 和 ledger 成功进入 `COMMITTED` 后，canonical + ledger
@@ -535,8 +670,9 @@ staged 路径；staged 被修改、删除或清理不会产生 incident，也不
 staged 的 post-commit 地位，不删除或弱化 canonical 的 commit-window 后验，以及重启后的
 checksum、名称/inode、pinned root 和目录链复核。
 
-第 5 步之前的最后一次文件系统检查与 SQLite 更新之间存在不可消除的窗口；本文**不宣称文件系统与
-SQLite 原子**。若进程在 ledger commit 后、第 6 步之前崩溃，durable 状态暂为 `COMMITTED`；启动
+每项 intent 在第 6 步之前的最后一次文件系统检查与 SQLite 更新之间存在不可消除的窗口；本文
+**不宣称文件系统与 SQLite 原子**。若进程在 intent commit 后、第 7 步之前崩溃，durable 状态暂为
+`COMMITTED`；启动
 Reconciler 必须重做后验，发现 identity/checksum/目录链 drift 时转为 `CONFLICT`，不能继续把该
 intent 当成成功。
 
@@ -554,7 +690,8 @@ canonical 与 staged 证据，记录
 “repair ledger”。crash 后只知道 canonical checksum 不同时可记 `artifact_checksum_conflict`，仍须
 保留所有文件供人工选择。
 
-Promotion intent 的合法状态与恢复语义为：
+下表是 bundle 内**单个** Promotion intent 的合法状态与恢复语义；bundle success 仍要求同一 attempt 的
+所有 intent 均为 `COMMITTED`：
 
 | Durable 状态 | 文件系统证据 | Reconciler 行为 |
 | --- | --- | --- |
@@ -580,21 +717,25 @@ promotion 状态，未来若加入自动 GC 仍须另行证明 no-follow ownersh
 flowchart TD
     EXEC["Action 执行结束"] --> RESULT{"结构化结果类型"}
 
-    RESULT -- "Succeeded" --> VALIDATE["确定性验证"]
+    RESULT -- "Succeeded(bundle)" --> VALIDATE["staging-aware 确定性验证"]
     RESULT -- "RetryableFailure" --> RETRY["按 retry policy 重试"]
     RESULT -- "RepairRequired" --> REPAIR["提交缺陷证据<br/>Planner 生成其他修复 Action"]
     RESULT -- "PermanentFailure" --> PERM["Action = PERMANENT_FAILED<br/>记录不可变 incident"]
-    RESULT -- "Indeterminate" --> PROBE["运行 reconcile / probe<br/>禁止直接重复副作用"]
+    RESULT -- "Indeterminate" --> PROBE["运行绑定的只读 probe<br/>禁止直接重复副作用"]
+    RESULT -- "ProbeResolution" --> CHECKPROBE["校验 probe capability<br/>operation key · original status"]
     RESULT -- "Paused" --> PAUSE["PAUSED_BUDGET / PAUSED_HITL"]
 
     PERM --> ALT{"存在策略允许的替代能力？"}
     ALT -- "是" --> REPLAN["生成替代计划"]
     ALT -- "否" --> BLOCKED["Run = BLOCKED<br/>等待外部处理"]
 
-    PROBE --> KNOWN{"结果可以确定？"}
-    KNOWN -- "已成功" --> VALIDATE
-    KNOWN -- "确认未执行" --> RETRY
-    KNOWN -- "仍无法确定" --> PAUSE
+    PROBE --> CHECKPROBE
+    CHECKPROBE --> KNOWN{"disposition"}
+    KNOWN -- "succeeded" --> RESOLVED["原 Action = SUCCEEDED<br/>不重发"]
+    KNOWN -- "absent" --> RETRYPOLICY{"原 retry policy 允许？"}
+    RETRYPOLICY -- "是" --> RETRY
+    RETRYPOLICY -- "否" --> BLOCKED
+    KNOWN -- "unknown" --> UNKNOWNBLOCKED["原 attempt 保持 INDETERMINATE<br/>Run = BLOCKED / 人工核对"]
 ```
 
 分类规则：
@@ -606,9 +747,16 @@ flowchart TD
 | `PermanentFailure` | 相同能力和输入不会成功 | 版权禁止、格式不支持、权限永久拒绝、invariant 冲突 | 替代能力或 `BLOCKED` |
 | `Indeterminate` | 副作用可能已发生 | 发布超时、commit 后崩溃 | probe/reconcile，禁止盲重试 |
 | `Paused` | 等待预算或人类 | 预算上限、敏感动作确认 | interrupt 后恢复 |
+| `ProbeResolution` | 只读 probe 对原 operation 的专用裁决 | 外部幂等查询、发布状态核对 | 经 ledger 原子 resolve；不能作为普通成功 |
 
 不根据异常类名字符串猜测语义。每个 ActionSpec 明确列出可重试错误和最大尝试；未分类异常默认
 `PermanentFailure` 或 `Indeterminate`（如果可能产生外部副作用），采用 fail-closed。
+
+Probe 自身的 attempt 以 evidence-only 方式提交，不创建 artifact bundle/promotion intent。Registry 与
+ProbeResolver 同时校验它是原 ActionSpec 唯一绑定的 probe capability，且 `operation_key` 与原
+`Indeterminate` 完全一致。相同 resolution 重放幂等；`succeeded/absent/unknown` 之间的冲突重放、错误
+probe capability、原状态已经改变或 operation key 不同一律 fail closed 并留下 incident。`unknown` 不是
+pause 成功：原 attempt 保持 `INDETERMINATE`，run 明确进入 `BLOCKED` 等待人工或新的外部证据。
 
 ## 14. 并发与调度
 
@@ -674,8 +822,14 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 - read/write 冲突；
 - terminal policy；
 - ActionOutcome 分类；
+- frozen bundle 的唯一排序/canonical JSON、非空、duplicate/path/type/identity 拒绝；
+- 参数展开的 expected effect manifest 与实际 bundle 对额外/缺失项均 fail closed；
+- agent handler 与 deterministic builder 都只能通过 attempt-scoped writer 写 staging；
+- staging-aware validator 覆盖当前输出、只读其余 committed canonical，并绑定 bundle digest/checksums；
 - ledger transition 和事务回滚；
-- artifact promotion 与 checksum 冲突。
+- 全部 intents durable 之前零 canonical copy、完整 bundle 前零 ledger success；
+- artifact promotion 与 checksum 冲突；
+- ProbeResolution 的 capability/operation/status/retry/idempotency 校验与冲突重放。
 
 ### 17.2 Planner eval
 
@@ -691,9 +845,12 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 在每个 checkpoint/commit 边界注入崩溃，验证：
 
 - 已提交 Action 不重复；
-- 未提交 staging 可验证并保留；本协议不自动清理 staging；
+- 未提交 staging bundle 可验证并保留；本协议不自动清理 staging；
+- 多文件 bundle 在每个 intent/copy/postcheck/success transaction 边界崩溃后按 attempt 恢复且不重跑 Action；
+- 任一 `CONFLICT` 阻止整个 bundle 成功，但不阻断其他 intent 对账；
 - ledger commit 后 graph crash 能跳过；
-- `Indeterminate` 不会盲重试；
+- `Indeterminate` 的 `succeeded/absent/unknown` probe matrix 不会盲重试，重复相同 resolution 幂等且冲突
+  resolution fail closed；
 - budget/HITL/blocked 可恢复；
 - outbox 不丢事件且不会重复投影业务事实。
 
@@ -719,8 +876,12 @@ validator version、错误分类、成本和 trace IDs。敏感正文是否进�
 src/abi/
 ├── types/orchestration.py          # frozen 领域模型
 ├── project/run_ledger.py           # SQLite 业务真相
+├── project/artifacts.py            # attempt writer、bundle intents 与 create-only promotion
 ├── actions/
 │   ├── registry.py                 # ActionSpec 注册与启动校验
+│   ├── effects.py                  # 参数 → ExpectedArtifactManifest
+│   ├── evidence.py                 # StagingEvidenceView
+│   ├── validators.py               # staging-aware deterministic gates
 │   ├── predicates.py               # eligibility / terminal policy
 │   ├── outcomes.py                 # ActionOutcome
 │   └── builtins/                    # 领域 Action 定义
@@ -760,12 +921,17 @@ dict/Any。
 2. Planner 只能产出强类型 `PlanPatch`；非法计划被 PolicyEngine fail-closed 拒绝。
 3. 所有 Action 通过 Registry 声明前置条件、证据、工具、retry 和 read/write 集合。
 4. RunLedger 是唯一业务真相，投影可从它重建。
-5. Action staging、validator、promotion、ledger commit 和 reconcile 通过故障注入测试。
-6. `PermanentFailure`、`RepairRequired`、`Indeterminate`、预算暂停和 HITL 都有端到端测试。
-7. 恢复不会重复已提交业务事实；不确定副作用不会盲重试。
-8. 动态并行不会产生未声明的写冲突。
-9. 所有 LLM 与子 agent 调用仍受预算、Langfuse 和本地事件管道覆盖。
-10. 现有 L2/L3 质量门禁和全量自动化测试通过。
+5. 所有写操作都经 attempt-scoped writer；非空 typed bundle 与 expected manifest 精确匹配，validator
+   只读 staging-aware evidence view 并绑定 digest/checksum。
+6. 完整 bundle 的所有 intents 先 durable、后逐项 promote；只有全部 `COMMITTED` 才在一个 SQLite
+   事务中提交 artifacts/gates/success，且文档和实现均不声称文件系统多文件或跨介质原子。
+7. 崩溃恢复按 run/action/attempt 对账完整 bundle、不重跑 Action；任一 conflict 阻止成功并记录 incident。
+8. `PermanentFailure`、`RepairRequired`、`Indeterminate`、三种 `ProbeResolution`、预算暂停和 HITL 都有
+   端到端测试；probe 重放相同裁决幂等、冲突裁决 fail closed。
+9. 恢复不会重复已提交业务事实；不确定副作用不会盲重试。
+10. 动态并行不会产生未声明的写冲突。
+11. 所有 LLM 与子 agent 调用仍受预算、Langfuse 和本地事件管道覆盖。
+12. 现有 L2/L3 质量门禁和全量自动化测试通过。
 
 ## 21. 明确放弃的替代方案
 
