@@ -14,12 +14,13 @@ import pytest
 
 from abi.orchestrator.driver import Orchestrator
 from abi.project import ScaffoldRequest, Status, scaffold_project
-from abi.providers.agent_runtime.runner import AgentResult
+from abi.providers.agent_runtime import AgentActionRequest
 from abi.tools.context import ToolContext
+from abi.types.orchestration import AgentRunResult, Succeeded
 
 
 class _FakeServices:
-    """Minimal stand-in for RunServices: only .agent.run, .events, .metrics, .flush."""
+    """Minimal stand-in for RunServices and its Action runtime."""
 
     def __init__(self, project, ingest_split, gates) -> None:
         self.agent = _FakeAgent(project, ingest_split, gates)
@@ -49,11 +50,16 @@ class _FakeAgent:
         self._ingest_split = ingest_split
         self._gates = gates
 
-    async def run(self, *, agent_name: str, **_: object) -> AgentResult:
-        self._ingest_split(agent_name, self._p)
-        self._gates(agent_name, self._p)
-        return AgentResult(final_text=f"done {agent_name}", messages=[], tool_calls=0,
-                           llm_calls=0, cost_usd=0.0)
+    async def run_action(self, request: AgentActionRequest) -> AgentRunResult:
+        self._ingest_split(request.agent_name, self._p)
+        self._gates(request.agent_name, self._p)
+        return AgentRunResult(
+            outcome=Succeeded(staging_relpath="state/staging/offline/result.json"),
+            tool_calls=0,
+            llm_calls=0,
+            cost_usd=0.0,
+            stopped_reason="completed",
+        )
 
 
 def _make_stage_writer(project):
@@ -67,7 +73,9 @@ def _make_stage_writer(project):
         elif sid.startswith("02"):
             p.toc_json.write_text("[]", encoding="utf-8")
             for i in (1, 2):
-                (p.chapters_src / f"{i:03d}_c.md").write_text(f"# C{i}\n\nsrc {i}\n", encoding="utf-8")
+                (p.chapters_src / f"{i:03d}_c.md").write_text(
+                    f"# C{i}\n\nsrc {i}\n", encoding="utf-8"
+                )
         elif sid.startswith("03"):
             (p.root / "qa/benchmark").mkdir(parents=True, exist_ok=True)
             (p.root / "qa/benchmark/global_research_ack.md").write_text("ack", encoding="utf-8")
@@ -87,34 +95,50 @@ def _make_stage_writer(project):
                 p.chapter_control(f.stem).write_text(
                     "scope: FULL_CHAPTER\nissues_found: 0\nfixes_applied: 0\n"
                     "unresolved_blocking_issues: 0\nlatest_round_status: PASS\n"
-                    "allow_next_chapter: true\n", encoding="utf-8")
+                    "allow_next_chapter: true\n",
+                    encoding="utf-8",
+                )
         elif sid.startswith("11"):
             for f in p.chapters_translated.glob("*.md"):
                 p.chapter_gate(f.stem).write_text("result: PASS\n", encoding="utf-8")
-                (p.chapters_final / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+                (p.chapters_final / f.name).write_text(
+                    f.read_text(encoding="utf-8"), encoding="utf-8"
+                )
         elif sid.startswith("13"):
-            p.book_yaml.write_text("title: 书\nlanguage: zh-Hans\nidentifier: ''\n", encoding="utf-8")
+            p.book_yaml.write_text(
+                "title: 书\nlanguage: zh-Hans\nidentifier: ''\n", encoding="utf-8"
+            )
             p.production_spec.write_text("spec", encoding="utf-8")
         elif sid.startswith("14"):
             from abi.epub.build import build_sample_epub
+
             build_sample_epub(p)
             p.sample_review.write_text("sample_review_status: PASS\n", encoding="utf-8")
         elif sid.startswith("15"):
             from abi.epub import asset_manifest_check, build_epub, publication_lint
+
             publication_lint(p)
             asset_manifest_check(p)
             build_epub(p)
         elif sid.startswith("16a"):
             from abi.qa import select_random_review_passages, validate_random_spotcheck
+
             for _ in range(2):
                 select_random_review_passages(p, agents=2)
                 rd = sorted(p.random_spotcheck_dir.glob("round_*"))[-1]
                 for lbl in ("agent_a", "agent_b"):
                     (rd / "reviews" / f"{lbl}_summary.json").write_text(
-                        json.dumps({"average_score": 95, "lowest_score": 91,
-                                    "open_p0_p1_p2": 0, "confidence": 0.9,
-                                    "samples": [{"unit_id": "x", "score": 95}]}),
-                        encoding="utf-8")
+                        json.dumps(
+                            {
+                                "average_score": 95,
+                                "lowest_score": 91,
+                                "open_p0_p1_p2": 0,
+                                "confidence": 0.9,
+                                "samples": [{"unit_id": "x", "score": 95}],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
                 validate_random_spotcheck(p)
         elif sid.startswith("16_"):
             for lbl in ("agent_a", "agent_b"):
@@ -122,12 +146,15 @@ def _make_stage_writer(project):
                 (p.root / f"reviews/{lbl}/review.md").write_text("result: PASS\n", encoding="utf-8")
         elif sid.startswith("18a"):
             from abi.release import create_release
+
             create_release(p)
         elif sid.startswith("18_"):
             p.final_manifest.write_text("manifest", encoding="utf-8")
         elif sid.startswith("19"):
             p.retrospective.write_text("retro", encoding="utf-8")
-            (p.root / "retrospective/template_update_suggestions.md").write_text("s", encoding="utf-8")
+            (p.root / "retrospective/template_update_suggestions.md").write_text(
+                "s", encoding="utf-8"
+            )
 
     return write
 
@@ -136,8 +163,11 @@ def _make_stage_writer(project):
 async def test_full_pipeline_offline(tmp_path: Path) -> None:
     project = scaffold_project(
         ScaffoldRequest(
-            target_root=tmp_path / "zh-Hans", book_slug="t", source_lang="en",
-            target_lang="zh-Hans", source_target="en-zh-Hans",
+            target_root=tmp_path / "zh-Hans",
+            book_slug="t",
+            source_lang="en",
+            target_lang="zh-Hans",
+            source_target="en-zh-Hans",
         )
     )
     writer = _make_stage_writer(project)

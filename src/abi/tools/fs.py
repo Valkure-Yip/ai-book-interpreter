@@ -4,14 +4,49 @@ from __future__ import annotations
 
 import re
 
-from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import Field
 
 from abi.tools.context import ToolContext
+from abi.types._base import FrozenModel
+from abi.types.tools import ToolBinding
 
 _MAX_READ_CHARS = 60_000
 
 
-def make_fs_tools(ctx: ToolContext) -> list[BaseTool]:
+class ReadFileInput(FrozenModel):
+    path: str = Field(description="Project-relative UTF-8 text file path.")
+
+
+class WriteFileInput(FrozenModel):
+    path: str = Field(description="Project-relative output file path.")
+    content: str = Field(description="Complete UTF-8 file content.")
+
+
+class AppendFileInput(FrozenModel):
+    path: str = Field(description="Project-relative output file path.")
+    content: str = Field(description="UTF-8 text to append.")
+
+
+class EditFileInput(FrozenModel):
+    path: str = Field(description="Project-relative UTF-8 text file path.")
+    old_string: str = Field(description="Exact first occurrence to replace.")
+    new_string: str = Field(description="Replacement text.")
+
+
+class ListDirInput(FrozenModel):
+    path: str = Field(default=".", description="Project-relative directory path.")
+
+
+class GlobInput(FrozenModel):
+    pattern: str = Field(description="Project-relative glob pattern.")
+
+
+class GrepInput(FrozenModel):
+    pattern: str = Field(description="Regular expression to search for.")
+    path_glob: str = Field(default="**/*.md", description="Files to search.")
+
+
+def make_fs_tools(ctx: ToolContext) -> list[ToolBinding]:
     def read_file(path: str) -> str:
         """Read a UTF-8 text file inside the project. Path is project-relative."""
         p = ctx.resolve(path)
@@ -21,7 +56,9 @@ def make_fs_tools(ctx: ToolContext) -> list[BaseTool]:
             return f"ERROR: {path} is a directory; use list_dir."
         text = p.read_text(encoding="utf-8", errors="replace")
         if len(text) > _MAX_READ_CHARS:
-            return text[:_MAX_READ_CHARS] + f"\n\n[...truncated {len(text) - _MAX_READ_CHARS} chars]"
+            return (
+                text[:_MAX_READ_CHARS] + f"\n\n[...truncated {len(text) - _MAX_READ_CHARS} chars]"
+            )
         return text
 
     def write_file(path: str, content: str) -> str:
@@ -66,9 +103,7 @@ def make_fs_tools(ctx: ToolContext) -> list[BaseTool]:
 
     def glob(pattern: str) -> str:
         """Glob project files, e.g. 'chapters/final/*.md'. Returns relative paths."""
-        matches = sorted(
-            ctx.project.rel(p) for p in ctx.project.root.glob(pattern) if p.is_file()
-        )
+        matches = sorted(ctx.project.rel(p) for p in ctx.project.root.glob(pattern) if p.is_file())
         return "\n".join(matches) if matches else "(no matches)"
 
     def grep(pattern: str, path_glob: str = "**/*.md") -> str:
@@ -82,7 +117,9 @@ def make_fs_tools(ctx: ToolContext) -> list[BaseTool]:
             if not p.is_file():
                 continue
             try:
-                for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                for i, line in enumerate(
+                    p.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+                ):
                     if rx.search(line):
                         out.append(f"{ctx.project.rel(p)}:{i}: {line.strip()[:200]}")
                         if len(out) >= 200:
@@ -93,11 +130,15 @@ def make_fs_tools(ctx: ToolContext) -> list[BaseTool]:
         return "\n".join(out) if out else "(no matches)"
 
     return [
-        StructuredTool.from_function(read_file),
-        StructuredTool.from_function(write_file),
-        StructuredTool.from_function(append_file),
-        StructuredTool.from_function(edit_file),
-        StructuredTool.from_function(list_dir),
-        StructuredTool.from_function(glob),
-        StructuredTool.from_function(grep),
+        ToolBinding("read_file", read_file.__doc__ or "Read a file.", ReadFileInput, read_file),
+        ToolBinding(
+            "write_file", write_file.__doc__ or "Write a file.", WriteFileInput, write_file
+        ),
+        ToolBinding(
+            "append_file", append_file.__doc__ or "Append a file.", AppendFileInput, append_file
+        ),
+        ToolBinding("edit_file", edit_file.__doc__ or "Edit a file.", EditFileInput, edit_file),
+        ToolBinding("list_dir", list_dir.__doc__ or "List a directory.", ListDirInput, list_dir),
+        ToolBinding("glob", glob.__doc__ or "Glob files.", GlobInput, glob),
+        ToolBinding("grep", grep.__doc__ or "Search files.", GrepInput, grep),
     ]

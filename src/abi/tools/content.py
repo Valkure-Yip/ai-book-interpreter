@@ -6,21 +6,31 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
-
-from langchain_core.tools import BaseTool, StructuredTool
 
 from abi.ir import ingest
 from abi.ir.split import split_book_to_chapters, write_toc_json
 from abi.ir.toc_refiner import needs_refinement, refine_toc_with_llm
 from abi.project.state import Status
 from abi.tools.context import ToolContext
+from abi.types._base import FrozenModel
 from abi.types.book import Book
+from abi.types.orchestration import RunSnapshot
+from abi.types.tools import ToolBinding
 
 _log = logging.getLogger(__name__)
 
 
-def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
+class EmptyInput(FrozenModel):
+    """No arguments are accepted by this tool."""
+
+
+def make_content_tools(
+    ctx: ToolContext,
+    *,
+    get_run_snapshot: Callable[[], RunSnapshot] | None = None,
+) -> list[ToolBinding]:
     project = ctx.project
 
     def ingest_source() -> str:
@@ -34,8 +44,10 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
         epubs = sorted(project.root.glob("source/*.epub"))
         src_path = raw if raw.exists() else (epubs[0] if epubs else None)
         if src_path is None:
-            return ("ERROR: no source found. Place the source text at "
-                    "source/source_text_raw.txt or an .epub under source/.")
+            return (
+                "ERROR: no source found. Place the source text at "
+                "source/source_text_raw.txt or an .epub under source/."
+            )
         book, warnings = ingest(src_path)
         paras = book.iter_paragraphs()
         clean = "\n\n".join(p.source_text for p in paras if p.source_text.strip())
@@ -56,12 +68,17 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         st = ctx.state()
-        st.advance(Status.SOURCE_INGESTED, step="01_ingest_clean",
-                   note=f"{len(paras)} paragraphs, {len(book.toc)} sections")
+        st.advance(
+            Status.SOURCE_INGESTED,
+            step="01_ingest_clean",
+            note=f"{len(paras)} paragraphs, {len(book.toc)} sections",
+        )
         st.record_artifact("source_clean", project.rel(project.source_clean))
         ctx.save_state(st)
-        return (f"ingested {book.meta.source_format}: {len(book.toc)} sections, "
-                f"{len(paras)} paragraphs. Wrote source_text.txt + source_manifest.json.")
+        return (
+            f"ingested {book.meta.source_format}: {len(book.toc)} sections, "
+            f"{len(paras)} paragraphs. Wrote source_text.txt + source_manifest.json."
+        )
 
     def _maybe_refine_toc(book: Book, warnings: list[str], src_path: Path) -> Book:
         """Run Pass 0.5 LLM TOC refinement if the heuristic result is suspect."""
@@ -69,9 +86,12 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
             return book
         if not needs_refinement(book, warnings):
             return book
-        _log.info("toc_refiner: Pass 0 produced suspect structure (%d sections, "
-                   "%d paragraphs), running Pass 0.5 LLM refinement",
-                   len(book.toc), len(book.iter_paragraphs()))
+        _log.info(
+            "toc_refiner: Pass 0 produced suspect structure (%d sections, "
+            "%d paragraphs), running Pass 0.5 LLM refinement",
+            len(book.toc),
+            len(book.iter_paragraphs()),
+        )
         raw_text = src_path.read_text(encoding="utf-8", errors="replace")
         try:
             refined = asyncio.get_event_loop().run_until_complete(
@@ -79,19 +99,16 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
             )
         except RuntimeError:
             # No running event loop; create one.
-            refined = asyncio.run(
-                refine_toc_with_llm(book, raw_text, router=ctx.services.router)
-            )
+            refined = asyncio.run(refine_toc_with_llm(book, raw_text, router=ctx.services.router))
         if len(refined.toc) > len(book.toc):
-            _log.info("toc_refiner: refined %d -> %d sections",
-                       len(book.toc), len(refined.toc))
+            _log.info("toc_refiner: refined %d -> %d sections", len(book.toc), len(refined.toc))
             ctx.services.events.event(
                 "toc.refinement.applied",
-                before=len(book.toc), after=len(refined.toc),
+                before=len(book.toc),
+                after=len(refined.toc),
             )
             return refined
-        _log.info("toc_refiner: refinement did not improve (kept %d sections)",
-                   len(book.toc))
+        _log.info("toc_refiner: refinement did not improve (kept %d sections)", len(book.toc))
         ctx.services.events.event("toc.refinement.skipped", reason="no improvement")
         return book
 
@@ -107,52 +124,38 @@ def make_content_tools(ctx: ToolContext) -> list[BaseTool]:
         entries = split_book_to_chapters(book, project.chapters_src)
         write_toc_json(entries, project.toc_json)
         st = ctx.state()
-        st.advance(Status.SOURCE_SPLIT, step="02_split",
-                   note=f"{len(entries)} chapters")
+        st.advance(Status.SOURCE_SPLIT, step="02_split", note=f"{len(entries)} chapters")
         st.record_artifact("toc", project.rel(project.toc_json))
         ctx.save_state(st)
         listing = "\n".join(f"  {e.slug} ({e.paragraph_count} paras)" for e in entries[:60])
         return f"split into {len(entries)} chapters:\n{listing}"
 
-    def get_state() -> str:
-        """Return the current pipeline state (status, step, gates, artifacts)."""
-        st = ctx.state()
-        return json.dumps(
-            {
-                "status": st.status.value,
-                "current_step": st.current_step,
-                "last_error": st.last_error,
-                "gates": st.gates,
-                "artifacts": st.artifacts,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    def set_state(status: str, step: str, note: str = "") -> str:
-        """Advance the pipeline state. status must be a valid Status name."""
-        try:
-            new_status = Status(status)
-        except ValueError:
-            valid = ", ".join(s.value for s in Status)
-            return f"ERROR: invalid status {status!r}. Valid: {valid}"
-        st = ctx.state()
-        st.advance(new_status, step=step, note=note)
-        ctx.save_state(st)
-        project.append_log(f"state -> {new_status.value} ({step}) {note}")
-        return f"state advanced to {new_status.value}"
-
-    def record_gate(name: str, result: str) -> str:
-        """Record a gate result, e.g. record_gate('pretranslation', 'PASS')."""
-        st = ctx.state()
-        st.record_gate(name, result)
-        ctx.save_state(st)
-        return f"gate {name} = {result}"
+    def read_run_snapshot() -> str:
+        """Return the Action-scoped, read-only RunLedger snapshot as JSON."""
+        if get_run_snapshot is None:
+            return (
+                "ERROR: this Action has no run snapshot callback. "
+                "Bind get_run_snapshot when constructing its tool belt."
+            )
+        return json.dumps(get_run_snapshot().model_dump(mode="json"), ensure_ascii=False, indent=2)
 
     return [
-        StructuredTool.from_function(ingest_source),
-        StructuredTool.from_function(split_chapters),
-        StructuredTool.from_function(get_state),
-        StructuredTool.from_function(set_state),
-        StructuredTool.from_function(record_gate),
+        ToolBinding(
+            "ingest_source",
+            ingest_source.__doc__ or "Ingest the source.",
+            EmptyInput,
+            ingest_source,
+        ),
+        ToolBinding(
+            "split_chapters",
+            split_chapters.__doc__ or "Split chapters.",
+            EmptyInput,
+            split_chapters,
+        ),
+        ToolBinding(
+            "get_run_snapshot",
+            read_run_snapshot.__doc__ or "Read the current run snapshot.",
+            EmptyInput,
+            read_run_snapshot,
+        ),
     ]

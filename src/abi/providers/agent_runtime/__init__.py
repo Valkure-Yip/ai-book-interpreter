@@ -1,7 +1,7 @@
-"""Agent runtime: LangGraph tool-calling loop with shared budget + observability."""
+"""Provider-owned LangChain Action harness."""
 
 from __future__ import annotations
 
-from abi.providers.agent_runtime.runner import AgentResult, AgentRuntime
+from abi.providers.agent_runtime.runner import AgentActionRequest, AgentRuntime
 
-__all__ = ["AgentResult", "AgentRuntime"]
+__all__ = ["AgentActionRequest", "AgentRuntime"]

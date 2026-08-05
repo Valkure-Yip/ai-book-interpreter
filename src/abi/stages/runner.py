@@ -11,9 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from abi.prompts.stages import StageSpec, get_stage_registry
+from abi.providers.agent_runtime import AgentActionRequest
 from abi.stages.validators import validate
 from abi.tools.belt import ToolBelt
 from abi.tools.context import ToolContext
+from abi.types.tools import ToolBinding
 
 
 @dataclass
@@ -37,7 +39,7 @@ def _prompt_vars(ctx: ToolContext) -> dict[str, object]:
     }
 
 
-def _tools_for(spec: StageSpec, belt: ToolBelt):
+def _tools_for(spec: StageSpec, belt: ToolBelt) -> list[ToolBinding]:
     if spec.tool_profile == "production":
         return belt.production()
     if spec.tool_profile == "review":
@@ -64,18 +66,20 @@ async def run_stage(
         user_prompt = stage_prompt
         if attempt > 1:
             user_prompt = (
-                stage_prompt
-                + f"\n\n## RETRY (attempt {attempt})\nThe previous attempt did not "
+                stage_prompt + f"\n\n## RETRY (attempt {attempt})\nThe previous attempt did not "
                 f"satisfy the deterministic gate. Reason: {last_reason}\nInspect the "
                 "current files, fix the gap, and finish the stage."
             )
-        result = await ctx.services.agent.run(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            tools=tools,
-            agent_name=spec.stage_id,
-            max_iterations=spec.max_iterations,
-            thread_id=f"{spec.stage_id}#{attempt}",
+        result = await ctx.services.agent.run_action(
+            AgentActionRequest(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools=tuple(tools),
+                agent_name=spec.stage_id,
+                max_iterations=spec.max_iterations,
+                thread_id=f"{spec.stage_id}#{attempt}",
+                checkpoint_path=ctx.project.graph_checkpoints,
+            )
         )
         total_cost += result.cost_usd
 

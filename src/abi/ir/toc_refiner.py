@@ -145,7 +145,7 @@ async def refine_toc_with_llm(
     Returns a new ``Book`` with the refined TOC, or the original ``book``
     unchanged on any failure.
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from abi.providers.llm.factory import system_message, user_message
 
     candidates = extract_candidates(raw_text)
     if not candidates:
@@ -153,7 +153,7 @@ async def refine_toc_with_llm(
         return book
 
     user_prompt = _build_user_prompt(candidates)
-    messages = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=user_prompt)]
+    messages = [system_message(_SYSTEM_PROMPT), user_message(user_prompt)]
 
     try:
         response, _llm_resp = await router.invoke_structured(

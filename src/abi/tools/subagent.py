@@ -7,13 +7,20 @@ message history and a read-only-ish tool subset.
 
 from __future__ import annotations
 
-from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import Field
 
 from abi.tools.context import ToolContext
 from abi.tools.fs import make_fs_tools
+from abi.types._base import FrozenModel
+from abi.types.tools import ToolBinding
 
 
-def make_subagent_tools(ctx: ToolContext) -> list[BaseTool]:
+class SpawnReviewAgentInput(FrozenModel):
+    agent_label: str = Field(description="Short isolated reviewer identifier.")
+    instructions: str = Field(description="Complete review assignment and output path.")
+
+
+def make_subagent_tools(ctx: ToolContext) -> list[ToolBinding]:
     async def spawn_review_agent(agent_label: str, instructions: str) -> str:
         """Spawn an independent review sub-agent with an isolated context.
 
@@ -31,16 +38,27 @@ def make_subagent_tools(ctx: ToolContext) -> list[BaseTool]:
         )
         # Read-only-ish subset: fs tools (the reviewer writes only its own report).
         tools = make_fs_tools(ctx)
-        result = await ctx.services.agent.run(
-            system_prompt=system,
-            user_prompt=instructions,
-            tools=tools,
-            agent_name=f"review_{agent_label}",
-            max_iterations=30,
-            thread_id=f"review_{agent_label}",
+        from abi.providers.agent_runtime import AgentActionRequest
+
+        result = await ctx.services.agent.run_action(
+            AgentActionRequest(
+                system_prompt=system,
+                user_prompt=instructions,
+                tools=tuple(tools),
+                agent_name=f"review_{agent_label}",
+                checkpoint_path=ctx.project.graph_checkpoints,
+                max_iterations=30,
+                thread_id=f"review_{agent_label}",
+                may_have_side_effects=True,
+            )
         )
-        return result.final_text or f"(sub-agent {agent_label} finished: {result.stopped_reason})"
+        return result.outcome.model_dump_json()
 
     return [
-        StructuredTool.from_function(coroutine=spawn_review_agent),
+        ToolBinding(
+            "spawn_review_agent",
+            spawn_review_agent.__doc__ or "Spawn an isolated review agent.",
+            SpawnReviewAgentInput,
+            spawn_review_agent,
+        ),
     ]

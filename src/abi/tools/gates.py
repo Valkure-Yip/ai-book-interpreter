@@ -7,12 +7,42 @@ PASS/FAIL summary the agent must obey before advancing state.
 
 from __future__ import annotations
 
-from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import Field
 
 from abi.tools.context import ToolContext
+from abi.types._base import FrozenModel
+from abi.types.tools import ToolBinding
 
 
-def make_gate_tools(ctx: ToolContext) -> list[BaseTool]:
+class EmptyInput(FrozenModel):
+    """No arguments are accepted by this tool."""
+
+
+class BuildSampleEpubInput(FrozenModel):
+    chapter_slugs: str = Field(
+        default="", description="Comma-separated chapter stems; empty selects the first chapter."
+    )
+
+
+class EpubcheckInput(FrozenModel):
+    epub_path: str = Field(default="output/book.epub", description="Project-relative EPUB path.")
+
+
+class SelectRandomReviewInput(FrozenModel):
+    agents: int = Field(default=2, ge=1)
+    samples_per_agent: int = Field(default=120, ge=1)
+    target_confidence: float = Field(default=0.80, ge=0, le=1)
+
+
+class ValidateRandomSpotcheckInput(FrozenModel):
+    require_pass: bool = True
+
+
+class CreateReleaseInput(FrozenModel):
+    version: str = Field(default="", description="Optional explicit release version.")
+
+
+def make_gate_tools(ctx: ToolContext) -> list[ToolBinding]:
     project = ctx.project
 
     def publication_lint() -> str:
@@ -100,12 +130,42 @@ def make_gate_tools(ctx: ToolContext) -> list[BaseTool]:
         return res.summary()
 
     return [
-        StructuredTool.from_function(publication_lint),
-        StructuredTool.from_function(asset_manifest_check),
-        StructuredTool.from_function(build_sample_epub),
-        StructuredTool.from_function(build_epub),
-        StructuredTool.from_function(epubcheck),
-        StructuredTool.from_function(select_random_review_passages),
-        StructuredTool.from_function(validate_random_spotcheck),
-        StructuredTool.from_function(create_release),
+        ToolBinding(
+            "publication_lint",
+            publication_lint.__doc__ or "Run publication lint.",
+            EmptyInput,
+            publication_lint,
+        ),
+        ToolBinding(
+            "asset_manifest_check",
+            asset_manifest_check.__doc__ or "Check assets.",
+            EmptyInput,
+            asset_manifest_check,
+        ),
+        ToolBinding(
+            "build_sample_epub",
+            build_sample_epub.__doc__ or "Build a sample EPUB.",
+            BuildSampleEpubInput,
+            build_sample_epub,
+        ),
+        ToolBinding("build_epub", build_epub.__doc__ or "Build EPUB.", EmptyInput, build_epub),
+        ToolBinding("epubcheck", epubcheck.__doc__ or "Run EPUBCheck.", EpubcheckInput, epubcheck),
+        ToolBinding(
+            "select_random_review_passages",
+            select_random_review_passages.__doc__ or "Select review passages.",
+            SelectRandomReviewInput,
+            select_random_review_passages,
+        ),
+        ToolBinding(
+            "validate_random_spotcheck",
+            validate_random_spotcheck.__doc__ or "Validate the latest spot check.",
+            ValidateRandomSpotcheckInput,
+            validate_random_spotcheck,
+        ),
+        ToolBinding(
+            "create_release",
+            create_release.__doc__ or "Create a release.",
+            CreateReleaseInput,
+            create_release,
+        ),
     ]
