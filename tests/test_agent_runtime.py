@@ -178,13 +178,11 @@ class _DeliveryInput(FrozenModel):
 
 class _SequentialInterruptState(TypedDict, total=False):
     messages: list[object]
-    structured_response: object
 
 
 class _ParallelInterruptState(TypedDict, total=False):
     messages: list[object]
     effects: Annotated[list[str], operator.add]
-    structured_response: object
 
 
 class _LoopingModel(BaseChatModel):
@@ -253,17 +251,7 @@ class _SideEffectModel(BaseChatModel):
 
 
 def _success_message(*, evidence: list[str] | None = None) -> AIMessage:
-    return AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "ActionOutcomeEnvelope",
-                "args": {**_succeeded_envelope_payload(evidence_refs=evidence)},
-                "id": "outcome-success",
-                "type": "tool_call",
-            }
-        ],
-    )
+    return AIMessage(content=(evidence or ["completed"])[0])
 
 
 class _RecordingOutcomeModel(BaseChatModel):
@@ -291,6 +279,35 @@ class _RecordingOutcomeModel(BaseChatModel):
     ) -> ChatResult:
         self.human_counts.append(sum(message.type == "human" for message in messages))
         return ChatResult(generations=[ChatGeneration(message=_success_message())])
+
+
+class _PlainCompletionModel(BaseChatModel):
+    bound_tool_choices: list[str | None] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "plain-completion-test-model"
+
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Any],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.bound_tool_choices.append(tool_choice)
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="work complete"))]
+        )
 
 
 class _LabeledOutcomeModel(_RecordingOutcomeModel):
@@ -529,6 +546,48 @@ def _runtime(tmp_path: Path, model: BaseChatModel, *, cap: float | None = None) 
     return runner._set_model_for_testing(runtime, model)
 
 
+@pytest.mark.parametrize(
+    ("thinking_mode", "expected_extra_body"),
+    (
+        ("provider_default", None),
+        ("disabled", {"thinking": {"type": "disabled"}}),
+    ),
+)
+def test_agent_runtime_applies_explicit_provider_thinking_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    thinking_mode: str,
+    expected_extra_body: dict[str, object] | None,
+) -> None:
+    """Catch tool-choice requests reaching thinking-only compatible endpoints."""
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    captured: list[dict[str, object]] = []
+
+    def recording_chat_openai(**kwargs: object) -> object:
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(runner, "ChatOpenAI", recording_chat_openai)
+    runtime = runner.AgentRuntime(
+        config=LLMConfig(model="provider-model", thinking_mode=thinking_mode),
+        api_key="test-key",
+        budget=BudgetGate(None),
+        events=EventLogger(tmp_path / "events.jsonl", "run-1"),
+        metrics=MetricsAggregator(tmp_path / "metrics.json", "run-1", "book-1"),
+        langfuse_handler=None,
+        langfuse_status=LangfuseStatus(False, False, "", "test"),
+        sem=asyncio.Semaphore(1),
+    )
+
+    runtime._get_model()
+
+    assert len(captured) == 1
+    if expected_extra_body is None:
+        assert "extra_body" not in captured[0]
+    else:
+        assert captured[0]["extra_body"] == expected_extra_body
+
+
 def _request(
     tmp_path: Path,
     *,
@@ -554,6 +613,24 @@ def _request(
         resume=resume,
         approval_tools=approval_tools,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_accepts_plain_completion_without_forcing_outcome_tool(
+    tmp_path: Path,
+) -> None:
+    """The model may report completion but cannot manufacture business authority."""
+    model = _PlainCompletionModel(bound_tool_choices=[])
+    runtime = _runtime(tmp_path, model)
+    tool = ToolBinding("noop", "Do nothing.", _NoopInput, lambda: "ok")
+
+    result = await runtime.run_action(_request(tmp_path, tools=(tool,)))
+
+    assert result.outcome.kind == "completed"
+    assert result.outcome.summary == "work complete"
+    assert result.stopped_reason == "completed"
+    assert model.bound_tool_choices
+    assert all(choice is None for choice in model.bound_tool_choices)
 
 
 async def _pending_interrupt_ids(checkpoint_path: Path, thread_id: str) -> tuple[str, ...]:
@@ -615,8 +692,8 @@ async def test_budget_pause_resumes_without_appending_a_human_message(tmp_path: 
     isolated = await resumed_runtime.run_action(_request(tmp_path, thread_id="run-1/a2/1"))
 
     assert first.outcome.kind == "paused"
-    assert resumed.outcome.kind == "succeeded"
-    assert isolated.outcome.kind == "succeeded"
+    assert resumed.outcome.kind == "completed"
+    assert isolated.outcome.kind == "completed"
     assert model.human_counts == [1, 1]
     assert (tmp_path / "graph-checkpoints.sqlite").is_file()
 
@@ -642,8 +719,8 @@ async def test_provider_crash_resume_does_not_replay_completed_side_effect(
     )
 
     assert first.outcome.kind == "retryable_failure"
-    assert resumed.outcome.kind == "succeeded"
-    assert resumed.outcome.evidence_refs == ("prior_tool_result",)
+    assert resumed.outcome.kind == "completed"
+    assert resumed.outcome.summary == "prior_tool_result"
     assert executions == 1
     assert set(model.human_counts) == {1}
 
@@ -675,7 +752,7 @@ async def test_recursion_resume_keeps_one_human_turn_and_completed_tools(
 
     assert first.outcome.error_code == "iteration_limit"
     assert first.tool_calls == 4
-    assert resumed.outcome.kind == "succeeded"
+    assert resumed.outcome.kind == "completed"
     assert executions == 4
     assert set(model.human_counts) == {1}
 
@@ -751,7 +828,7 @@ async def test_hitl_approve_resumes_interrupt_without_new_human_or_replay(
         )
     )
 
-    assert resumed.outcome.kind == "succeeded"
+    assert resumed.outcome.kind == "completed"
     assert executions == 1
     assert set(model.human_counts) == {1}
 
@@ -853,7 +930,7 @@ async def test_hitl_checkpoint_inspection_never_blindly_reexecutes_approved_tool
     resumed = await runtime.run_action(resume_request)
     after = await runtime.inspect_hitl_checkpoint(resume_request)
 
-    assert resumed.outcome.kind == "succeeded"
+    assert resumed.outcome.kind == "completed"
     assert after.disposition == "outcome"
     assert after.outcome == resumed.outcome
     assert executions == 1
@@ -901,7 +978,7 @@ async def test_hitl_reject_resumes_without_executing_the_business_tool(
     )
 
     assert first.outcome.kind == "paused"
-    assert rejected.outcome.kind == "succeeded"
+    assert rejected.outcome.kind == "completed"
     assert executions == 0
     assert set(model.human_counts) == {1}
 
@@ -977,7 +1054,7 @@ async def test_same_action_resumes_two_sequential_public_hitl_interrupts(
         )
     )
 
-    assert completed.outcome.kind == "succeeded"
+    assert completed.outcome.kind == "completed"
     assert completed.tool_calls == 1
     assert [(record.name, record.arguments_json) for record in completed.tool_log] == [
         ("deliver_b", "{}")
@@ -1002,11 +1079,7 @@ async def test_same_node_resumes_second_interrupt_despite_historical_resume_writ
         interrupt(_hitl_interrupt("ignored-provider-id", "deliver_b").value)
         if "deliver_b" not in effects:
             effects.append("deliver_b")
-        return {
-            "structured_response": _succeeded_envelope_payload(
-                evidence_refs=["two-approved-effects"]
-            )
-        }
+        return {"messages": [AIMessage(content="two-approved-effects")]}
 
     def real_node_agent(*args: Any, **kwargs: Any) -> Any:
         return (
@@ -1064,8 +1137,8 @@ async def test_same_node_resumes_second_interrupt_despite_historical_resume_writ
         )
     )
 
-    assert completed.outcome.kind == "succeeded"
-    assert completed.outcome.evidence_refs == ("two-approved-effects",)
+    assert completed.outcome.kind == "completed"
+    assert completed.outcome.summary == "two-approved-effects"
     assert effects == ["deliver_a", "deliver_b"]
 
 
@@ -1155,11 +1228,7 @@ async def test_real_parallel_partial_resume_excludes_completed_task_interrupt(
         return node
 
     def finish(state: _ParallelInterruptState) -> dict[str, object]:
-        return {
-            "structured_response": _succeeded_envelope_payload(
-                evidence_refs=state["effects"], leaf="parallel/result.json"
-            )
-        }
+        return {"messages": [AIMessage(content=",".join(sorted(state["effects"])))]}
 
     def build_graph(checkpointer: Any) -> Any:
         return (
@@ -1237,8 +1306,8 @@ async def test_real_parallel_partial_resume_excludes_completed_task_interrupt(
         )
     )
 
-    assert completed.outcome.kind == "succeeded"
-    assert set(completed.outcome.evidence_refs) == {"deliver_a", "deliver_b"}
+    assert completed.outcome.kind == "completed"
+    assert completed.outcome.summary == "deliver_a,deliver_b"
 
 
 def test_hitl_resume_requires_exact_pending_interrupt_id_set(tmp_path: Path) -> None:
@@ -1380,7 +1449,7 @@ async def test_hitl_resumes_multiple_tools_with_ordered_decisions(
     )
 
     assert paused.outcome.kind == "paused"
-    assert resumed.outcome.kind == "succeeded"
+    assert resumed.outcome.kind == "completed"
     assert tuple(executions) == expected_executions
     assert set(model.human_counts) == {1}
 
@@ -1891,7 +1960,7 @@ async def test_hitl_resume_rejects_non_hitl_checkpoint_before_model_or_tool_work
         )
     )
 
-    assert first.outcome.kind == ("paused" if checkpoint_state == "budget" else "succeeded")
+    assert first.outcome.kind == ("paused" if checkpoint_state == "budget" else "completed")
     assert result.outcome.kind == "repair_required"
     assert result.outcome.defect_codes == ("checkpoint_not_resumable",)
     assert result.llm_calls == 0
@@ -2013,7 +2082,7 @@ async def test_fresh_invocation_may_create_checkpoint_parent_and_database(
 
     result = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
 
-    assert result.outcome.kind == "succeeded"
+    assert result.outcome.kind == "completed"
     assert checkpoint_path.is_file()
     with sqlite3.connect(checkpoint_path) as connection:
         marker = connection.execute(
@@ -2074,7 +2143,7 @@ async def test_owner_sidecar_publish_failure_leaves_no_final_and_fresh_retry_suc
     runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
     recovered = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
 
-    assert recovered.outcome.kind == "succeeded"
+    assert recovered.outcome.kind == "completed"
     assert owner_path.read_bytes() == b"abi_action_checkpoint:1\n"
     assert set(checkpoint_path.parent.iterdir()) == {checkpoint_path, owner_path}
 
@@ -2210,8 +2279,8 @@ async def test_shared_first_initialization_hides_schema_until_marker_commit(
 
     assert second_waited_before_opening
     assert saver_factories == 2
-    assert first.outcome.kind == "succeeded"
-    assert second.outcome.kind == "succeeded"
+    assert first.outcome.kind == "completed"
+    assert second.outcome.kind == "completed"
     assert first_model.human_counts == [1]
     assert second_model.human_counts == [1]
 
@@ -2336,7 +2405,7 @@ def test_shared_initialization_crosses_threads_and_event_loops_without_leaking_r
     assert not second_thread.is_alive()
     assert errors == {}
     assert set(results) == {"a", "b"}
-    assert all(result.outcome.kind == "succeeded" for result in results.values())
+    assert all(result.outcome.kind == "completed" for result in results.values())
     with runner._CHECKPOINT_INITIALIZATIONS_GUARD:
         assert runner._CHECKPOINT_INITIALIZATIONS == {}
 
@@ -2385,7 +2454,7 @@ async def test_failed_first_initialization_can_be_completed_by_fresh_retry(
 
     assert failed.outcome.kind == "repair_required"
     assert failed.outcome.defect_codes == ("checkpoint_read_failed",)
-    assert recovered.outcome.kind == "succeeded"
+    assert recovered.outcome.kind == "completed"
     assert initialization_attempts == 2
     assert retry_model.human_counts == [1]
 
@@ -2413,10 +2482,8 @@ async def test_multiple_runtimes_share_first_initialization_and_isolate_threads(
         )
     )
 
-    assert [result.outcome.kind for result in fresh_results] == ["succeeded"] * 4
-    assert [result.outcome.evidence_refs for result in fresh_results] == [
-        (label,) for label in labels
-    ]
+    assert [result.outcome.kind for result in fresh_results] == ["completed"] * 4
+    assert [result.outcome.summary for result in fresh_results] == list(labels)
     assert [model.human_counts for model in models] == [[1], [1], [1], [1]]
 
     resume_runtimes = tuple(
@@ -2440,10 +2507,8 @@ async def test_multiple_runtimes_share_first_initialization_and_isolate_threads(
         )
     )
 
-    assert [result.outcome.kind for result in resumed_results] == ["succeeded"] * 4
-    assert [result.outcome.evidence_refs for result in resumed_results] == [
-        (label,) for label in labels
-    ]
+    assert [result.outcome.kind for result in resumed_results] == ["completed"] * 4
+    assert [result.outcome.summary for result in resumed_results] == list(labels)
     assert all(result.llm_calls == 0 for result in resumed_results)
 
 
@@ -2459,7 +2524,7 @@ async def test_resume_rejects_symlink_in_any_checkpoint_path_component(
     target_path = target_dir / "graph.sqlite"
     runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
     first = await runtime.run_action(_request(tmp_path, checkpoint_path=target_path))
-    assert first.outcome.kind == "succeeded"
+    assert first.outcome.kind == "completed"
     target_before = target_path.read_bytes()
     if alias_kind == "file":
         alias_path = tmp_path / "checkpoint-alias.sqlite"
@@ -2507,7 +2572,7 @@ async def test_resume_precheck_and_invoke_share_one_saver_context(
     checkpoint_path = tmp_path / "graph-checkpoints.sqlite"
     runtime = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
     first = await runtime.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
-    assert first.outcome.kind == "succeeded"
+    assert first.outcome.kind == "completed"
     real_from_conn_string = runner.AsyncSqliteSaver.from_conn_string
     saver_opens = 0
     replacement_hook_ran = False
@@ -2665,7 +2730,7 @@ async def test_checkpoint_read_failures_are_control_results_without_graph_work(
     checkpoint_path = tmp_path / "graph-checkpoints.sqlite"
     initializer = _runtime(tmp_path, _RecordingOutcomeModel(human_counts=[]))
     initialized = await initializer.run_action(_request(tmp_path, checkpoint_path=checkpoint_path))
-    assert initialized.outcome.kind == "succeeded"
+    assert initialized.outcome.kind == "completed"
     model = _ExplodingModel(error=AssertionError("model must not run"))
     runtime = _runtime(tmp_path, model)
     real_create_agent = runner.create_agent
@@ -2715,7 +2780,7 @@ async def test_completed_checkpoint_resume_returns_cached_success_without_new_wo
     first = await runtime.run_action(_request(tmp_path))
     resumed = await runtime.run_action(_request(tmp_path, resume=runner.CheckpointResume()))
 
-    assert first.outcome.kind == "succeeded"
+    assert first.outcome.kind == "completed"
     assert resumed.outcome == first.outcome
     assert resumed.llm_calls == 0
     assert resumed.tool_calls == 0

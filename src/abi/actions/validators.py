@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 from collections.abc import Callable, Mapping
 from typing import Any, cast
+
+import yaml
 
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
@@ -181,8 +185,27 @@ def _nonempty_bundle(
 
 
 def _contains_field_pass(text: str, field: str = "result") -> bool:
-    pattern = re.compile(rf"(?im)^\s*(?:[#>*`-]+\s*)?{re.escape(field)}\s*:\s*PASS\s*$")
+    wrapper = r"(?:\*\*|__|`)?"
+    pattern = re.compile(
+        rf"(?im)^\s*(?:[#>*-]+\s*)?{wrapper}{re.escape(field)}"
+        rf"\s*:\s*PASS{wrapper}\s*$"
+    )
     return pattern.search(text) is not None
+
+
+def _terminal_review_result(text: str) -> str | None:
+    stripped = text.rstrip()
+    matches = tuple(re.finditer(r"(?m)^result: (PASS|FAIL)$", stripped))
+    if len(matches) != 1 or matches[0].end() != len(stripped):
+        return None
+    return matches[0].group(1)
+
+
+def _review_failure_excerpt(text: str) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= 2000:
+        return compact
+    return f"{compact[:1000]} ... {compact[-1000:]}"
 
 
 def _source_split(
@@ -237,7 +260,9 @@ def _translation_trial(
     )
     if not result.passed:
         return result
-    if not _contains_field_pass(view.read_text("qa/pretranslation/report.md")):
+    if not _contains_field_pass(
+        view.read_text("qa/pretranslation/pretranslation_report.md")
+    ):
         return _semantic_failure(
             capability,
             view,
@@ -253,17 +278,93 @@ def _glossary_prepare(
     capability = "glossary.prepare"
     if invalid := _typed_expected(capability, EmptyInput, view, parameters, bundle):
         return invalid
-    try:
-        rows = tuple(
-            row
-            for row in view.read_text("glossary/terms.csv").splitlines()
-            if row.strip()
+    terms_text = view.read_text("glossary/terms.csv")
+    style_text = view.read_text("glossary/style_guide.md")
+    if not terms_text.strip() or not style_text.strip():
+        return _semantic_failure(
+            capability,
+            view,
+            "glossary_terms_empty",
+            "Glossary requires a header, a term row, and a style guide.",
         )
-        if len(rows) < 2 or not view.read_text("glossary/style_guide.md").strip():
-            raise ValueError("Glossary requires a header, a term row, and a style guide.")
-    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
-        return _semantic_failure(capability, view, "glossary_terms_empty", str(exc))
+    expected_fields = (
+        "term",
+        "target",
+        "status",
+        "display_policy",
+        "forbidden_body_renderings",
+        "note",
+    )
+    try:
+        reader = csv.DictReader(io.StringIO(terms_text, newline=""), strict=True)
+        if tuple(reader.fieldnames or ()) != expected_fields:
+            raise ValueError("Glossary CSV header must match the six-field contract.")
+        rows = tuple(reader)
+        if not rows:
+            raise ValueError("Glossary CSV requires at least one term row.")
+        for row in rows:
+            if set(row) != set(expected_fields) or any(
+                value is None for value in row.values()
+            ):
+                raise ValueError(
+                    "Every glossary row must contain exactly six CSV fields; "
+                    "quote fields that contain commas."
+                )
+            if not row["term"].strip() or not row["target"].strip():
+                raise ValueError("Glossary term and target fields cannot be empty.")
+            if row["status"].strip() not in {
+                "locked",
+                "preferred",
+                "avoid",
+                "note_only",
+            }:
+                raise ValueError(
+                    "Glossary status must be locked, preferred, avoid, or note_only."
+                )
+    except (csv.Error, OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(capability, view, "glossary_terms_invalid", str(exc))
     return _semantic_success(capability, view, bundle)
+
+
+def _preproduction_spec(
+    view: StagingEvidenceView, parameters: FrozenModel, bundle: ArtifactBundle
+) -> GateDecision:
+    capability = "preproduction.spec"
+    result = _nonempty_bundle(
+        capability,
+        EmptyInput,
+        "production_spec_missing",
+        view,
+        parameters,
+        bundle,
+    )
+    if not result.passed:
+        return result
+    try:
+        loaded = yaml.safe_load(view.read_text("metadata/finalized_book.yaml"))
+        if not isinstance(loaded, dict):
+            raise ValueError("Finalized metadata must be a YAML mapping.")
+        required = {"title", "authors", "language", "identifier", "rights", "publisher"}
+        missing = sorted(required - {str(key) for key in loaded})
+        if missing:
+            raise ValueError(
+                f"Finalized metadata is missing required keys: {', '.join(missing)}."
+            )
+        for key in ("title", "language", "identifier", "rights", "publisher"):
+            if not str(loaded.get(key) or "").strip():
+                raise ValueError(f"Finalized metadata field {key} must be non-empty.")
+        authors = loaded.get("authors")
+        if not isinstance(authors, (str, list)):
+            raise ValueError("Finalized metadata authors must be a string or list.")
+        if isinstance(authors, list) and any(
+            not isinstance(author, str) or not author.strip() for author in authors
+        ):
+            raise ValueError("Finalized metadata authors must contain only non-empty strings.")
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+        return _semantic_failure(
+            capability, view, "finalized_metadata_invalid", str(exc)
+        )
+    return result
 
 
 def _chapter_review(
@@ -327,19 +428,52 @@ def _review_independent(
         capability, ReviewBatchInput, view, parameters, bundle
     ):
         return invalid
+    failure_reasons = {
+        "agent_a": "translation_quality_failed",
+        "agent_b": "epub_quality_failed",
+    }
     for reviewer in ("agent_a", "agent_b"):
         path = f"reviews/{reviewer}/review.md"
         try:
-            passed = _contains_field_pass(view.read_text(path))
-        except (OSError, PermissionError, UnicodeError, ValueError):
-            passed = False
-        if not passed:
+            report = view.read_text(path)
+            result = _terminal_review_result(report)
+        except (OSError, PermissionError, UnicodeError, ValueError) as exc:
             return _semantic_failure(
                 capability,
                 view,
-                "independent_review_not_passed",
-                f"{path} must conclude result: PASS.",
+                "independent_review_protocol_invalid",
+                f"{path} is unreadable: {exc}",
             )
+        if result is None:
+            return _semantic_failure(
+                capability,
+                view,
+                "independent_review_protocol_invalid",
+                f"{path} must end with exactly one plain result: PASS or result: FAIL line.",
+            )
+        if result == "FAIL":
+            return _semantic_failure(
+                capability,
+                view,
+                failure_reasons[reviewer],
+                f"{path} reported a real quality failure: {_review_failure_excerpt(report)}",
+            )
+    try:
+        route = view.read_text("reviews/revision_route.md")
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(
+            capability,
+            view,
+            "independent_review_protocol_invalid",
+            f"reviews/revision_route.md is unreadable: {exc}",
+        )
+    if _terminal_review_result(route) != "PASS":
+        return _semantic_failure(
+            capability,
+            view,
+            "independent_review_protocol_invalid",
+            "reviews/revision_route.md must end with result: PASS when both reviewers pass.",
+        )
     return _semantic_success(capability, view, bundle)
 
 
@@ -428,8 +562,6 @@ def _chapter_control(
             "polysemy_unresolved_count": "0",
         }
         report_lines = text.rstrip().splitlines()
-        block_start = max(0, len(report_lines) - len(required_fields))
-        trailing_lines = tuple(line.strip() for line in report_lines[block_start:])
         expected_lines = tuple(
             f"{field}: {value}" for field, value in required_fields.items()
         )
@@ -437,7 +569,7 @@ def _chapter_control(
         latest_round_start = max(
             (
                 index + 1
-                for index, line in enumerate(report_lines[:block_start])
+                for index, line in enumerate(report_lines)
                 if round_marker.search(line)
             ),
             default=0,
@@ -445,14 +577,22 @@ def _chapter_control(
         field_prefix = re.compile(
             rf"(?i)^\s*(?:{'|'.join(map(re.escape, required_fields))})\s*:"
         )
-        duplicate_in_latest_round = any(
-            field_prefix.search(line)
-            for line in report_lines[latest_round_start:block_start]
+        latest_round_lines = report_lines[latest_round_start:]
+        protocol_lines = tuple(
+            line.strip() for line in latest_round_lines if field_prefix.search(line)
         )
-        if duplicate_in_latest_round or tuple(
-            line.lower() for line in trailing_lines
-        ) != tuple(
-            line.lower() for line in expected_lines
+        normalized_expected = tuple(line.lower() for line in expected_lines)
+        has_contiguous_protocol_block = any(
+            tuple(
+                line.strip().lower()
+                for line in latest_round_lines[start : start + len(expected_lines)]
+            )
+            == normalized_expected
+            for start in range(len(latest_round_lines) - len(expected_lines) + 1)
+        )
+        if (
+            len(protocol_lines) != len(required_fields)
+            or not has_contiguous_protocol_block
         ):
             return _decision(
                 view, passed=False, reason_code="chapter_control_not_passed",
@@ -709,9 +849,7 @@ _VALIDATORS.update(
         "chapter.translate": _chapter_translate,
         "chapter.control": _chapter_control,
         "chapter.review": _chapter_review,
-        "preproduction.spec": lambda view, parameters, bundle: _nonempty_bundle(
-            "preproduction.spec", EmptyInput, "production_spec_missing", view, parameters, bundle
-        ),
+        "preproduction.spec": _preproduction_spec,
         "preproduction.sample": _preproduction_sample,
         "epub.build": _epub_build,
         "review.spotcheck": _review_spotcheck,

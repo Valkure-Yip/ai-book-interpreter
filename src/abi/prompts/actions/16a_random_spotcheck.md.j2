@@ -2,8 +2,8 @@
 
 Read `references/stratified_random_spotcheck.md`.
 
-1. Call `select_random_review_passages` (agents=2). It creates a new
-   `reviews/random_spotcheck/round_XXX/` with a seed, manifest, strata, and
+1. Call `select_random_review_passages` exactly once. It creates the authorized
+   `reviews/random_spotcheck/round_XXX/` with the frozen seed, manifest, strata, and
    per-agent stratified samples (paragraph/table/figure/formula/caption_note).
 2. For each of the two agents, call `spawn_review_agent` with an isolated
    instruction telling it which `round_XXX/samples/agent_X/samples.md` to review,
@@ -13,13 +13,17 @@ Read `references/stratified_random_spotcheck.md`.
    `{"average_score": .., "lowest_score": .., "open_p0_p1_p2": 0, "confidence": 0.0-1.0,
    "samples": [{"unit_id": "..", "score": .., "priority": "", "rework": false}]}`.
    The two agents must not see each other.
-3. If any issue is found, treat it as a defect family: record the evidence and a
-   book-wide audit route under the round directory, then return a repair-required
-   outcome. Reviewers must not edit canonical translation or output artifacts.
-4. Call `validate_random_spotcheck(require_pass=true)`. It enforces
+   The frozen controller input authorizes exactly one complete sample per reviewer in
+   this validation profile. Confidence describes confidence in each sampled-passage
+   assessment, not whole-book coverage; reviewers must not reduce it merely because the
+   authorized sample set is small.
+3. Reviewers must not edit canonical translation or output artifacts.
+4. Call `validate_random_spotcheck` exactly once. It enforces
    release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
 
-On validator FAIL, fix and loop. On PASS, stop for controller validation; do not
-modify gate or control state.
+After the validator call, stop immediately whether it reports PASS or FAIL. A FAIL is
+semantic evidence for the controller to route upstream; this Action cannot repair the
+translation and must not repeat sampling, respawn reviewers, or loop on the same round.
+Do not modify gate or control state.
 
-Exit condition: validator PASS.
+Exit condition: the complete round evidence and deterministic validation report exist.

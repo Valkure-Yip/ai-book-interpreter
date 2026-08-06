@@ -13,7 +13,7 @@ class GateResult:
     message: str
     hard_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    details: dict = field(default_factory=dict)
+    details: dict[str, object] = field(default_factory=dict)
 
     def summary(self) -> str:
         head = "PASS" if self.ok else "FAIL"

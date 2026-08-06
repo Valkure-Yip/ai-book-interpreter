@@ -28,17 +28,47 @@ _FIXED: dict[str, tuple[ExpectedArtifact, ...]] = {
         _artifact("qa/benchmark/global_research_ack.md", "text/markdown", "research"),
     ),
     "research.book": (
-        _artifact("metadata/book_research.md", "text/markdown", "research"),
+        _artifact(
+            "metadata/book_specific_translation_research.md",
+            "text/markdown",
+            "research",
+        ),
         _artifact("metadata/style_profile.md", "text/markdown", "style_profile"),
     ),
     "translation.trial": (
-        _artifact("qa/pretranslation/report.md", "text/markdown", "trial_report"),
+        _artifact(
+            "metadata/pretranslation_style_profile.md",
+            "text/markdown",
+            "style_profile_revision",
+        ),
+        _artifact(
+            "qa/pretranslation/pretranslation_report.md",
+            "text/markdown",
+            "trial_report",
+        ),
+        *(
+            _artifact(
+                f"qa/pretranslation/source_{index:02d}.md",
+                "text/markdown",
+                "trial_source",
+            )
+            for index in range(1, 6)
+        ),
+        *(
+            _artifact(
+                f"qa/pretranslation/trial_{index:02d}.md",
+                "text/markdown",
+                "translation_trial",
+            )
+            for index in range(1, 6)
+        ),
     ),
     "glossary.prepare": (
         _artifact("glossary/style_guide.md", "text/markdown", "style_guide"),
         _artifact("glossary/terms.csv", "text/csv", "glossary"),
     ),
     "preproduction.spec": (
+        _artifact("metadata/finalized_book.yaml", "application/yaml", "finalized_metadata"),
         _artifact("preproduction/stage1/production_spec.md", "text/markdown", "production_spec"),
     ),
     "preproduction.sample": (

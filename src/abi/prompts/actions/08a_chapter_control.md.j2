@@ -3,10 +3,19 @@
 Follow `skills/expert-translation-quality/SKILL.md` and
 `skills/translation-quality-defect-families/SKILL.md`.
 
-For EACH authorized translated chapter, run a FULL-CHAPTER (not sampled) post-translation
-control. Read the committed `chapters/translated/{NNN_slug}.md`, write the corrected immutable
-revision to `chapters/controlled/{NNN_slug}.md`, and write
-`qa/chapter_controls/{NNN_slug}.control.md`. Never overwrite or adopt the committed translated
+Authorized chapter paths (and no others):
+{% for chapter in parameters.chapters %}
+- read `chapters/translated/{{ chapter }}.md`; write
+  `chapters/controlled/{{ chapter }}.md` and
+  `qa/chapter_controls/{{ chapter }}.control.md`
+{% endfor %}
+
+After the required reads, call `write_file` or `edit_file` immediately for every
+listed controlled chapter and control report. Do not narrate, rehearse, or paste
+the files into the assistant response; only tool writes count as Action evidence.
+
+For EACH authorized translated chapter, run a FULL-CHAPTER (not sampled)
+post-translation control. Never overwrite or adopt the committed translated
 artifact. The check must cover
 body text, notes, terminology, reader-facing wording, readability, polish,
 plain-language clarity (without flattening specialist quality), title handling,
@@ -26,7 +35,12 @@ latest_round_status: PASS
 allow_next_chapter: true
 expert_translation_skill_used: true
 polysemy_unresolved_count: 0
+expert_level_review_status: "PASS"
+polysemy_translation_stage_review: "PASS"
+polysemy_context_review: "PASS"
 ```
+This single block satisfies both the controller and expert skill protocols.
+Do not append a second expert-skill closure or repeat any machine-readable field.
 
 Exit condition: every authorized chapter has a zero-issue PASS control file.
 Stop for controller validation; do not modify gate or control state.

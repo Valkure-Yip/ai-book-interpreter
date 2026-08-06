@@ -60,6 +60,13 @@ class PolicyEngine:
             reasons.add("duplicate_proposal_id")
 
         eligible = {action.capability for action in snapshot.eligible_actions}
+        semantic_repair_capabilities = {
+            self._registry.semantic_repair_capability(incident.reason_code)
+            for incident in snapshot.incidents
+            if incident.repair_class == "semantic"
+            and incident.reason_code is not None
+            and self._registry.has_semantic_repair(incident.reason_code)
+        }
         resolved = self._resolve_known_actions(proposals, reasons)
         for proposal in proposals:
             if not self._registry.contains(proposal.capability):
@@ -68,7 +75,10 @@ class PolicyEngine:
             if proposal.capability not in eligible:
                 reasons.add("ineligible_capability")
             definition = self._registry.get(proposal.capability)
-            if not self._registry.prerequisites_pass(definition, snapshot):
+            if (
+                proposal.capability not in semantic_repair_capabilities
+                and not self._registry.prerequisites_pass(definition, snapshot)
+            ):
                 reasons.add("hard_prerequisite_failed")
 
         self._check_dependencies(snapshot, proposals, reasons)
@@ -76,9 +86,35 @@ class PolicyEngine:
         self._check_budget(snapshot, resolved_actions, reasons)
         self._check_conflicts(resolved.values(), reasons)
         self._check_failure_signatures(snapshot, resolved_actions, reasons)
-        self._check_terminal_release_policy(snapshot, resolved_actions, reasons)
+        self._check_completed_capabilities(snapshot, proposals, reasons)
         self._check_repair_routes(snapshot, proposals, reasons)
         return reasons, resolved
+
+    def _check_completed_capabilities(
+        self,
+        snapshot: RunSnapshot,
+        proposals: tuple[ProposedAction, ...],
+        reasons: set[str],
+    ) -> None:
+        """Do not let a free-form planner replay already-current business work."""
+        completed = {
+            action.capability
+            for action in snapshot.actions
+            if action.status.value == "SUCCEEDED" and action.outputs_current
+        }
+        repair_capabilities = {
+            self._registry.semantic_repair_capability(incident.reason_code)
+            for incident in snapshot.incidents
+            if incident.repair_class == "semantic"
+            and incident.reason_code is not None
+            and self._registry.has_semantic_repair(incident.reason_code)
+        }
+        if any(
+            proposal.capability in completed
+            and proposal.capability not in repair_capabilities
+            for proposal in proposals
+        ):
+            reasons.add("capability_already_succeeded")
 
     def _check_repair_routes(
         self,
@@ -211,28 +247,6 @@ class PolicyEngine:
             if signature in prior:
                 reasons.add("repeated_failure_signature")
 
-    @staticmethod
-    def _check_terminal_release_policy(
-        snapshot: RunSnapshot,
-        resolved: Iterable[ResolvedAction],
-        reasons: set[str],
-    ) -> None:
-        for action in resolved:
-            if not action.definition.spec.capability.startswith("release."):
-                continue
-            required = {
-                evidence.name
-                for evidence in action.definition.spec.expected_evidence
-                if evidence.required
-            }
-            passed = {
-                evidence.gate
-                for evidence in snapshot.gate_evidence
-                if evidence.passed
-            }
-            if snapshot.status.value != "RUNNING" or not required <= passed:
-                reasons.add("terminal_release_policy")
-
     def _resolve_actions(
         self,
         snapshot: RunSnapshot,
@@ -245,6 +259,18 @@ class PolicyEngine:
             proposal.proposal_id: f"{snapshot.run_id}:{next_plan_version}:{proposal.proposal_id}"
             for proposal in patch.proposed_actions
         }
+        repair_incidents_by_capability: dict[str, list[str]] = {}
+        for incident in snapshot.incidents:
+            reason_code = incident.reason_code
+            if (
+                incident.repair_class == "semantic"
+                and reason_code is not None
+                and self._registry.has_semantic_repair(reason_code)
+            ):
+                capability = self._registry.semantic_repair_capability(reason_code)
+                repair_incidents_by_capability.setdefault(capability, []).append(
+                    incident.incident_id
+                )
         authorized: list[AuthorizedAction] = []
         for proposal in patch.proposed_actions:
             candidate = resolved[proposal.proposal_id]
@@ -278,6 +304,9 @@ class PolicyEngine:
                         item.name
                         for item in action.definition.spec.expected_evidence
                         if item.required
+                    ),
+                    repairs_incident_ids=tuple(
+                        sorted(repair_incidents_by_capability.get(proposal.capability, ()))
                     ),
                     retry_policy=retry_policy,
                     retry_policy_fingerprint=sha256_canonical_json(

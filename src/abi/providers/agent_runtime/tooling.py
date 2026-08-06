@@ -6,11 +6,15 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool, ToolException
 
 from abi.types.tools import ToolBinding
 
 ActualStartHook = Callable[[ToolBinding, dict[str, object]], None]
+
+
+def _permission_denial_output(error: ToolException) -> str:
+    return f"ERROR: tool request rejected: {error}"
 
 
 def _is_async_callable(function: Callable[..., object]) -> bool:
@@ -30,8 +34,11 @@ def to_langchain_tool(
         async def coroutine(*args: Any, **kwargs: Any) -> Any:
             if on_actual_start is not None:
                 on_actual_start(binding, dict(kwargs))
-            result = binding.callable(*args, **kwargs)
-            return await cast(Awaitable[Any], result)
+            try:
+                result = binding.callable(*args, **kwargs)
+                return await cast(Awaitable[Any], result)
+            except (FileExistsError, PermissionError, ValueError) as exc:
+                raise ToolException(str(exc)) from exc
 
         return StructuredTool.from_function(
             func=None,
@@ -39,11 +46,15 @@ def to_langchain_tool(
             name=binding.name,
             description=binding.description,
             args_schema=binding.args_schema,
+            handle_tool_error=_permission_denial_output,
         )
     def function(*args: Any, **kwargs: Any) -> Any:
         if on_actual_start is not None:
             on_actual_start(binding, dict(kwargs))
-        return binding.callable(*args, **kwargs)
+        try:
+            return binding.callable(*args, **kwargs)
+        except (FileExistsError, PermissionError, ValueError) as exc:
+            raise ToolException(str(exc)) from exc
 
     return StructuredTool.from_function(
         func=function,
@@ -51,4 +62,5 @@ def to_langchain_tool(
         name=binding.name,
         description=binding.description,
         args_schema=binding.args_schema,
+        handle_tool_error=_permission_denial_output,
     )

@@ -80,9 +80,11 @@ def _mode_for(project: BookProject, runtime_metadata: GateRuntimeMetadata | None
 
 
 def _title(project: BookProject) -> str:
-    if project.book_yaml.exists():
+    if project.finalized_book_yaml.exists():
         try:
-            data = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
+            data = yaml.safe_load(
+                project.finalized_book_yaml.read_text(encoding="utf-8")
+            ) or {}
             if isinstance(data, dict) and data.get("title"):
                 return str(data["title"])
         except Exception:

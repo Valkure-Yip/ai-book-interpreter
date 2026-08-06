@@ -120,8 +120,8 @@ def _artifact_gated_registry() -> ActionRegistry:
     registry.register(
         ActionDefinition(
             spec=ActionSpec(
-                capability="source.ingest",
-                description="Create immutable source-manifest evidence.",
+                capability="source.consume",
+                description="Consume immutable source-manifest evidence.",
                 input_schema="EmptyInput",
                 action_kind=ActionKind.DETERMINISTIC,
                 prerequisites=({"name": "source_exists"},),
@@ -331,7 +331,7 @@ async def test_snapshot_contains_hashes_not_book_body_and_applies_limits(tmp_pat
     assert len(snapshot.incidents) == 1
     assert snapshot.incidents[0].message == "x" * 500
     assert snapshot.remaining_budget_usd == 3.75
-    assert snapshot.eligible_actions[0].capability == "source.ingest"
+    assert snapshot.eligible_actions == ()
     assert snapshot.plan_rejections[0].reason_codes == ("invalid_horizon",)
     assert "other_run_only" not in payload
     assert snapshot.actions == ()
@@ -353,7 +353,7 @@ async def test_context_keeps_full_policy_facts_while_planner_view_is_bounded(tmp
 
     patch = PlanPatch(
         objective="use source evidence",
-        proposed_actions=(ProposedAction(proposal_id="ingest", capability="source.ingest"),),
+        proposed_actions=(ProposedAction(proposal_id="consume", capability="source.consume"),),
         rationale="source artifact is a durable policy fact",
     )
     policy = PolicyEngine(registry)
@@ -361,7 +361,7 @@ async def test_context_keeps_full_policy_facts_while_planner_view_is_bounded(tmp
     assert context == repeated
     assert len(context.policy_snapshot.artifacts) == 2
     assert context.planner_snapshot.artifacts == ()
-    assert context.planner_snapshot.eligible_actions[0].capability == "source.ingest"
+    assert context.planner_snapshot.eligible_actions[0].capability == "source.consume"
     assert policy.authorize(context.policy_snapshot, patch, next_plan_version=2).authorized is True
     assert policy.authorize(context.planner_snapshot, patch, next_plan_version=2).reason_codes == (
         "hard_prerequisite_failed",
@@ -435,6 +435,8 @@ async def test_planner_returns_valid_patch_from_structured_provider_boundary() -
     assert schema is PlanPatch
     assert "one to five actions" in str(messages[0].content)
     assert "prior rejection reasons as hard feedback" in str(messages[0].content)
+    assert "repairs_reason_codes" in str(messages[0].content)
+    assert "do not add upstream or downstream actions" in str(messages[0].content)
     assert '"eligible_actions"' in str(messages[1].content)
     assert '"invalid_horizon"' in str(messages[1].content)
     assert "private-policy-evidence" not in str(messages[1].content)

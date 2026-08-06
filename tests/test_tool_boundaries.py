@@ -112,6 +112,7 @@ class _Project:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.graph_checkpoints = root / "state" / "graph-checkpoints.sqlite"
+        self.action_checkpoints = root / "state" / "action-checkpoints.sqlite"
 
     def rel(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()
@@ -223,6 +224,53 @@ async def test_provider_adapter_executes_sync_and_async_bindings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_adapter_returns_permission_denial_to_agent() -> None:
+    """Catch an unauthorized tool argument aborting the whole agent loop."""
+    def denied(value: str) -> str:
+        raise PermissionError(f"not allowed to read {value}")
+
+    tool = to_langchain_tool(
+        ToolBinding("read_denied", "Exercise denied input.", _EchoInput, denied)
+    )
+
+    assert await tool.ainvoke({"value": "skills/private.md"}) == (
+        "ERROR: tool request rejected: not allowed to read skills/private.md"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_adapter_returns_duplicate_attempt_output_to_agent() -> None:
+    """Catch a create-only staging collision aborting the whole agent loop."""
+
+    def duplicate(value: str) -> str:
+        raise FileExistsError(f"attempt output {value} was already emitted")
+
+    tool = to_langchain_tool(
+        ToolBinding("write_duplicate", "Exercise duplicate output.", _EchoInput, duplicate)
+    )
+
+    assert await tool.ainvoke({"value": "qa/chapter_controls/001.control.md"}) == (
+        "ERROR: tool request rejected: attempt output "
+        "qa/chapter_controls/001.control.md was already emitted"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_adapter_returns_tool_value_rejection_to_agent() -> None:
+    """A deterministic tool precondition must not become an opaque graph failure."""
+    def rejected(value: str) -> str:
+        raise ValueError(f"controller value does not permit {value}")
+
+    tool = to_langchain_tool(
+        ToolBinding("value_rejected", "Exercise a value guard.", _EchoInput, rejected)
+    )
+
+    assert await tool.ainvoke({"value": "mutable-override"}) == (
+        "ERROR: tool request rejected: controller value does not permit mutable-override"
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_adapter_awaits_async_callable_objects_and_wrappers() -> None:
     class AsyncEcho:
         async def __call__(self, value: str) -> str:
@@ -311,8 +359,8 @@ async def test_review_subagent_uses_abi_owned_stable_distinct_threads(
     second = json.loads(await spawn(agent_label="agent_b", instructions="review round two"))
 
     assert first["thread_id"] != second["thread_id"]
-    assert first["thread_id"] == "review:run-1:review-1:agent_a"
-    assert second["thread_id"] == "review:run-1:review-1:agent_b"
+    assert first["thread_id"] == "review:run-1:review-1:1:agent_a"
+    assert second["thread_id"] == "review:run-1:review-1:1:agent_b"
     assert requests[0].resume is None  # type: ignore[union-attr]
     assert requests[1].resume is None  # type: ignore[union-attr]
     with pytest.raises(TypeError, match="resume_thread_id"):
@@ -325,7 +373,7 @@ async def test_review_subagent_uses_abi_owned_stable_distinct_threads(
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_retry_keeps_thread_and_requests_checkpoint_resume(
+async def test_review_subagent_retry_uses_fresh_attempt_thread_without_resume(
     tmp_path: Path,
 ) -> None:
     requests: list[object] = []
@@ -348,8 +396,10 @@ async def test_review_subagent_retry_keeps_thread_and_requests_checkpoint_resume
 
     payload = json.loads(await spawn(agent_label="agent_a", instructions="continue"))
 
-    assert payload["thread_id"] == "review:run-1:review-1:agent_a"
-    assert requests[0].resume.kind == "checkpoint"  # type: ignore[union-attr]
+    assert payload["thread_id"] == "review:run-1:review-1:2:agent_a"
+    assert requests[0].resume is None  # type: ignore[union-attr]
+    assert requests[0].checkpoint_path == context.project.action_checkpoints  # type: ignore[union-attr]
+    assert requests[0].checkpoint_path != context.project.graph_checkpoints  # type: ignore[union-attr]
     store.close()
 
 
@@ -389,6 +439,8 @@ async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
     )[0].callable  # type: ignore[arg-type]
 
     await spawn(agent_label="agent_a", instructions="review")
+    assert "complete sample set for this round" in requests[0].system_prompt  # type: ignore[union-attr]
+    assert "not whole-book coverage" in requests[0].system_prompt  # type: ignore[union-attr]
     write_file = next(tool for tool in requests[0].tools if tool.name == "write_file")  # type: ignore[union-attr]
     write_file.callable(
         path="reviews/random_spotcheck/round_001/reviews/agent_a_summary.json",
@@ -399,6 +451,35 @@ async def test_spotcheck_subagents_receive_only_exact_reviewer_outputs(
             path="reviews/random_spotcheck/round_001/validation_report.json",
             content='{"status":"PASS"}',
         )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_independent_subagent_treats_release_as_downstream_and_out_of_scope(
+    tmp_path: Path,
+) -> None:
+    requests: list[object] = []
+
+    class RecordingAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            return SimpleNamespace(outcome=_success())
+
+    context = _context(tmp_path)
+    context.services = SimpleNamespace(agent=RecordingAgent())
+    store, writer = _review_writer(tmp_path)
+    spawn = make_subagent_tools(
+        context,
+        permissions=ActionPathPermissions(read_dirs=("reviews",), write_dirs=()),
+        action_identity=ReviewActionIdentity(run_id="run-1", action_id="review-1"),
+        capability="review.independent",
+        writer=writer,
+    )[0].callable  # type: ignore[arg-type]
+
+    await spawn(agent_label="agent_b", instructions="review EPUB")
+
+    assert "before release.prepare" in requests[0].system_prompt  # type: ignore[union-attr]
+    assert "never fail" in requests[0].system_prompt  # type: ignore[union-attr]
     store.close()
 
 

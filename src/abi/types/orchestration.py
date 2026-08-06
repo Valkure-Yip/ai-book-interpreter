@@ -288,6 +288,7 @@ class ActionView(FrozenModel):
     repair_class: RepairClass | None = None
     repair_source: RepairSource | None = None
     reason_code: str | None = None
+    outputs_current: bool = False
 
     @model_validator(mode="after")
     def _repair_fields_together(self) -> Self:
@@ -302,6 +303,8 @@ class ActionView(FrozenModel):
             raise ValueError("classified indeterminate actions need class/source/reason")
         if self.status not in classified_statuses and any(item is not None for item in values):
             raise ValueError("unclassified actions may not carry repair classification")
+        if self.outputs_current and self.status is not ActionStatus.SUCCEEDED:
+            raise ValueError("only a succeeded Action can own current outputs")
         return self
 
 
@@ -309,7 +312,17 @@ class EligibleAction(FrozenModel):
     capability: str
     description: str
     input_schema: str
+    fixed_arguments: tuple[ActionArgument, ...] = ()
+    repairs_reason_codes: tuple[str, ...] = ()
     estimated_cost_usd: float = Field(ge=0)
+
+    @field_validator("input_schema")
+    @classmethod
+    def _canonical_input_schema(cls, value: str) -> str:
+        decoded = _require_canonical_json(value, label="eligible action input_schema")
+        if not isinstance(decoded, dict):
+            raise ValueError("eligible action input_schema must be a JSON object")
+        return value
 
 
 class RunSnapshot(FrozenModel):
@@ -345,6 +358,7 @@ class AuthorizedAction(FrozenModel):
     expected_artifact_manifest: ExpectedArtifactManifest
     expected_artifact_manifest_digest: str
     expected_evidence_refs: tuple[str, ...] = ()
+    repairs_incident_ids: tuple[str, ...] = ()
     retry_policy: RetryPolicySpec
     retry_policy_fingerprint: str
 
@@ -586,8 +600,15 @@ class ToolCallRecord(FrozenModel):
     arguments_json: str
 
 
+class AgentCompleted(FrozenModel):
+    """Advisory model signal; the Action executor still owns success authority."""
+
+    kind: Literal["completed"] = "completed"
+    summary: str = ""
+
+
 class AgentRunResult(FrozenModel):
-    outcome: ActionOutcome
+    outcome: ActionOutcome | AgentCompleted
     llm_calls: int
     tool_calls: int
     cost_usd: float

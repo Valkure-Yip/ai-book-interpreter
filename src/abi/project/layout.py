@@ -90,6 +90,11 @@ class BookProject:
         return self.root / "metadata/book.yaml"
 
     @property
+    def finalized_book_yaml(self) -> Path:
+        """Immutable metadata decision produced by preproduction."""
+        return self.root / "metadata/finalized_book.yaml"
+
+    @property
     def rights_checklist(self) -> Path:
         return self.root / "metadata/rights_checklist.md"
 
@@ -156,6 +161,10 @@ class BookProject:
     def pretranslation_report(self) -> Path:
         return self.root / "qa/pretranslation/pretranslation_report.md"
 
+    @property
+    def pretranslation_style_profile(self) -> Path:
+        return self.root / "metadata/pretranslation_style_profile.md"
+
     # --- preproduction ---
     @property
     def production_spec(self) -> Path:
@@ -210,7 +219,7 @@ class BookProject:
     # --- retrospective ---
     @property
     def retrospective(self) -> Path:
-        return self.root / "retrospective/book_retrospective.md"
+        return self.root / "retrospective/retrospective.md"
 
     # --- state ---
     @property
@@ -220,8 +229,13 @@ class BookProject:
 
     @property
     def graph_checkpoints(self) -> Path:
-        """Durable LangGraph checkpoint database, separate from business facts."""
+        """Durable Controller-loop checkpoints, separate from business facts."""
         return self.root / "state/graph_checkpoints.sqlite"
+
+    @property
+    def action_checkpoints(self) -> Path:
+        """Durable agent Action checkpoints, isolated from the Controller graph."""
+        return self.root / "state/action_checkpoints.sqlite"
 
     @property
     def staging_root(self) -> Path:

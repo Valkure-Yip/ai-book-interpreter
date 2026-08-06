@@ -631,6 +631,75 @@ async def test_integrity_unblock_preserves_history_and_creates_replacement(
 
 
 @pytest.mark.asyncio
+async def test_operational_unblock_replaces_terminal_failed_action(
+    tmp_path: Path,
+) -> None:
+    """A code/config fix can resume a blocked side-effect-free Action without DB edits."""
+    project = scaffold_project(_request_for(tmp_path), root=tmp_path / "operational")
+    async with RunLedger.open(project.run_db) as ledger:
+        run_id = await ledger.create_run(RunSeed(run_id="operational-run"))
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="run a side-effect-free action",
+                proposed_actions=(
+                    ProposedAction(proposal_id="broken", capability="source.ingest"),
+                ),
+                rationale="exercise operational recovery",
+            ),
+        )
+        await ledger.authorize_actions(run_id, (_authorized_action(),))
+        await ledger.start_attempt("broken-action")
+        outcome = PermanentFailure(
+            error_code="unclassified_exception",
+            message="safe durable failure summary",
+        )
+        envelope_json = canonical_model_json(
+            ActionOutcomeEnvelope(action_id="broken-action", attempt=1, outcome=outcome)
+        )
+        await ledger.record_attempt_outcome(
+            AttemptOutcomeReceiptPayload(
+                action_id="broken-action",
+                attempt=1,
+                canonical_outcome_json=envelope_json,
+                outcome_digest=sha256_canonical_json(envelope_json),
+                error_code=outcome.error_code,
+            )
+        )
+        await ledger.finish_attempt(
+            "broken-action", attempt=1, status=ActionStatus.PERMANENT_FAILED
+        )
+        await ledger.record_incident(
+            run_id,
+            error_code=outcome.error_code,
+            message=outcome.message,
+            action_id="broken-action",
+        )
+        await ledger.set_run_status(run_id, RunStatus.BLOCKED)
+
+    result = await lifecycle.unblock(
+        project_root=project.root,
+        request=lifecycle.UnblockRequest(
+            reason="fixed the controller-owned tool schema",
+            evidence_refs=("tests:test_spotcheck_tool_schema",),
+            source_action_id="broken-action",
+        ),
+    )
+
+    async with RunLedger.open(project.run_db) as ledger:
+        run = await ledger.get_run("operational-run")
+        original = await ledger.get_action("broken-action")
+        replacement = await ledger.get_action(result.replacement_action_id)
+        incidents = await ledger.list_incidents("operational-run", open_only=True)
+
+    assert run.status is RunStatus.RUNNING
+    assert original.status is ActionStatus.PERMANENT_FAILED
+    assert replacement.status is ActionStatus.AUTHORIZED
+    assert replacement.action_id != original.action_id
+    assert incidents == ()
+
+
+@pytest.mark.asyncio
 async def test_unblock_rejects_semantic_repair_and_budget_resume_needs_no_replacement(
     tmp_path: Path,
 ) -> None:
@@ -1429,7 +1498,9 @@ async def test_default_hitl_continuation_reconstructs_exact_action_request(
     assert len(seen) == 1
     agent_request = seen[0]
     assert agent_request.thread_id == "hitl-run/hitl-action/1"
-    assert agent_request.checkpoint_path == BookProject(project_root).graph_checkpoints
+    project = BookProject(project_root)
+    assert agent_request.checkpoint_path == project.action_checkpoints
+    assert agent_request.checkpoint_path != project.graph_checkpoints
     assert agent_request.resume.interrupts[0].interrupt_id == "public-interrupt-1"
     assert agent_request.resume.interrupts[0].decisions[0].decision == "reject"
     assert agent_request.resume.interrupts[0].decisions[0].feedback == "operator denied"

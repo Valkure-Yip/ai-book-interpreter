@@ -30,6 +30,13 @@
 > 并转为 `RESOLVED`；业务路由只通过 effective outcome 选择最新 continuation。`STARTED` 崩溃恢复只能
 > 使用 Task 6 public checkpoint inspector 裁决；旧 pending 不能证明未执行，必须 fail closed。
 >
+> **全流程收尾修订：已实现。** 2026-08-06；Planner 拒绝后由 controller 选择 DAG 最深的单一
+> eligible Action 作为有界 deterministic frontier，semantic repair 也由 Registry reason mapping
+> 确定性选择。release version 是 controller-owned fixed argument；release 授权依赖 Registry DAG 中的
+> independent review + spot-check current success，不再把 release 自己尚未生成的 expected evidence
+> 当作前置 gate。HITL continuation 完成后从同一 attempt staging 重建 exact bundle，再进入 validator/
+> commit。`short_book` 实跑证据见 19.2 节。
+>
 > 本文定义 ABI 当前宏观控制平面：用 `Planner + PolicyEngine + durable action loop`
 > 取代固定阶段链。LangGraph 的具体分层与 checkpoint/HITL 恢复协议见
 > [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md)。
@@ -229,7 +236,11 @@ flowchart TD
 
     PLAN --> PLANOK{"PlanPatch 合法？"}
     PLANOK -- "否" --> REJECT["记录拒绝原因<br/>非法依赖、越权、预算或循环"]
-    REJECT --> PLAN
+    REJECT --> FRONTIER{"有合法 deterministic<br/>repair / deepest frontier？"}
+    FRONTIER -- "是" --> FALLBACK["生成单 Action PlanPatch<br/>固定参数来自 Registry"]
+    FALLBACK --> PLANOK
+    FRONTIER -- "否且达到上限" --> BLOCKED
+    FRONTIER -- "否且未达到上限" --> PLAN
 
     PLANOK -- "是" --> BATCH["选择一个 Action<br/>或无写冲突的并行 batch"]
     BATCH --> AUTH["AUTHORIZED 持久化<br/>expected manifest + retry policy/fingerprint"]
@@ -252,7 +263,10 @@ flowchart TD
     VIEW --> VALIDATE["确定性 validator<br/>绑定 bundle digest 与 checksum"]
     HOOK -- "RetryableFailure" --> RETRY{"durable receipt/policy<br/>允许 next attempt？"}
     RETRY -- "是" --> RETRYWAIT["路由事务终结旧 attempt/action<br/>RETRY_WAIT · receipt 不变"]
-    RETRY -- "否" --> RETRYBLOCK["retry_exhausted incident<br/>run = BLOCKED"]
+    RETRY -- "否" --> REPAIRGEN{"bound semantic<br/>replacement generation？"}
+    REPAIRGEN -- "是" --> NEXTGEN["当前 generation = PERMANENT_FAILED<br/>原 semantic incident 保持 OPEN<br/>外层 bounded replan"]
+    REPAIRGEN -- "否" --> RETRYBLOCK["retry_exhausted incident<br/>run = BLOCKED"]
+    NEXTGEN --> SEMREPAIR
     RETRYBLOCK --> BLOCKED
     HOOK -- "RepairRequired" --> REPAIRCLASS{"repair_class + source/reason<br/>明确且可信？"}
 
@@ -555,6 +569,12 @@ next-attempt 创建后、首次 claim 前崩溃时，可恢复派发该 `AUTHORI
 分类为 semantic automatic replan 或 integrity blocking。artifact conflict、durable corruption 与 unknown
 probe 绝不能借 retry API 继续。
 
+若 `RetryableFailure` 的 error code 未注册或 attempt 已达到冻结上限，ledger 必须先把当前 attempt/Action
+收敛为 `PERMANENT_FAILED`，不得留下带终态 receipt 的 `RUNNING` 行。普通 Action 随后创建
+`retry_exhausted` 并阻断；若该 Action 是已绑定 open semantic incident 的 replacement generation，则不
+另造不可关闭的 operational incident，而是保留原 semantic incident，由外层
+`max_semantic_repair_attempts` 允许下一 replacement Action 或最终以 `semantic_repair_stalled` 阻断。
+
 ### 7.8 Semantic repair versus integrity blocking
 
 `REPAIR_REQUIRED` 是 attempt/Action 状态，不足以决定 run 路由。每个 repair fact、incident 和对应 outbox
@@ -581,8 +601,10 @@ fail closed，不能默认为 semantic。
    plan version、new action ID 和 new staging namespace。
 
 Semantic repair Action 仍只能写自己的 attempt staging，并受新的 exact expected manifest 约束；它不得
-覆盖、删除、选择或“清理”任何 conflict canonical、旧 receipts、gate receipts 或 intents。若 semantic
-repair 规划时发现任一 integrity incident，PolicyEngine 必须拒绝授权并保持 `BLOCKED`。
+覆盖、删除、选择或“清理”任何 **conflict** canonical、旧 receipts、gate receipts 或 intents。对于完整性
+仍可信的当前 canonical，只有绑定 open semantic incident 的 replacement Action 才能在 commit 阶段创建
+新 generation；普通 Planner proposal 不能借同一路径重跑已成功能力。若 semantic repair 规划时发现任一
+integrity incident，PolicyEngine 必须拒绝授权并保持 `BLOCKED`。
 
 第一版至少固定以下分类 vocabulary；validator 可增加 reason，但只有 Registry 显式映射后才可进入
 semantic 路径：
@@ -590,13 +612,50 @@ semantic 路径：
 | repair class | repair source | stable reason codes | route |
 | --- | --- | --- | --- |
 | `semantic` | `action_outcome` | `term_drift` | run 保持 `RUNNING`；new plan/action/staging |
-| `semantic` | `validator` | Registry-mapped validator reason，例如 `chapter_quality_failed`、`epub_lint_failed` | run 保持 `RUNNING`；new plan/action/staging |
+| `semantic` | `validator` | `translation_quality_failed`、`epub_quality_failed`、`spotcheck_not_passed` 等 Registry-mapped reason | 路由到可修改上游产物的 capability；new plan/action/staging |
 | `integrity` | `action_outcome` | `artifact_identity_conflict` | run=`BLOCKED`；人工 resolve/unblock 后 new plan/action/staging |
 | `integrity` | `integrity_guard` | `artifact_bundle_conflict`、`artifact_checksum_conflict`、`canonical_write_incomplete`、`partial_intent_set`、`receipt_binding_conflict`、`gate_binding_conflict`、`post_success_drift`、`probe_resolution_unknown`、`probe_resolution_conflict`、`external_side_effect_unclassified`、`repair_class_unknown` | run=`BLOCKED`；人工 resolve/unblock 后 new plan/action/staging |
 
 `repair_source` 描述实际产生 durable repair fact 的边界，不能为迎合 semantic mapping 而改写；例如
 executor 返回的 `term_drift` 是 `action_outcome`，validator FAIL 是 `validator`，Reconciler 检出的 drift
 是 `integrity_guard`。
+
+### 7.9 Canonical generations and downstream invalidation
+
+Canonical 路径是“当前视图”，不是只允许写一次的历史表。历史不可变性由 attempt staging、receipt、gate、
+promotion intent 和 `artifacts` generation 保证；`artifacts.is_current=1` 的唯一部分索引只允许每个路径有
+一个当前 generation。本协议使用 ledger schema v2，不迁移或读取 schema v1 run。替换协议如下：
+
+```mermaid
+flowchart LR
+    FAIL["Validator opens mapped semantic incident"] --> AUTH["Policy authorizes exact repair capability"]
+    AUTH --> STAGE["New action + attempt staging"]
+    STAGE --> PASS{"Validator PASS?"}
+    PASS -- "no" --> RETRY["bounded retry / next repair generation"]
+    PASS -- "yes" --> BIND["Intent binds predecessor artifact ID + checksum"]
+    BIND --> SWAP["Atomic same-filesystem canonical replacement"]
+    SWAP --> HISTORY["Old artifact remains immutable history; new artifact is_current=1"]
+    HISTORY --> INVALIDATE["Recursively invalidate current downstream artifacts whose read_set overlaps"]
+    INVALIDATE --> REPLAN["Planner may rebuild only stale capabilities"]
+```
+
+替换前必须同时证明：replacement Action 绑定 semantic incident；前任 artifact ID、canonical path、ledger
+checksum 与磁盘 checksum 一致；staging checksum 与新 intent 一致。进程在原子 rename 后、ledger commit
+前崩溃时，以“canonical 已等于新 checksum”恢复提交；任何其他组合进入 integrity block。
+
+当 upstream generation 更新时，ledger 在同一 commit 事务中递归将读取该路径的 downstream artifact
+generation 标为 stale。Prerequisite、terminal evidence、scheduler dependency 和完成判定只承认
+`outputs_current=true` 的 success。因而真实翻译缺陷可路由到 `chapter.review`，EPUB/元数据缺陷可路由到
+`preproduction.spec`；其后 sample、EPUB、双审、release、final manifest 和 retrospective 会按依赖重新
+生成，而不会复用旧 PASS。
+
+同一 semantic incident 最多绑定配置项 `max_semantic_repair_attempts` 个未成功 replacement Action；达到
+上限后创建 `semantic_repair_stalled` 并 `BLOCKED`。全局 `max_cycles` 只作为最后保险，不承担非进展检测。
+
+复合 review Action 同样遵守“证据生成”和“缺陷修复”分离：spot-check 的 round、reviewer、chapter、sample
+count 与 seed 都是 Controller-owned fixed arguments。Action 每轮只采样一次、运行两个隔离 reviewer、调用
+一次确定性 validator；PASS 或 FAIL 均立即结束并把完整证据交给 controller，禁止在 reviewer 无权修改
+上游译文时原地循环到 iteration limit。
 
 ## 8. Planner 与 PolicyEngine
 
@@ -610,11 +669,22 @@ Planner 是结构化模型调用，不是拥有业务工具的通用 agent。它
 - 不选择具体 worker 实例；
 - 不读取整本书或全部 agent 轨迹；
 - 不能通过文本声称 PASS/DONE。
+- 不接收已经成功且 `outputs_current=true` 的 capability；只有绑定 semantic incident 的精确修复能力或
+  downstream stale rebuild 会重新出现在 `eligible_actions`。
+- 对采样身份、reviewer 名称、chapter 集、seed 等 Controller-owned `fixed_arguments` 只能原样复制或省略，
+  不得从 JSON Schema 猜测自定义 validator 约束。
+
+Planner 不是每轮都必须参与。存在 policy rejection 历史时，controller 优先生成一个 deterministic frontier
+patch：从当前 eligible actions 中按 Registry prerequisite DAG 深度、成本和 capability 稳定排序，只选择
+最深的单一 Action，并复制其 controller-owned fixed arguments。存在 mapped semantic incident 时，优先
+选择精确 repair capability。这个 fallback 仍必须重新经过同一个 PolicyEngine；连续拒绝达到上限时
+`BLOCKED`，不能绕过策略，也不会退回固定 `HAPPY_PATH`。
 
 以下事件可触发 replan：Action/batch 完成、已持久化且 policy-mapped 的 semantic repair fact、预算阈值、
 人工 resolve/unblock 后的恢复或约束改变。gate FAIL 只有被 Registry 明确映射为 semantic repair 且完整性
-前提成立时才属于该集合；artifact drift、重试用尽、未知 repair classification 和 integrity incident 必须先
-`BLOCKED`，不能直接触发 Planner。
+前提成立时才属于该集合；artifact drift、普通 Action 重试用尽、未知 repair classification 和 integrity
+incident 必须先 `BLOCKED`，不能直接触发 Planner。已绑定 semantic incident 的 replacement generation
+重试用尽属于该 incident 的外层 bounded replan，不走普通 operational unblock。
 
 ### 8.2 PolicyEngine
 
@@ -632,13 +702,17 @@ PolicyEngine 是纯确定性模块，输入
 - 并行 Action 的 write/write 和 read/write 集合无冲突；
 - fan-out、成本、turn、时限和并发上限有效；
 - 相同失败签名不得形成无界循环；
+- 已有 current success 的 capability 不得再次授权；只有精确 mapped semantic repair 或 stale downstream
+  rebuild 可以例外；
 - semantic repair reason 必须在 Registry 中显式映射到 repair capability，且 durable repair fact 的
   `repair_class`、`repair_source`、`reason_code` 与映射一致；
 - 任一 integrity incident、未知/缺失 repair classification 或不确定外部副作用存在时，拒绝自动 repair
   plan 并保持 run=`BLOCKED`；
-- semantic repair Action 的 exact manifest 只能指向新 attempt staging，不能覆盖、删除、选择或清理
-  conflict canonical、旧 outcome/gate receipts、promotion intents 或 probe resolutions；
-- release Action 只能在 terminal policy 的全部前置条件满足后授权。
+- semantic repair Action 的 exact manifest 只能指向新 attempt staging；commit 只可按 7.9 supersede 已绑定
+  且 checksum 匹配的可信 current generation，不能覆盖、删除、选择或清理 conflict canonical、旧
+  outcome/gate receipts、promotion intents 或 probe resolutions；
+- release Action 只在 Registry 声明的 review prerequisites 都有 current success 时授权；release 自身的
+  expected evidence 是执行后 validator/commit 所需的输出契约，不得在执行前被误用为 gate。
 
 拒绝决定与原因进入 ledger，作为下一次 Planner 输入和 L1 eval 数据。
 
@@ -754,7 +828,8 @@ event_outbox
   intent。完全相同的 failed decision 重放幂等；不同重放保留首个 receipt，回滚后以
   `gate_binding_conflict` 独立补偿并阻断。
 - Gate 必须关联 evidence ID、validator version 和输入 artifact checksums。
-- Artifact 记录路径、hash、producer action、attempt 和 committed_at。
+- Artifact 记录路径、hash、producer action、attempt、committed_at、`is_current` 与 `superseded_at`；每个
+  canonical path 只允许一个 current generation，历史 generation 永不改写。
 - artifact bundle 记录 canonical JSON/digest、`action_id + attempt`；同一成功 attempt 只能有一个完全一致的
   bundle，重复不同内容 fail closed。
 - probe resolution 表唯一绑定原 action/attempt、probe action/attempt 和 operation key；重复相同 resolution
@@ -842,6 +917,7 @@ LangGraph checkpoint
 | 预算耗尽 | `PAUSED_BUDGET`；提高预算后恢复 |
 | 需要人工判断 | `PAUSED_HITL`；以 interrupt/Command 恢复 |
 | HITL decision=`CLAIMED` | 原子写 `STARTED` marker 后才允许第一次 provider resume |
+| HITL continuation 返回完成 | 从同一 `action_id + attempt` staging 按 durable expected manifest 重建 exact bundle；不能依赖新进程中空的 writer entry list，也不能跳过 validator/commit |
 | HITL decision=`STARTED` 且无可重建的新 outcome | 原 action/attempt=`INDETERMINATE`、run=`BLOCKED`；人工凭副作用证据创建 new plan/action/staging，禁止重发旧 resume |
 | 原 Action 为 `INDETERMINATE` | 只授权其绑定的 evidence-only probe；用 `ProbeResolution` 原子解析，禁止重发原操作 |
 | 外部条件缺失 | `BLOCKED`；条件修复后恢复 |
@@ -1128,7 +1204,7 @@ validator version、错误分类、成本和 trace IDs。repair 事件还必须�
 - hard gate 不可跳过；
 - dependency cycle；
 - read/write 冲突；
-- terminal policy；
+- release prerequisite DAG 与 post-execution evidence contract 不得混淆；
 - ActionOutcome 分类；
 - semantic/integrity repair classification 的 class/source/reason 必填、Registry reason mapping 与未知分类
   fail-closed；
@@ -1304,6 +1380,34 @@ dict/Any。
   explicit `round:` marker 界定最新轮；同一轮内的 FAIL/重复字段不能再由空行或后置 PASS 块掩盖。
 - **最终独立复审：** 第四次 scoped review 独立执行 35 个 adversarial cases，确认上述空行绕过关闭且
   I1-I3 未回退；结论为 Critical 0 / Important 0 / Minor 0，Ready to merge: Yes。
+
+### 19.2 `short_book` 全流程验证与收尾修订（2026-08-06）
+
+- **真实运行：** `books/zh-Hans/0023_short-book-agent-loop-validation-23`，run
+  `77e6e005-9d19-44fd-ab23-e957ae1517fe` 最终为 `COMPLETED`，开放 incident 为 0。终端能力
+  `release.prepare`、replacement `output.finalize`、`retrospective.capture` 均为 `SUCCEEDED`；历史失败、
+  rejected plan、旧 attempt 与 continuation receipt 保留在 ledger 中，没有被成功结果覆盖。
+- **质量与发布：** independent agent A/B 最终均 `result: PASS`；`round_001` spot-check 为 PASS，
+  双 reviewer 得分 95、confidence 0.95。`release_state.json` 为 `latest_status=PASS`、
+  `latest_version=v0.0.1`，发布物为 `output/release/book_v0.0.1.epub`；独立执行 EPUBCheck 3.3 得到
+  `0 fatals / 0 errors / 0 warnings`，ZIP 完整性检查也通过。最终 manifest 与两份 retrospective 工件均已提交。
+- **Planner 收敛：** free-form patch 被拒绝后，controller 使用 Registry prerequisite DAG depth 选择单一
+  deepest eligible Action。这个策略覆盖 normal frontier 与 mapped semantic repair，所有 fallback patch
+  仍经过 PolicyEngine；不存在恢复旧 `HAPPY_PATH` 或 planner 自授权。
+- **release 契约：** `release.prepare.version` 固定为 controller-owned `v0.0.1`。发布的前置权威来自
+  `review.independent` 与 `review.spotcheck` 的 current success；release expected evidence 只约束其执行后
+  staged output 与 validator，不再形成“发布前要求发布输出已存在”的循环条件。
+- **HITL 断点：** `output.finalize.write_file` 的初始 `Paused` receipt 保持不可变。批准后 runtime 在相同
+  thread/action/attempt checkpoint 继续，approved tool 输出写入同一 staging；新进程中的 writer 没有旧的
+  in-memory entry list，因此 executor 依据 durable expected manifest 从 staging 重建 exact bundle，再走
+  validator、promotion 与 commit。批准后的模型收尾也属于 continuation，运行命令必须具备与原 Action
+  相同的 provider 网络条件。
+- **抽检轮次限制：** 生产默认仍要求连续 2 轮 PASS。本次短书 smoke 通过已有
+  `ABI_SPOTCHECK_PASS_ROUNDS=1` 运行级 override 冻结为单轮；当前 controller 只注册 `round_001` fixed
+  arguments，多轮自动推进仍是后续能力，不影响本次单轮 smoke 对完整业务链路的证明。
+- **最终自动化：** Python 3.12 执行全量 pytest 为 `760 passed, 55 warnings`；
+  `mypy --strict --python-version 3.12 src` 对 98 个 source files 为 0 issues；Ruff 全仓库通过，
+  `git diff --check` 通过。warnings 均为既有 datetime/ebooklib 弃用提示。
 
 ## 20. 实现完成判据
 

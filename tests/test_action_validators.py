@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from abi.actions.validators import validate_evidence
 from abi.epub.result import GateResult
 from abi.project.artifacts import ArtifactStore, sha256_file
 from abi.project.layout import BookProject
+from abi.prompts.actions import ActionPromptRegistry, ActionPromptSnapshot
 from abi.types.orchestration import ArtifactRef
 
 
@@ -311,6 +313,24 @@ polysemy_unresolved_count: 0
 """,
             True,
         ),
+        (
+            "Substantive controlled translation.",
+            """## Round 1
+scope: FULL_CHAPTER
+issues_found: 0
+fixes_applied: 0
+unresolved_blocking_issues: 0
+latest_round_status: PASS
+allow_next_chapter: true
+expert_translation_skill_used: true
+polysemy_unresolved_count: 0
+
+expert_level_review_status: "PASS"
+polysemy_translation_stage_review: "PASS"
+polysemy_context_review: "PASS"
+""",
+            True,
+        ),
     ),
 )
 def test_chapter_control_requires_substantive_revision_and_complete_pass_report(
@@ -334,6 +354,92 @@ def test_chapter_control_requires_substantive_revision_and_complete_pass_report(
     decision = validate_evidence("chapter.control", view, parameters, bundle)
 
     assert decision.passed is expected_pass
+
+
+def test_rendered_chapter_control_protocol_passes_its_validator(tmp_path: Path) -> None:
+    parameters = ChapterBatchInput(chapters=("001",))
+    prompt = ActionPromptRegistry().render(
+        "chapter.control", parameters, ActionPromptSnapshot()
+    )
+    match = re.search(r"```\n(scope: FULL_CHAPTER\n.*?)\n```", prompt, re.DOTALL)
+    assert match is not None
+    project = scaffold_without_ledger(tmp_path)
+    (project.chapters_controlled / "001.md").write_text(
+        "Substantive controlled translation.", encoding="utf-8"
+    )
+    (project.root / "qa/chapter_controls/001.control.md").write_text(
+        match.group(1) + "\n", encoding="utf-8"
+    )
+    view, bundle = _validator_input(
+        project, "chapter.control", parameters, action_id="rendered-control-protocol"
+    )
+
+    decision = validate_evidence("chapter.control", view, parameters, bundle)
+
+    assert decision.passed is True
+
+
+def test_glossary_validator_rejects_unquoted_commas_before_downstream_use(
+    tmp_path: Path,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    project.terms_csv.parent.mkdir(parents=True, exist_ok=True)
+    project.terms_csv.write_text(
+        "term,target,status,display_policy,forbidden_body_renderings,note\n"
+        "constitutive,构成,locked,use_target_only,构成性,Convey the role, e.g. active\n",
+        encoding="utf-8",
+    )
+    project.style_guide.write_text("Use precise terminology.", encoding="utf-8")
+    parameters = EmptyInput()
+    view, bundle = _validator_input(
+        project, "glossary.prepare", parameters, action_id="glossary-invalid-csv"
+    )
+
+    decision = validate_evidence("glossary.prepare", view, parameters, bundle)
+
+    assert decision.passed is False
+    assert decision.reason_code == "glossary_terms_invalid"
+
+
+def test_glossary_validator_rejects_unknown_status(tmp_path: Path) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    project.terms_csv.parent.mkdir(parents=True, exist_ok=True)
+    project.terms_csv.write_text(
+        "term,target,status,display_policy,forbidden_body_renderings,note\n"
+        "constitutive,构成,maybe,use_target_only,构成性,precise term\n",
+        encoding="utf-8",
+    )
+    project.style_guide.write_text("Use precise terminology.", encoding="utf-8")
+    parameters = EmptyInput()
+    view, bundle = _validator_input(
+        project, "glossary.prepare", parameters, action_id="glossary-invalid-status"
+    )
+
+    decision = validate_evidence("glossary.prepare", view, parameters, bundle)
+
+    assert decision.passed is False
+    assert decision.reason_code == "glossary_terms_invalid"
+    assert "status" in decision.message
+
+
+def test_preproduction_spec_requires_complete_finalized_metadata(tmp_path: Path) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    project.production_spec.parent.mkdir(parents=True, exist_ok=True)
+    project.production_spec.write_text("# Production specification\n", encoding="utf-8")
+    project.finalized_book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.finalized_book_yaml.write_text(
+        "title: Final title\nlanguage: zh-Hans\n",
+        encoding="utf-8",
+    )
+    parameters = EmptyInput()
+    view, bundle = _validator_input(
+        project, "preproduction.spec", parameters, action_id="preproduction-invalid"
+    )
+
+    decision = validate_evidence("preproduction.spec", view, parameters, bundle)
+
+    assert decision.passed is False
+    assert decision.reason_code == "finalized_metadata_invalid"
 
 
 def test_every_builtin_capability_has_an_exhaustive_validator(tmp_path: Path) -> None:
@@ -416,6 +522,60 @@ def test_semantic_validators_reject_empty_or_incomplete_exact_bundles(
 
     assert result.passed is False
     assert result.reason_code != "evidence_valid"
+
+
+@pytest.mark.parametrize(
+    ("agent_a_result", "agent_b_result", "expected_reason"),
+    (
+        ("FAIL", "PASS", "translation_quality_failed"),
+        ("PASS", "FAIL", "epub_quality_failed"),
+        ("Final Verdict: PASS", "PASS", "independent_review_protocol_invalid"),
+    ),
+)
+def test_independent_review_routes_protocol_and_real_quality_failures_separately(
+    tmp_path: Path,
+    agent_a_result: str,
+    agent_b_result: str,
+    expected_reason: str,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    parameters = ReviewBatchInput()
+    action_id = "independent-review"
+    manifest = expand_expected_artifacts(
+        "review.independent", action_id, parameters
+    )
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer(action_id, 1)
+        for expected in manifest.entries:
+            if "agent_a" in expected.canonical_relpath:
+                content = (
+                    f"# Translation findings\n\nproblem details\n\n"
+                    f"{agent_a_result if ':' in agent_a_result else f'result: {agent_a_result}'}\n"
+                )
+            elif "agent_b" in expected.canonical_relpath:
+                content = f"# EPUB findings\n\nresult: {agent_b_result}\n"
+            else:
+                content = "status: REQUIRED\nresult: FAIL\n"
+            writer.write_text(
+                expected.canonical_relpath,
+                content,
+                media_type=expected.media_type,
+                evidence_role=expected.evidence_role,
+                metadata=expected.metadata,
+            )
+        bundle = writer.artifact_bundle()
+        view = StagingEvidenceView.for_bundle(project, (), bundle)
+        result = validate_evidence(
+            "review.independent", view, parameters, bundle
+        )
+    finally:
+        store.close()
+
+    assert result.passed is False
+    assert result.reason_code == expected_reason
+    if expected_reason == "translation_quality_failed":
+        assert "problem details" in result.message
 
 
 def test_epub_validator_accepts_existing_gate_report_shape(tmp_path: Path) -> None:

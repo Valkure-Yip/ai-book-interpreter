@@ -99,6 +99,36 @@ class ActionRegistry:
             self._definitions[capability].spec for capability in sorted(self._definitions)
         )
 
+    def progress_depth(self, capability: str) -> int:
+        """Return deterministic DAG depth from registered action.succeeded prerequisites."""
+        memo: dict[str, int] = {}
+        visiting: set[str] = set()
+
+        def depth(current: str) -> int:
+            if current in memo:
+                return memo[current]
+            if current in visiting:
+                raise RegistryConfigurationError(
+                    f"capability prerequisite cycle includes {current}; repair the registry DAG"
+                )
+            visiting.add(current)
+            dependencies: list[str] = []
+            for predicate in self.get(current).spec.prerequisites:
+                if predicate.name != "action.succeeded":
+                    continue
+                for argument in predicate.arguments:
+                    if argument.name != "capability":
+                        continue
+                    value = json.loads(argument.value_json)
+                    if isinstance(value, str) and self.contains(value):
+                        dependencies.append(value)
+            result = 0 if not dependencies else 1 + max(depth(item) for item in dependencies)
+            visiting.remove(current)
+            memo[current] = result
+            return result
+
+        return depth(capability)
+
     def validate_startup(self) -> None:
         for definition in self._definitions.values():
             self._validate_definition(definition)
@@ -160,14 +190,47 @@ class ActionRegistry:
 
     def eligible(self, snapshot: RunSnapshot) -> tuple[EligibleAction, ...]:
         eligible: list[EligibleAction] = []
+        current_succeeded = {
+            action.capability
+            for action in snapshot.actions
+            if action.outputs_current
+        }
+        repair_reasons_by_capability: dict[str, set[str]] = {}
+        for incident in snapshot.incidents:
+            reason_code = incident.reason_code
+            if (
+                incident.repair_class == "semantic"
+                and reason_code is not None
+                and self.has_semantic_repair(reason_code)
+            ):
+                repair_capability = self.semantic_repair_capability(reason_code)
+                repair_reasons_by_capability.setdefault(repair_capability, set()).add(
+                    reason_code
+                )
         for capability, definition in self._definitions.items():
-            if self.prerequisites_pass(definition, snapshot):
+            if (
+                capability in current_succeeded
+                and capability not in repair_reasons_by_capability
+            ):
+                continue
+            if (
+                self.prerequisites_pass(definition, snapshot)
+                or capability in repair_reasons_by_capability
+            ):
                 spec = definition.spec
                 eligible.append(
                     EligibleAction(
                         capability=capability,
                         description=spec.description,
-                        input_schema=spec.input_schema,
+                        input_schema=json.dumps(
+                            definition.input_model.model_json_schema(),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        fixed_arguments=definition.fixed_arguments,
+                        repairs_reason_codes=tuple(
+                            sorted(repair_reasons_by_capability.get(capability, ()))
+                        ),
                         estimated_cost_usd=spec.estimated_cost_usd,
                     )
                 )
@@ -190,6 +253,14 @@ class ActionRegistry:
     ) -> ResolvedAction:
         definition = self.get(capability)
         raw = self._decode_unique_arguments(capability, arguments)
+        fixed = self._decode_unique_arguments(capability, definition.fixed_arguments)
+        for name, value in fixed.items():
+            if name in raw and raw[name] != value:
+                raise RegistryConfigurationError(
+                    f"controller-owned argument for {capability} field {name} cannot be "
+                    "overridden by the Planner"
+                )
+            raw[name] = value
         try:
             parameters = definition.input_model.model_validate(raw)
         except ValidationError as exc:
@@ -257,6 +328,18 @@ class ActionRegistry:
 
     def _validate_definition(self, definition: ActionDefinition) -> None:
         spec = definition.spec
+        if definition.fixed_arguments:
+            raw = self._decode_unique_arguments(
+                spec.capability, definition.fixed_arguments
+            )
+            try:
+                definition.input_model.model_validate(raw)
+            except ValidationError as exc:
+                field = ".".join(str(part) for part in exc.errors()[0]["loc"])
+                raise RegistryConfigurationError(
+                    f"fixed arguments for {spec.capability} field {field} do not match "
+                    "the registered input schema"
+                ) from exc
         if re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", spec.capability) is None:
             raise RegistryConfigurationError(
                 f"capability {spec.capability!r} must use a portable lowercase ASCII namespace; "

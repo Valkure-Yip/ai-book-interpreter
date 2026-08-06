@@ -59,8 +59,14 @@ class DynamicController:
         reconciler: Reconciler,
         projector: OutboxProjector,
         complete_when: CompletionPredicate,
+        max_plan_rejections: int = 3,
+        max_semantic_repair_attempts: int = 3,
         test_hook: ControllerHook | None = None,
     ) -> None:
+        if max_plan_rejections < 0:
+            raise ValueError("max_plan_rejections must be non-negative")
+        if max_semantic_repair_attempts < 1:
+            raise ValueError("max_semantic_repair_attempts must be positive")
         self._ledger = ledger
         self._registry = registry
         self._planner = planner
@@ -72,6 +78,8 @@ class DynamicController:
         self._reconciler = reconciler
         self._projector = projector
         self._complete_when = complete_when
+        self._max_plan_rejections = max_plan_rejections
+        self._max_semantic_repair_attempts = max_semantic_repair_attempts
         self._test_hook = test_hook
 
     async def tick(self, run_id: str) -> bool:
@@ -96,6 +104,9 @@ class DynamicController:
         await self._authorize_pending_probes(run_id)
         context = await self._snapshots.build(run_id)
         snapshot = context.policy_snapshot
+        if await self._block_if_semantic_repair_stalled(run_id, snapshot):
+            await self._projector.flush(run_id)
+            return False
         candidates = tuple(
             action
             for action in await self._ledger.list_actions(run_id)
@@ -116,10 +127,20 @@ class DynamicController:
             plan = await self._ledger.pending_plan(run_id)
             authorization_snapshot = context.policy_snapshot
             if plan is None:
-                if semantic_repair_pending:
+                patch = self._deterministic_repair_patch(context)
+                rejection_count = await self._ledger.consecutive_plan_rejection_count(run_id)
+                if patch is None and (
+                    rejection_count or context.policy_snapshot.plan_rejections
+                ):
+                    patch = self._deterministic_frontier_patch(context)
+                if patch is None and await self._block_if_plan_rejections_exhausted(run_id):
+                    await self._projector.flush(run_id)
+                    return False
+                if patch is None:
+                    self._invoke_hook("before_planner", context)
+                    patch = await self._planner.plan(context)
+                else:
                     self._invoke_hook("before_semantic_replan", context)
-                self._invoke_hook("before_planner", context)
-                patch = await self._planner.plan(context)
                 plan = await self._ledger.append_plan(run_id, patch)
                 if semantic_repair_pending:
                     self._invoke_hook("after_semantic_replan", plan)
@@ -138,6 +159,9 @@ class DynamicController:
                     plan_version=plan.version,
                     reason_codes=decision.reason_codes,
                 )
+                if await self._block_if_plan_rejections_exhausted(run_id):
+                    await self._projector.flush(run_id)
+                    return False
                 await self._projector.flush(run_id)
                 return True
             if semantic_repair_pending:
@@ -200,6 +224,65 @@ class DynamicController:
             keep_running = False
         await self._projector.flush(run_id)
         return keep_running
+
+    def _deterministic_frontier_patch(self, context: PlanningContext) -> PlanPatch | None:
+        """Recover from one rejected proposal with the deepest runnable DAG node."""
+        eligible = context.policy_snapshot.eligible_actions
+        if not eligible:
+            return None
+        selected = min(
+            eligible,
+            key=lambda action: (
+                -self._registry.progress_depth(action.capability),
+                action.estimated_cost_usd,
+                action.capability,
+            ),
+        )
+        next_version = context.policy_snapshot.plan_version + 1
+        return PlanPatch(
+            objective=f"advance current evidence frontier with {selected.capability}",
+            proposed_actions=(
+                ProposedAction(
+                    proposal_id=f"frontier-{next_version}-{selected.capability.replace('.', '-')}",
+                    capability=selected.capability,
+                    arguments=selected.fixed_arguments,
+                    priority=50,
+                ),
+            ),
+            rationale=(
+                "The prior LLM patch was rejected; select one deepest currently eligible "
+                "registered DAG node to guarantee bounded forward progress."
+            ),
+        )
+
+    @staticmethod
+    def _deterministic_repair_patch(context: PlanningContext) -> PlanPatch | None:
+        """Select the next policy-mapped semantic repair without an LLM round trip."""
+        repairs = tuple(
+            action
+            for action in context.policy_snapshot.eligible_actions
+            if action.repairs_reason_codes
+        )
+        if not repairs:
+            return None
+        selected = min(repairs, key=lambda action: action.capability)
+        next_version = context.policy_snapshot.plan_version + 1
+        reasons = ",".join(selected.repairs_reason_codes)
+        return PlanPatch(
+            objective=f"repair semantic incident(s): {reasons}",
+            proposed_actions=(
+                ProposedAction(
+                    proposal_id=f"repair-{next_version}-{selected.capability.replace('.', '-')}",
+                    capability=selected.capability,
+                    arguments=selected.fixed_arguments,
+                    priority=100,
+                ),
+            ),
+            rationale=(
+                "The registry maps each open semantic reason to one eligible repair "
+                "capability; controller selection is deterministic."
+            ),
+        )
 
     async def _reserve_due_retries(self, run_id: str) -> None:
         """Turn each durable RETRY_WAIT into exactly one authorized successor."""
@@ -357,13 +440,57 @@ class DynamicController:
         await self._block(run_id, "controller_max_cycles_exhausted")
         await self._projector.flush(run_id)
 
+    async def _block_if_plan_rejections_exhausted(self, run_id: str) -> bool:
+        count = await self._ledger.consecutive_plan_rejection_count(run_id)
+        threshold = max(1, self._max_plan_rejections)
+        if count < threshold:
+            return False
+        await self._ledger.record_incident(
+            run_id,
+            error_code="planner_rejection_limit_exhausted",
+            message=(
+                f"Planner produced {count} consecutive rejected plans; configured limit is "
+                f"{self._max_plan_rejections}. Inspect deterministic rejection feedback and "
+                "resume only after repairing the planning contract or provider behavior."
+            ),
+        )
+        await self._block(run_id, "planner_rejection_limit_exhausted")
+        return True
+
+    async def _block_if_semantic_repair_stalled(
+        self, run_id: str, snapshot: RunSnapshot
+    ) -> bool:
+        """Stop repeated repair generations that have produced no successful evidence."""
+        for incident in snapshot.incidents:
+            if incident.repair_class != "semantic":
+                continue
+            attempts = await self._ledger.semantic_repair_attempt_count(
+                incident.incident_id
+            )
+            if attempts < self._max_semantic_repair_attempts:
+                continue
+            await self._ledger.record_incident(
+                run_id,
+                error_code="semantic_repair_stalled",
+                message=(
+                    f"Semantic incident {incident.incident_id} has already been bound to "
+                    f"{attempts} unsuccessful replacement Actions; configured limit is "
+                    f"{self._max_semantic_repair_attempts}. Preserve the evidence and repair "
+                    "the route or inputs before resuming."
+                ),
+                action_id=incident.action_id,
+            )
+            await self._block(run_id, "semantic_repair_stalled")
+            return True
+        return False
+
     def _select_batch(
         self, candidates: tuple[ActionRecord, ...], snapshot: RunSnapshot
     ) -> tuple[ActionRecord, ...]:
         committed = frozenset(
             action.action_id
             for action in snapshot.actions
-            if action.status is ActionStatus.SUCCEEDED
+            if action.status is ActionStatus.SUCCEEDED and action.outputs_current
         )
         eligible = frozenset(action.capability for action in snapshot.eligible_actions)
         return self._scheduler.select_batch(

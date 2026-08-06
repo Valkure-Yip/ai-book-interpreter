@@ -7,6 +7,8 @@ What remains is endpoint + observability + cost + orchestration limits.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from abi.types._base import FrozenModel
@@ -25,6 +27,7 @@ class LLMConfig(FrozenModel):
     max_output_tokens: int = 8192
     request_timeout_s: int = 240
     max_concurrency: int = 4
+    thinking_mode: Literal["provider_default", "disabled"] = "provider_default"
 
 
 class LangfuseConfig(FrozenModel):
@@ -44,6 +47,7 @@ class OrchestrationConfig(FrozenModel):
     max_cycles: int = Field(default=500, ge=1)
     max_parallel_actions: int = Field(default=4, ge=1)
     default_action_attempts: int = Field(default=3, ge=1)
+    max_semantic_repair_attempts: int = Field(default=3, ge=1)
 
 
 class RunConfig(FrozenModel):

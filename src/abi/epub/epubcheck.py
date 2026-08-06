@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -133,6 +134,15 @@ def _parse_report(json_out: Path, output: str) -> tuple[int, int, int]:
             )
         except Exception:
             pass
+    summaries = re.findall(
+        r"Messages:\s*(\d+)\s+fatals?\s*/\s*(\d+)\s+errors?\s*/\s*"
+        r"(\d+)\s+warnings?",
+        output,
+        flags=re.IGNORECASE,
+    )
+    if summaries:
+        fatal, errors, warnings = summaries[-1]
+        return int(fatal), int(errors), int(warnings)
     # Fallback: scrape text output.
     fatal = output.count("FATAL")
     errors = output.lower().count("error") - output.lower().count("0 error")

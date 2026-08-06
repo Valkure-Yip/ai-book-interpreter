@@ -8,6 +8,7 @@ from pathlib import Path
 from lxml import etree
 
 from abi.epub import asset_manifest_check, build_epub, publication_lint
+from abi.epub.epubcheck import _parse_report
 from abi.project import ScaffoldRequest, scaffold_project
 
 
@@ -22,7 +23,13 @@ def _project(tmp_path: Path):
         )
     )
     project.book_yaml.write_text(
-        "title: 测试书\nauthors: [作者]\nlanguage: zh-Hans\nidentifier: ''\n",
+        "title: 草稿标题\nauthors: []\nlanguage: en\nidentifier: draft\n",
+        encoding="utf-8",
+    )
+    project.finalized_book_yaml.write_text(
+        "title: 测试书\nauthors: [作者]\nlanguage: zh-Hans\n"
+        "identifier: urn:isbn:fixture\nrights: public domain\n"
+        "publisher: LifeBook 书坊 译制\n",
         encoding="utf-8",
     )
     (project.chapters_final / "001_intro.md").write_text(
@@ -48,7 +55,10 @@ def test_build_epub_is_wellformed(tmp_path: Path) -> None:
         info = zf.getinfo("mimetype")
         assert info.compress_type == zipfile.ZIP_STORED
         # OPF, nav, and chapters must be well-formed XML.
-        etree.fromstring(zf.read("OEBPS/content.opf"))
+        opf = zf.read("OEBPS/content.opf")
+        etree.fromstring(opf)
+        assert "测试书".encode() in opf
+        assert "草稿标题".encode() not in opf
         etree.fromstring(zf.read("OEBPS/nav.xhtml"))
         etree.fromstring(zf.read("OEBPS/chap_001_001_intro.xhtml"))
 
@@ -70,3 +80,13 @@ def test_asset_check_flags_missing_image(tmp_path: Path) -> None:
     )
     res = asset_manifest_check(project)
     assert not res.ok
+
+
+def test_epubcheck_text_summary_does_not_count_words_as_errors(tmp_path: Path) -> None:
+    output = """Validating using EPUB version 3.3 rules.
+No errors or warnings detected.
+Messages: 0 fatals / 0 errors / 0 warnings / 0 infos
+EPUBCheck completed
+"""
+
+    assert _parse_report(tmp_path / "missing-report.json", output) == (0, 0, 0)

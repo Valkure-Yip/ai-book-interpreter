@@ -326,6 +326,38 @@ async def test_failed_validator_decision_routes_only_through_typed_repair_fact(
 
 
 @pytest.mark.asyncio
+async def test_failed_validator_may_cite_a_canonical_path_from_its_exact_bundle(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        await _seed(ledger)
+        await ledger.start_attempt("a1", attempt=1)
+        bundle = _bundle()
+        await ledger.record_attempt_outcome(_success_receipt(bundle))
+        decision = _failed_gate(bundle, evidence_refs=("reports/a.json",))
+
+        fact = await ledger.record_repair_required(
+            action_id="a1",
+            attempt=1,
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code=decision.reason_code,
+            defect_codes=(decision.reason_code,),
+            evidence_refs=decision.evidence_refs,
+            message=decision.message,
+            semantic_reason_mapped=True,
+            validator_decision=decision,
+        )
+
+        assert (fact.repair_class, fact.repair_source, fact.reason_code) == (
+            "semantic",
+            "validator",
+            "term_drift",
+        )
+        assert (await ledger.get_run("run-1")).status is RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mismatch", ("bundle", "evidence", "checksum_cardinality"))
 async def test_failed_validator_decision_binding_mismatch_blocks_as_integrity(
     tmp_path: Path, mismatch: str

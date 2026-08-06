@@ -52,21 +52,24 @@ def publication_lint(
     warnings: list[str] = []
 
     meta: dict[str, object] = {}
-    if project.book_yaml.exists():
+    metadata_label = "metadata/finalized_book.yaml"
+    if project.finalized_book_yaml.exists():
         try:
-            loaded = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
+            loaded = yaml.safe_load(
+                project.finalized_book_yaml.read_text(encoding="utf-8")
+            ) or {}
             if not isinstance(loaded, dict):
                 raise TypeError("top-level metadata must be a mapping")
             meta = {str(key): value for key, value in loaded.items()}
         except Exception as exc:
-            errors.append(f"metadata/book.yaml: invalid YAML ({exc})")
+            errors.append(f"{metadata_label}: invalid YAML ({exc})")
     configured_language = runtime_metadata.target_language if runtime_metadata else ""
     lang = str((meta or {}).get("language") or configured_language)
     cjk_target = lang.startswith(("zh", "ja", "ko"))
 
     for required in ("title", "language"):
         if not (meta or {}).get(required):
-            errors.append(f"metadata/book.yaml: missing required field '{required}'")
+            errors.append(f"{metadata_label}: missing required field '{required}'")
 
     final_files = sorted(project.chapters_final.glob("*.md"))
     if not final_files:

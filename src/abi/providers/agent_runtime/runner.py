@@ -38,7 +38,7 @@ from abi.providers.observability.langfuse_client import LangfuseStatus
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcome,
-    ActionOutcomeEnvelope,
+    AgentCompleted,
     AgentRunResult,
     Indeterminate,
     Paused,
@@ -91,7 +91,7 @@ class HitlCheckpointInspection(FrozenModel):
     """Read-only classification of one claimed HITL checkpoint."""
 
     disposition: Literal["outcome", "not_started", "indeterminate"]
-    outcome: ActionOutcome | None = None
+    outcome: ActionOutcome | AgentCompleted | None = None
     detail: str | None = None
 
     @model_validator(mode="after")
@@ -336,6 +336,28 @@ def _empty_result(outcome: ActionOutcome) -> AgentRunResult:
         cost_usd=0.0,
         stopped_reason="error",
     )
+
+
+def _terminal_completion(values: object) -> AgentCompleted | None:
+    """Extract a powerless terminal assistant message from graph state."""
+    if not isinstance(values, dict):
+        return None
+    messages = values.get("messages")
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, BaseMessage) or message.type != "ai":
+            continue
+        if getattr(message, "tool_calls", ()):
+            return None
+        content = message.content
+        summary = (
+            content
+            if isinstance(content, str)
+            else json.dumps(content, ensure_ascii=False, default=str)
+        )
+        return AgentCompleted(summary=summary)
+    return None
 
 
 def _integrity_repair(defect_code: str, message: str) -> RepairRequired:
@@ -1043,6 +1065,9 @@ class AgentRuntime:
 
     def _get_model(self) -> BaseChatModel:
         if self._model is None:
+            provider_options: dict[str, Any] = {}
+            if self._config.thinking_mode == "disabled":
+                provider_options["extra_body"] = {"thinking": {"type": "disabled"}}
             self._model = ChatOpenAI(
                 base_url=self._config.base_url,
                 api_key=self._api_key,
@@ -1051,6 +1076,7 @@ class AgentRuntime:
                 max_tokens=self._config.max_output_tokens,
                 timeout=self._config.request_timeout_s,
                 max_retries=0,
+                **provider_options,
             )
         return self._model
 
@@ -1095,7 +1121,6 @@ class AgentRuntime:
                     model=self._get_model(),
                     tools=[to_langchain_tool(tool) for tool in request.tools],
                     system_prompt=request.system_prompt,
-                    response_format=ActionOutcomeEnvelope,
                     checkpointer=checkpointer,
                     name=request.agent_name,
                     middleware=(
@@ -1128,15 +1153,9 @@ class AgentRuntime:
                 ),
             )
         values = snapshot.values
-        if isinstance(values, dict):
-            structured = values.get("structured_response")
-            if structured is not None:
-                try:
-                    envelope = ActionOutcomeEnvelope.model_validate(structured)
-                except (TypeError, ValidationError, ValueError):
-                    pass
-                else:
-                    return HitlCheckpointInspection(disposition="outcome", outcome=envelope.outcome)
+        completion = _terminal_completion(values)
+        if completion is not None:
+            return HitlCheckpointInspection(disposition="outcome", outcome=completion)
         return HitlCheckpointInspection(
             disposition="indeterminate",
             detail="checkpoint has neither a current interrupt nor a typed terminal outcome",
@@ -1263,7 +1282,6 @@ class AgentRuntime:
                             for tool in request.tools
                         ],
                         system_prompt=request.system_prompt,
-                        response_format=ActionOutcomeEnvelope,
                         checkpointer=checkpointer,
                         name=request.agent_name,
                         middleware=(
@@ -1321,14 +1339,16 @@ class AgentRuntime:
                     tool_log=tuple(callback.tool_log),
                 )
             else:
-                envelope = ActionOutcomeEnvelope.model_validate(raw_result["structured_response"])
                 tool_log = tuple(callback.tool_log)
+                completion = _terminal_completion(raw_result)
+                if completion is None:
+                    raise ValueError("agent graph ended without a terminal assistant message")
                 result = AgentRunResult(
-                    outcome=envelope.outcome,
+                    outcome=completion,
                     llm_calls=callback.llm_calls,
                     tool_calls=len(tool_log),
                     cost_usd=callback.cost_usd,
-                    stopped_reason=("paused" if envelope.outcome.kind == "paused" else "completed"),
+                    stopped_reason="completed",
                     tool_log=tool_log,
                 )
         except Exception as error:

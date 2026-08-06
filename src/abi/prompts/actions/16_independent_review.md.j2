@@ -6,9 +6,20 @@ Spawn two independent reviewers over the finished book (separate from 16a):
 - `spawn_review_agent('agent_b', ...)`: EPUB engineering & typography review ->
   writes `reviews/agent_b/review.md` with scores and PASS/FAIL.
 
+This gate runs before `release.prepare`. Versioned release artifacts are deliberately
+absent and are not review evidence. Never treat an empty or inaccessible
+`output/release/` as a defect; review only `output/book.epub`, its three deterministic
+gate reports, the final chapters, and the applicable reference standards.
+
+Each reviewer report MUST end with exactly one unwrapped machine-readable line:
+`result: PASS` or `result: FAIL`. Human-language variants such as
+`Final Verdict: PASS`, `最终判定：PASS`, bold text, headings, tables, and emoji do
+not replace this line. Write the report through the filesystem tool; do not put
+the machine result only in the assistant response.
+
 Always write `reviews/revision_route.md`. If both reviewers PASS, write
 `status: NOT_REQUIRED` and `result: PASS`. If either FAILs, route the problem to
-the correct repair capability in that file and return repair-required.
+the correct repair capability in that file and end it with `result: FAIL`.
 Reviewers must not edit canonical translation or output artifacts. Do not
 explain-away findings.
 

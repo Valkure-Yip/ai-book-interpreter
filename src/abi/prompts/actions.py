@@ -44,6 +44,7 @@ class ActionPromptSnapshot(FrozenModel):
     source_text: str = ""
     style_rules: tuple[str, ...] = ()
     matched_terms: tuple[str, ...] = ()
+    repair_context: tuple[str, ...] = ()
 
 
 class ActionPromptRegistry:

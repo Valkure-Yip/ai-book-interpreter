@@ -78,13 +78,16 @@ def _env_overrides() -> dict[str, Any]:
 
     Endpoint:      LLM_BASE_URL, LLM_MODEL
     Observability: LANGFUSE_HOST, LANGFUSE_FULL_PAYLOAD
-    Tuning:        ABI_MAX_CONCURRENCY, ABI_MAX_STAGE_ATTEMPTS
+    Tuning:        ABI_MAX_CONCURRENCY, ABI_MAX_STAGE_ATTEMPTS,
+                   ABI_MAX_SEMANTIC_REPAIR_ATTEMPTS, ABI_LLM_THINKING
     """
     out: dict[str, Any] = {}
     if base := os.environ.get("LLM_BASE_URL"):
         out.setdefault("llm", {})["base_url"] = base
     if model := os.environ.get("LLM_MODEL"):
         out.setdefault("llm", {})["model"] = model
+    if thinking_mode := os.environ.get("ABI_LLM_THINKING"):
+        out.setdefault("llm", {})["thinking_mode"] = thinking_mode
     if host := os.environ.get("LANGFUSE_HOST"):
         out.setdefault("langfuse", {})["host"] = host
     if os.environ.get("LANGFUSE_FULL_PAYLOAD") == "1":
@@ -94,6 +97,10 @@ def _env_overrides() -> dict[str, Any]:
         out.setdefault("llm", {})["max_concurrency"] = n
     if (n := _env_int("ABI_MAX_STAGE_ATTEMPTS")) is not None and n >= 1:
         out["max_stage_attempts"] = n
+    if (
+        n := _env_int("ABI_MAX_SEMANTIC_REPAIR_ATTEMPTS")
+    ) is not None and n >= 1:
+        out.setdefault("orchestration", {})["max_semantic_repair_attempts"] = n
     if os.environ.get("ABI_TOC_REFINE") == "0":
         out["refine_toc"] = False
     return out

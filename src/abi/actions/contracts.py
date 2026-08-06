@@ -9,6 +9,7 @@ from abi.actions.evidence import StagingEvidenceView
 from abi.project.layout import BookProject
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
+    ActionArgument,
     ActionOutcomeEnvelope,
     ActionSpec,
     ArtifactBundle,
@@ -98,6 +99,7 @@ class ActionDefinition:
     validator: ActionValidator
     effect_expander: EffectExpander
     access_expander: AccessExpander | None = None
+    fixed_arguments: tuple[ActionArgument, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

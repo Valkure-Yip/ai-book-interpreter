@@ -7,6 +7,7 @@ import json
 import pytest
 
 from abi.actions.builtins.catalog import build_action_registry
+from abi.actions.builtins.inputs import ChapterBatchInput
 from abi.actions.contracts import AccessExpander, ActionAccess, ActionDefinition
 from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
@@ -23,7 +24,6 @@ from abi.types.orchestration import (
     ExpectedArtifact,
     ExpectedArtifactManifest,
     GateDecision,
-    GateEvidence,
     IncidentView,
     PlanPatch,
     PredicateSpec,
@@ -39,6 +39,10 @@ class SourceIngestInput(FrozenModel):
 
 class EmptyInput(FrozenModel):
     pass
+
+
+def _input_schema(model: type[FrozenModel]) -> str:
+    return json.dumps(model.model_json_schema(), sort_keys=True, separators=(",", ":"))
 
 
 async def _execute_unused(context: object, parameters: FrozenModel) -> object:
@@ -174,13 +178,13 @@ def _repair_snapshot(*, repair_class: str, reason_code: str) -> RunSnapshot:
             EligibleAction(
                 capability="repair.glossary",
                 description="repair",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0,
             ),
             EligibleAction(
                 capability="work.other",
                 description="other",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0,
             ),
         ),
@@ -216,7 +220,83 @@ def test_policy_authorizes_only_registry_mapped_semantic_repair() -> None:
     )
 
     assert mapped.authorized
+    assert mapped.actions[0].repairs_incident_ids == ("repair:old:1",)
     assert unrelated.reason_codes == ("semantic_repair_capability_mismatch",)
+
+
+def test_policy_rejects_replaying_current_success_but_allows_bound_repair() -> None:
+    ordinary_registry = _registry()
+    ordinary = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        actions=(
+            ActionView(
+                action_id="source-v1",
+                capability="source.ingest",
+                status=ActionStatus.SUCCEEDED,
+                outputs_current=True,
+            ),
+        ),
+        eligible_actions=(
+            EligibleAction(
+                capability="source.ingest",
+                description="source",
+                input_schema=_input_schema(SourceIngestInput),
+                estimated_cost_usd=1,
+            ),
+        ),
+    )
+    duplicate = PolicyEngine(ordinary_registry).authorize(
+        ordinary,
+        PlanPatch(
+            objective="repeat completed source",
+            proposed_actions=(
+                ProposedAction(
+                    proposal_id="source-v2",
+                    capability="source.ingest",
+                    arguments=(
+                        ActionArgument(
+                            name="source_relpath", value_json='"source/raw.txt"'
+                        ),
+                    ),
+                ),
+            ),
+            rationale="planner must not replay current work",
+        ),
+        next_plan_version=1,
+    )
+    assert duplicate.reason_codes == ("capability_already_succeeded",)
+
+    repair_registry = _repair_registry()
+    repair = _repair_snapshot(
+        repair_class="semantic", reason_code="term_drift"
+    ).model_copy(
+        update={
+            "actions": (
+                *_repair_snapshot(
+                    repair_class="semantic", reason_code="term_drift"
+                ).actions,
+                ActionView(
+                    action_id="glossary-v1",
+                    capability="repair.glossary",
+                    status=ActionStatus.SUCCEEDED,
+                    outputs_current=True,
+                ),
+            )
+        }
+    )
+    replacement = PolicyEngine(repair_registry).authorize(
+        repair,
+        PlanPatch(
+            objective="replace current glossary",
+            proposed_actions=(
+                ProposedAction(proposal_id="glossary-v2", capability="repair.glossary"),
+            ),
+            rationale="open semantic incident grants exact replacement authority",
+        ),
+        next_plan_version=2,
+    )
+    assert replacement.authorized
 
 
 def test_policy_blocks_every_plan_when_integrity_incident_is_open() -> None:
@@ -252,13 +332,14 @@ def test_real_chapter_parameters_drive_parallel_policy_and_scheduler_access_sets
                 action_id="glossary",
                 capability="glossary.prepare",
                 status=ActionStatus.SUCCEEDED,
+                outputs_current=True,
             ),
         ),
         eligible_actions=(
             EligibleAction(
                 capability="chapter.translate",
                 description="translate",
-                input_schema="ChapterBatchInput",
+                input_schema=_input_schema(ChapterBatchInput),
                 estimated_cost_usd=1.5,
             ),
         ),
@@ -310,7 +391,7 @@ def test_policy_fails_closed_when_parameterized_access_expansion_is_invalid() ->
             EligibleAction(
                 capability="work.invalid",
                 description="invalid dynamic access",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0,
             ),
         ),
@@ -341,25 +422,25 @@ def _snapshot(*, budget: float | None = 10.0) -> RunSnapshot:
             EligibleAction(
                 capability="source.ingest",
                 description="Ingest source.",
-                input_schema="SourceIngestInput",
+                input_schema=_input_schema(SourceIngestInput),
                 estimated_cost_usd=1.0,
             ),
             EligibleAction(
                 capability="chapter.first",
                 description="Write chapters.",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0.0,
             ),
             EligibleAction(
                 capability="chapter.second",
                 description="Write chapters.",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0.0,
             ),
             EligibleAction(
                 capability="release.publish",
                 description="Publish release.",
-                input_schema="EmptyInput",
+                input_schema=_input_schema(EmptyInput),
                 estimated_cost_usd=0.0,
             ),
         ),
@@ -501,8 +582,8 @@ def test_policy_rejects_each_independent_invalid_plan_shape(
     assert reason_code in decision.reason_codes
 
 
-def test_policy_rechecks_hard_predicates_and_terminal_release_evidence() -> None:
-    """Catch plans that bypass fresh prerequisites or publish before terminal gates pass."""
+def test_policy_rechecks_hard_predicates_without_preconsuming_action_outputs() -> None:
+    """Prerequisites are authoritative; an Action's own outputs are post-execution facts."""
     registry = _registry()
     registry = ActionRegistry(
         predicates=PredicateCatalog({"never": lambda snapshot, arguments: False}),
@@ -539,29 +620,12 @@ def test_policy_rechecks_hard_predicates_and_terminal_release_evidence() -> None
     )
 
     assert hard_prerequisite.reason_codes == ("hard_prerequisite_failed",)
-    assert release.reason_codes == ("terminal_release_policy",)
+    assert release.authorized is True
 
 
-def test_policy_allows_release_only_after_all_required_gates_pass() -> None:
-    """Catch a terminal policy that accepts missing or failed required release evidence."""
-    snapshot = _snapshot().model_copy(
-        update={
-            "gate_evidence": (
-                GateEvidence(
-                    evidence_id="e1",
-                    gate="epubcheck",
-                    passed=True,
-                    validator_version="1",
-                ),
-                GateEvidence(
-                    evidence_id="e2",
-                    gate="spotcheck",
-                    passed=True,
-                    validator_version="1",
-                ),
-            )
-        }
-    )
+def test_policy_does_not_treat_release_expected_outputs_as_prerequisite_gates() -> None:
+    """Release expected evidence is validated after execution, not required before it."""
+    snapshot = _snapshot()
 
     decision = PolicyEngine(_registry()).authorize(
         snapshot,

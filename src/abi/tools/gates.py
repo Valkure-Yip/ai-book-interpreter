@@ -35,16 +35,6 @@ class EpubcheckInput(FrozenModel):
     epub_path: str = Field(default="output/book.epub", description="Project-relative EPUB path.")
 
 
-class SelectRandomReviewInput(FrozenModel):
-    agents: int = Field(default=2, ge=1)
-    samples_per_agent: int = Field(default=120, ge=1)
-    target_confidence: float = Field(default=0.80, ge=0, le=1)
-
-
-class ValidateRandomSpotcheckInput(FrozenModel):
-    require_pass: bool = True
-
-
 class CreateReleaseInput(FrozenModel):
     version: str = Field(default="", description="Optional explicit release version.")
 
@@ -169,9 +159,7 @@ def make_gate_tools(
         res = run_epubcheck_readonly(source)
         return res.summary()
 
-    def select_random_review_passages(
-        agents: int = 2, samples_per_agent: int = 120, target_confidence: float = 0.80
-    ) -> str:
+    def select_random_review_passages() -> str:
         """Deterministically select a new stratified random spot-check round.
 
         Creates reviews/random_spotcheck/round_XXX/ with seed, manifest, strata,
@@ -181,12 +169,6 @@ def make_gate_tools(
         require_write("reviews/random_spotcheck")
         if spotcheck_input is None:
             raise PermissionError("spot-check selection requires frozen controller input")
-        if agents != len(spotcheck_input.reviewers):
-            raise ValueError("agents must equal the frozen reviewer count")
-        if samples_per_agent != spotcheck_input.samples_per_agent:
-            raise ValueError("samples_per_agent must equal the frozen controller value")
-        if target_confidence != 0.80:
-            raise ValueError("target_confidence is fixed by policy at 0.80")
         from abi.qa.sampler import plan_random_review_passages
 
         result, outputs = plan_random_review_passages(
@@ -210,7 +192,7 @@ def make_gate_tools(
                 )
         return result.summary()
 
-    def validate_random_spotcheck(require_pass: bool = True) -> str:
+    def validate_random_spotcheck() -> str:
         """Validate the latest spot-check round against the excellence gate.
 
         Enforces release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.
@@ -268,7 +250,7 @@ def make_gate_tools(
             round_id=spotcheck_input.round_id,
             summaries=summaries,
             prior_rounds=tuple(prior_rounds),
-            require_pass=require_pass,
+            require_pass=True,
         )
         current_writer.write_bytes(
             f"{root}/validation_report.json",
@@ -320,13 +302,13 @@ def make_gate_tools(
         ToolBinding(
             "select_random_review_passages",
             select_random_review_passages.__doc__ or "Select review passages.",
-            SelectRandomReviewInput,
+            EmptyInput,
             select_random_review_passages,
         ),
         ToolBinding(
             "validate_random_spotcheck",
             validate_random_spotcheck.__doc__ or "Validate the latest spot check.",
-            ValidateRandomSpotcheckInput,
+            EmptyInput,
             validate_random_spotcheck,
         ),
         ToolBinding(

@@ -384,6 +384,20 @@ def test_reviewers_cannot_write_canonical_translation_or_output() -> None:
     assert not envelope.permissions.can_write("output/book.epub")
 
 
+def test_independent_review_cannot_observe_downstream_release_artifacts() -> None:
+    envelope = build_action_envelope(
+        "review.independent",
+        ReviewBatchInput(chapters=("001",), reviewers=("agent_a", "agent_b")),
+    )
+
+    assert envelope.permissions.can_read("output/book.epub")
+    assert envelope.permissions.can_read("output/epubcheck.json")
+    assert envelope.permissions.can_read("output/publication_lint.json")
+    assert envelope.permissions.can_read("output/asset_manifest_check.json")
+    assert not envelope.permissions.can_read("output/release/release_state.json")
+    assert not envelope.permissions.can_read("output/unrelated.json")
+
+
 def test_chapter_review_batches_have_disjoint_exact_qa_outputs() -> None:
     first = build_action_envelope("chapter.review", ReviewBatchInput(chapters=("001",)))
     second = build_action_envelope("chapter.review", ReviewBatchInput(chapters=("002",)))
@@ -443,8 +457,10 @@ def test_publication_lint_gate_uses_typed_metadata_without_legacy_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = BookProject(tmp_path)
-    project.book_yaml.parent.mkdir(parents=True)
-    project.book_yaml.write_text("title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8")
+    project.finalized_book_yaml.parent.mkdir(parents=True)
+    project.finalized_book_yaml.write_text(
+        "title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8"
+    )
     project.chapters_final.mkdir(parents=True)
     (project.chapters_final / "001.md").write_text("# 第一章\n\n正文。\n", encoding="utf-8")
     (project.root / "frontmatter").mkdir()
@@ -483,8 +499,10 @@ def _release_gate_project(tmp_path: Path) -> BookProject:
     project = BookProject(tmp_path)
     project.book_epub.parent.mkdir(parents=True)
     project.book_epub.write_bytes(b"epub")
-    project.book_yaml.parent.mkdir(parents=True, exist_ok=True)
-    project.book_yaml.write_text("title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8")
+    project.finalized_book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.finalized_book_yaml.write_text(
+        "title: Fixture\nlanguage: zh-Hans\n", encoding="utf-8"
+    )
     report = project.random_spotcheck_dir / "round_001/validation_report.json"
     report.parent.mkdir(parents=True)
     report.write_text('{"status":"PASS"}', encoding="utf-8")

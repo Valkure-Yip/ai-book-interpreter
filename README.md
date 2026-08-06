@@ -84,6 +84,8 @@ cp .env.example .env
 LLM_BASE_URL=https://api.openai.com/v1   # 或 DeepSeek / Ollama / vLLM 等
 LLM_API_KEY=sk-...
 LLM_MODEL=gpt-4o-mini
+# 某些兼容端点的 thinking mode 不支持 agent tool_choice 时设置：disabled
+ABI_LLM_THINKING=provider_default
 ```
 
 可选项（Langfuse 追踪、滑动窗口大小、批量大小、并发度、`runs/` 目录位置等）的完整说明见 [`.env.example`](./.env.example) 与 [`docs/product-specs/cli-and-config.md`](./docs/product-specs/cli-and-config.md)。

@@ -215,7 +215,7 @@ def unblock_cmd(
         help="PATH:removed or PATH:selected:SHA256; repeat for every conflict.",
     ),
 ) -> None:
-    """Resume budget pause or replace one evidence-resolved integrity Action."""
+    """Resume budget pause or replace one evidence-resolved blocked Action."""
     resolutions = tuple(_parse_resolution(value) for value in resolved_canonical or ())
     result = asyncio.run(
         unblock(

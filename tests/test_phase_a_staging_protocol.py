@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
+from threading import Barrier, BrokenBarrierError
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,7 @@ from abi.actions.builtins.catalog import build_action_registry
 from abi.actions.builtins.inputs import (
     BuildEpubInput,
     ChapterBatchInput,
+    EmptyInput,
     ResearchInput,
     ReviewBatchInput,
     SourceIngestInput,
@@ -23,18 +27,40 @@ from abi.actions.contracts import ActionExecutionContext
 from abi.actions.effects import expand_expected_artifacts
 from abi.actions.evidence import StagingEvidenceView
 from abi.actions.validators import validate_evidence
-from abi.project.artifacts import ArtifactStore
+from abi.project.artifacts import (
+    ArtifactConflictError,
+    ArtifactStore,
+    BufferedAttemptWriter,
+)
 from abi.project.layout import BookProject
 from abi.tools.context import ToolContext
 from abi.types.orchestration import (
-    ArtifactBundle,
+    AgentCompleted,
     ArtifactBundleEntry,
     ArtifactMetadata,
     ArtifactRef,
+    PermanentFailure,
     RunSnapshot,
     RunStatus,
     Succeeded,
 )
+
+
+def _approved_hitl_resume() -> object:
+    from abi.providers.agent_runtime import (
+        HitlDecision,
+        HitlInterruptDecision,
+        HitlResume,
+    )
+
+    return HitlResume(
+        interrupts=(
+            HitlInterruptDecision(
+                interrupt_id="interrupt-1",
+                decisions=(HitlDecision(decision="approve"),),
+            ),
+        )
+    )
 
 
 def test_attempt_writer_maps_logical_canonical_paths_and_records_ordered_effects(
@@ -57,6 +83,272 @@ def test_attempt_writer_maps_logical_canonical_paths_and_records_ordered_effects
         assert not (tmp_path / "reports/a.json").exists()
         assert (tmp_path / entry.staged_relpath).read_bytes() == b'{"ok":true}'
         assert writer.artifact_bundle().entries == (entry,)
+    finally:
+        store.close()
+
+
+def test_attempt_writer_canonicalizes_agent_write_order_at_bundle_boundary(
+    tmp_path: Path,
+) -> None:
+    """Parallel tool scheduling must not decide durable artifact identity order."""
+    project = BookProject(tmp_path)
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer("a1", 1)
+        writer.write_text(
+            "metadata/style_profile.md",
+            "style",
+            media_type="text/markdown",
+            evidence_role="style_profile",
+        )
+        writer.write_text(
+            "metadata/book_specific_translation_research.md",
+            "research",
+            media_type="text/markdown",
+            evidence_role="research",
+        )
+
+        assert tuple(
+            item.canonical_relpath for item in writer.artifact_bundle().entries
+        ) == (
+            "metadata/book_specific_translation_research.md",
+            "metadata/style_profile.md",
+        )
+    finally:
+        store.close()
+
+
+def test_buffered_attempt_writer_serializes_concurrent_duplicate_writes() -> None:
+    class RacingDict(dict[str, tuple[bytes, str, str, tuple[ArtifactMetadata, ...]]]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.barrier = Barrier(2)
+
+        def __contains__(self, key: object) -> bool:
+            present = super().__contains__(key)
+            if not present:
+                with suppress(BrokenBarrierError):
+                    self.barrier.wait(timeout=0.1)
+            return present
+
+    writer = BufferedAttemptWriter("review-1", 1)
+    writer._items = RacingDict()  # type: ignore[attr-defined]
+
+    def write() -> str:
+        try:
+            writer.write_text(
+                "reviews/a.md",
+                "review",
+                media_type="text/markdown",
+                evidence_role="review",
+            )
+        except FileExistsError:
+            return "duplicate"
+        return "written"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = tuple(pool.map(lambda _: write(), range(2)))
+
+    assert sorted(outcomes) == ["duplicate", "written"]
+    assert tuple(item.canonical_relpath for item in writer.entries) == (
+        "reviews/a.md",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_without_required_outputs_is_bounded_retry(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    for skill in (
+        "skills/expert-translation-quality/SKILL.md",
+        "skills/translation-quality-defect-families/SKILL.md",
+    ):
+        path = project.root / skill
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# policy\n", encoding="utf-8")
+
+    class EmptyAgent:
+        async def run_action(self, request: object) -> object:
+            return SimpleNamespace(outcome=AgentCompleted(summary="done"))
+
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(agent=EmptyAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+
+    result = await build_action_registry(tool_context=tool_context).get(
+        "chapter.control"
+    ).executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id="control-1",
+            snapshot=snapshot,
+        ),
+        ChapterBatchInput(chapters=("001",)),
+    )
+
+    assert result.outcome.kind == "retryable_failure"
+    assert result.outcome.error_code == "agent_incomplete_outputs"
+    assert "chapters/controlled/001.md" in result.outcome.message
+
+
+@pytest.mark.asyncio
+async def test_hitl_inspection_rebuilds_completed_bundle_from_exact_staging(
+    tmp_path: Path,
+) -> None:
+    """A process restart must not discard already-durable approved tool output."""
+    from abi.providers.agent_runtime import HitlCheckpointInspection
+
+    project = BookProject(tmp_path)
+    action_id = "finalize-1"
+    manifest = expand_expected_artifacts("output.finalize", action_id, EmptyInput())
+    expected = manifest.entries[0]
+    store = ArtifactStore(project, None)
+    try:
+        store.writer(action_id, 1).write_text(
+            expected.canonical_relpath,
+            "# Final manifest\n",
+            media_type=expected.media_type,
+            evidence_role=expected.evidence_role,
+            metadata=expected.metadata,
+        )
+    finally:
+        store.close()
+
+    class CompletedCheckpointAgent:
+        async def inspect_hitl_checkpoint(self, request: object) -> HitlCheckpointInspection:
+            return HitlCheckpointInspection(
+                disposition="outcome",
+                outcome=AgentCompleted(summary="approved output was written before restart"),
+            )
+
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(agent=CompletedCheckpointAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+    executor = build_action_registry(tool_context=tool_context).get(
+        "output.finalize"
+    ).executor
+
+    inspection = await executor.inspect_hitl(  # type: ignore[attr-defined]
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id=action_id,
+            attempt=1,
+            snapshot=snapshot,
+        ),
+        EmptyInput(),
+        _approved_hitl_resume(),
+    )
+
+    assert inspection.disposition == "outcome"
+    assert isinstance(inspection.outcome, Succeeded)
+    assert inspection.outcome.artifact_bundle.entries == tuple(
+        ArtifactBundleEntry(
+            staged_relpath=f"state/staging/{action_id}/1/{item.canonical_relpath}",
+            canonical_relpath=item.canonical_relpath,
+            media_type=item.media_type,
+            evidence_role=item.evidence_role,
+            metadata=item.metadata,
+        )
+        for item in manifest.entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_hitl_resume_rebuilds_completed_bundle_from_exact_staging(
+    tmp_path: Path,
+) -> None:
+    """A resumed graph uses durable staging, not a fresh writer's empty entry list."""
+    project = BookProject(tmp_path)
+    action_id = "finalize-1"
+    manifest = expand_expected_artifacts("output.finalize", action_id, EmptyInput())
+    expected = manifest.entries[0]
+    store = ArtifactStore(project, None)
+    try:
+        store.writer(action_id, 1).write_text(
+            expected.canonical_relpath,
+            "# Final manifest\n",
+            media_type=expected.media_type,
+            evidence_role=expected.evidence_role,
+            metadata=expected.metadata,
+        )
+    finally:
+        store.close()
+
+    class CompletedContinuationAgent:
+        async def run_action(self, request: object) -> object:
+            return SimpleNamespace(outcome=AgentCompleted(summary="approved output committed"))
+
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(agent=CompletedContinuationAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+    executor = build_action_registry(tool_context=tool_context).get(
+        "output.finalize"
+    ).executor
+
+    envelope = await executor.resume_hitl(  # type: ignore[attr-defined]
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id=action_id,
+            attempt=1,
+            snapshot=snapshot,
+        ),
+        EmptyInput(),
+        _approved_hitl_resume(),
+    )
+
+    assert isinstance(envelope.outcome, Succeeded)
+    assert envelope.outcome.artifact_bundle.entries == tuple(
+        ArtifactBundleEntry(
+            staged_relpath=f"state/staging/{action_id}/1/{item.canonical_relpath}",
+            canonical_relpath=item.canonical_relpath,
+            media_type=item.media_type,
+            evidence_role=item.evidence_role,
+            metadata=item.metadata,
+        )
+        for item in manifest.entries
+    )
+
+
+def test_hitl_staging_rebuild_rejects_extra_files(tmp_path: Path) -> None:
+    project = BookProject(tmp_path)
+    action_id = "finalize-1"
+    manifest = expand_expected_artifacts("output.finalize", action_id, EmptyInput())
+    expected = manifest.entries[0]
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer(action_id, 1)
+        writer.write_text(
+            expected.canonical_relpath,
+            "# Final manifest\n",
+            media_type=expected.media_type,
+            evidence_role=expected.evidence_role,
+            metadata=expected.metadata,
+        )
+        writer.write_text(
+            "output/unexpected.md",
+            "unexpected",
+            media_type="text/markdown",
+            evidence_role="unexpected",
+        )
+
+        with pytest.raises(ArtifactConflictError, match="contains extras"):
+            store.rebuild_exact_staged_bundle(action_id, 1, manifest)
     finally:
         store.close()
 
@@ -121,8 +413,15 @@ def test_independent_review_effects_include_both_reviewers_and_revision_route() 
 
 
 @pytest.mark.asyncio
-async def test_independent_review_success_writes_not_required_revision_route(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("review_result", "expected_kind"),
+    (
+        ("result: PASS", "succeeded"),
+        ("Final Verdict: PASS", "retryable_failure"),
+    ),
+)
+async def test_independent_review_enforces_terminal_machine_result_protocol(
+    tmp_path: Path, review_result: str, expected_kind: str
 ) -> None:
     project = BookProject(tmp_path)
     for skill in (
@@ -133,21 +432,8 @@ async def test_independent_review_success_writes_not_required_revision_route(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# Review policy\n", encoding="utf-8")
 
-    def provider_success() -> Succeeded:
-        return Succeeded(
-            artifact_bundle=ArtifactBundle(
-                action_id="provider-result",
-                attempt=1,
-                entries=(
-                    ArtifactBundleEntry(
-                        staged_relpath="state/staging/provider-result/1/provider/result.json",
-                        canonical_relpath="provider/result.json",
-                        media_type="application/json",
-                        evidence_role="provider_result",
-                    ),
-                ),
-            )
-        )
+    def provider_success() -> AgentCompleted:
+        return AgentCompleted(summary="review files written")
 
     class IndependentAgent:
         async def run_action(self, request: object) -> object:
@@ -170,7 +456,7 @@ async def test_independent_review_success_writes_not_required_revision_route(
             reviewer = agent_name.removeprefix("review_")
             tools["write_file"](
                 path=f"reviews/{reviewer}/review.md",
-                content=f"# {reviewer}\n\nresult: PASS\n",
+                content=f"# {reviewer}\n\n{review_result}\n",
             )
             return SimpleNamespace(outcome=provider_success())
 
@@ -194,6 +480,10 @@ async def test_independent_review_success_writes_not_required_revision_route(
         ReviewBatchInput(reviewers=("agent_a", "agent_b")),
     )
 
+    assert result.outcome.kind == expected_kind
+    if expected_kind == "retryable_failure":
+        assert result.outcome.error_code == "review_result_protocol_invalid"
+        return
     assert isinstance(result.outcome, Succeeded)
     assert tuple(
         item.canonical_relpath for item in result.outcome.artifact_bundle.entries
@@ -232,30 +522,15 @@ async def test_spotcheck_executor_buffers_two_reviewers_then_flushes_exact_bundl
     )
     files_seen_before_executor_flush: list[tuple[str, ...]] = []
 
-    def provider_success() -> Succeeded:
-        return Succeeded(
-            artifact_bundle=ArtifactBundle(
-                action_id="provider-result",
-                attempt=1,
-                entries=(
-                    ArtifactBundleEntry(
-                        staged_relpath="state/staging/provider-result/1/provider/result.json",
-                        canonical_relpath="provider/result.json",
-                        media_type="application/json",
-                        evidence_role="provider_result",
-                    ),
-                ),
-            )
-        )
+    def provider_success() -> AgentCompleted:
+        return AgentCompleted(summary="spot-check files written")
 
     class CompositeAgent:
         async def run_action(self, request: object) -> object:
             tools = {tool.name: tool.callable for tool in request.tools}  # type: ignore[attr-defined]
             agent_name = request.agent_name  # type: ignore[attr-defined]
             if agent_name == "review_spotcheck":
-                tools["select_random_review_passages"](
-                    agents=2, samples_per_agent=1, target_confidence=0.80
-                )
+                tools["select_random_review_passages"]()
                 await tools["spawn_review_agent"](
                     agent_label="agent_a", instructions="review your frozen sample"
                 )
@@ -268,7 +543,7 @@ async def test_spotcheck_executor_buffers_two_reviewers_then_flushes_exact_bundl
                     if staged.exists()
                     else ()
                 )
-                tools["validate_random_spotcheck"](require_pass=True)
+                tools["validate_random_spotcheck"]()
                 files_seen_before_executor_flush.append(
                     tuple(str(path.relative_to(project.root)) for path in staged.rglob("*") if path.is_file())
                     if staged.exists()
@@ -539,12 +814,22 @@ async def test_source_split_writes_only_its_exact_staged_toc(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_epub_build_uses_a_shadow_build_and_stages_every_effect(tmp_path: Path) -> None:
+async def test_epub_build_uses_a_shadow_build_and_stages_every_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from abi.epub.result import GateResult
+
+    monkeypatch.setattr(
+        "abi.epub.epubcheck.run_epubcheck_readonly",
+        lambda path: GateResult(True, "EPUBCheck passed"),
+    )
     project = BookProject(tmp_path)
     project.chapters_final.mkdir(parents=True)
     (project.chapters_final / "001.md").write_text("# Chapter\n\nText", encoding="utf-8")
-    project.book_yaml.parent.mkdir(parents=True, exist_ok=True)
-    project.book_yaml.write_text("title: Fixture\nlanguage: en\n", encoding="utf-8")
+    project.finalized_book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.finalized_book_yaml.write_text(
+        "title: Fixture\nlanguage: en\n", encoding="utf-8"
+    )
     result = await build_action_registry().get("epub.build").executor(
         ActionExecutionContext(
             project=project,
@@ -566,3 +851,40 @@ async def test_epub_build_uses_a_shadow_build_and_stages_every_effect(tmp_path: 
     assert not project.publication_lint_report.exists()
     assert not project.asset_manifest_report.exists()
     assert not project.epubcheck_log.exists()
+
+
+@pytest.mark.asyncio
+async def test_epubcheck_unavailable_is_a_precise_permanent_execution_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from abi.epub.result import GateResult
+
+    project = BookProject(tmp_path)
+    project.chapters_final.mkdir(parents=True)
+    (project.chapters_final / "001.md").write_text(
+        "# Chapter\n\nText", encoding="utf-8"
+    )
+    project.finalized_book_yaml.parent.mkdir(parents=True, exist_ok=True)
+    project.finalized_book_yaml.write_text(
+        "title: Fixture\nlanguage: en\nidentifier: fixture\nrights: test\n"
+        "publisher: test\nauthors: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "abi.epub.epubcheck.run_epubcheck_readonly",
+        lambda path: GateResult(False, "EPUBCheck not available"),
+    )
+
+    result = await build_action_registry().get("epub.build").executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id="epub-1",
+            attempt=1,
+            snapshot=RunSnapshot(run_id="run-1", status=RunStatus.RUNNING),
+        ),
+        BuildEpubInput(),
+    )
+
+    assert isinstance(result.outcome, PermanentFailure)
+    assert result.outcome.error_code == "epubcheck_unavailable"

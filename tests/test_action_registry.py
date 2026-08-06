@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -14,8 +15,11 @@ from abi.types.orchestration import (
     ActionArgument,
     ActionKind,
     ActionSpec,
+    ActionStatus,
+    ActionView,
     ExpectedArtifactManifest,
     GateDecision,
+    IncidentView,
     RunSnapshot,
     RunStatus,
 )
@@ -241,6 +245,131 @@ def test_eligible_evaluates_predicates_and_sorts_summaries() -> None:
     eligible = registry.eligible(_snapshot())
 
     assert tuple(item.capability for item in eligible) == ("alpha.ingest", "zeta.ingest")
+
+
+def test_eligible_exposes_executable_argument_contract_and_fixed_arguments() -> None:
+    """Catch Planner context that names a schema without exposing usable fields."""
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(), validators={"source_manifest": _validate_unused}
+    )
+    fixed = (
+        ActionArgument(name="source_relpath", value_json='"source/source_text_raw.txt"'),
+    )
+    registry.register(replace(_definition(), fixed_arguments=fixed))
+
+    (eligible,) = registry.eligible(_snapshot())
+
+    assert json.loads(eligible.input_schema) == SourceIngestInput.model_json_schema()
+    assert eligible.input_schema == json.dumps(
+        SourceIngestInput.model_json_schema(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert eligible.fixed_arguments == fixed
+
+
+def test_eligible_actions_expose_the_deterministic_semantic_repair_route() -> None:
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("chapter_control_not_passed", "chapter.control"),),
+    )
+    registry.register(_definition("chapter.control"))
+    registry.register(_definition("chapter.translate"))
+    snapshot = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        incidents=(
+            IncidentView(
+                incident_id="repair:control:1",
+                error_code="chapter_control_not_passed",
+                message="Control closure did not pass.",
+                action_id="control",
+                repair_class="semantic",
+                repair_source="validator",
+                reason_code="chapter_control_not_passed",
+            ),
+        ),
+    )
+
+    eligible = {item.capability: item for item in registry.eligible(snapshot)}
+
+    assert eligible["chapter.control"].repairs_reason_codes == (
+        "chapter_control_not_passed",
+    )
+    assert eligible["chapter.translate"].repairs_reason_codes == ()
+
+
+def test_eligible_hides_current_success_except_for_bound_semantic_repair() -> None:
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(),
+        validators={"source_manifest": _validate_unused},
+        semantic_repair_mappings=(("metadata_wrong", "source.ingest"),),
+    )
+    registry.register(_definition())
+    succeeded = ActionView(
+        action_id="ingest-1",
+        capability="source.ingest",
+        status=ActionStatus.SUCCEEDED,
+        outputs_current=True,
+    )
+
+    assert registry.eligible(
+        RunSnapshot(
+            run_id="run-1",
+            status=RunStatus.RUNNING,
+            actions=(succeeded,),
+        )
+    ) == ()
+
+    repair_snapshot = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        actions=(succeeded,),
+        incidents=(
+            IncidentView(
+                incident_id="repair:metadata:1",
+                error_code="metadata_wrong",
+                message="replace current metadata",
+                repair_class="semantic",
+                repair_source="validator",
+                reason_code="metadata_wrong",
+            ),
+        ),
+    )
+    (eligible,) = registry.eligible(repair_snapshot)
+    assert eligible.capability == "source.ingest"
+    assert eligible.repairs_reason_codes == ("metadata_wrong",)
+
+
+def test_registry_injects_fixed_arguments_and_rejects_planner_override() -> None:
+    """Catch Controller-owned source identity remaining mutable Planner authority."""
+    registry = ActionRegistry(
+        predicates=PredicateCatalog(), validators={"source_manifest": _validate_unused}
+    )
+    registry.register(
+        replace(
+            _definition(),
+            fixed_arguments=(
+                ActionArgument(
+                    name="source_relpath", value_json='"source/source_text_raw.txt"'
+                ),
+            ),
+        )
+    )
+
+    resolved = registry.resolve("source.ingest", ())
+
+    assert resolved.parameters.source_relpath == "source/source_text_raw.txt"
+    with pytest.raises(RegistryConfigurationError, match=r"controller-owned.*source_relpath"):
+        registry.resolve(
+            "source.ingest",
+            (
+                ActionArgument(
+                    name="source_relpath", value_json='"source/source_text.txt"'
+                ),
+            ),
+        )
 
 
 def test_eligible_evaluates_every_declared_predicate_before_rejecting() -> None:

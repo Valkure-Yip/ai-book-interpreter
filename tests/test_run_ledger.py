@@ -59,14 +59,14 @@ async def test_ledger_initialization_records_and_reopens_exact_schema_version(
         pass
 
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone() == (1,)
+        assert db.execute("PRAGMA user_version").fetchone() == (2,)
 
     async with RunLedger.open(path):
         pass
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema_version", [0, 2])
+@pytest.mark.parametrize("schema_version", [0, 1, 3])
 async def test_ledger_rejects_existing_unversioned_or_unknown_schema(
     tmp_path: Path, schema_version: int
 ) -> None:
@@ -159,6 +159,81 @@ async def test_attempt_reuses_the_authorized_action_frozen_access_sets(
     assert attempt.action_id == durable_action.action_id
     assert durable_action.read_set == read_set
     assert durable_action.write_set == write_set
+
+
+@pytest.mark.asyncio
+async def test_one_repair_action_can_bind_multiple_open_semantic_incidents(
+    tmp_path: Path,
+) -> None:
+    async with RunLedger.open(tmp_path / "run.db") as ledger:
+        run_id = await ledger.create_run(_run_seed())
+        first = await ledger.record_incident(
+            run_id,
+            error_code="term_drift",
+            message="chapter one",
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code="term_drift",
+        )
+        second = await ledger.record_incident(
+            run_id,
+            error_code="term_drift",
+            message="chapter two",
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code="term_drift",
+        )
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="repair all terminology drift",
+                proposed_actions=(
+                    ProposedAction(
+                        proposal_id="proposal-1", capability="glossary.prepare"
+                    ),
+                ),
+                rationale="one glossary revision repairs both incidents",
+            ),
+        )
+        action = _action("repair-1").model_copy(
+            update={
+                "repairs_incident_ids": tuple(
+                    sorted((first.incident_id, second.incident_id))
+                )
+            }
+        )
+
+        authorized = await ledger.authorize_actions(run_id, (action,))
+        await ledger.append_plan(
+            run_id,
+            PlanPatch(
+                objective="retry the semantic repair",
+                proposed_actions=(
+                    ProposedAction(
+                        proposal_id="proposal-2", capability="glossary.prepare"
+                    ),
+                ),
+                rationale="a failed replacement must not consume the incident lineage",
+            ),
+        )
+        retry = _action("repair-2").model_copy(
+            update={
+                "proposal_id": "proposal-2",
+                "plan_version": 2,
+                "repairs_incident_ids": tuple(
+                    sorted((first.incident_id, second.incident_id))
+                ),
+            }
+        )
+        retried = await ledger.authorize_actions(run_id, (retry,))
+
+    assert [item.action_id for item in authorized] == ["repair-1"]
+    assert [item.action_id for item in retried] == ["repair-2"]
+    with sqlite3.connect(tmp_path / "run.db") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM semantic_repair_bindings "
+            "WHERE replacement_action_id IN ('repair-1', 'repair-2')"
+        ).fetchone() == (4,)
 
 
 async def _seed_authorized_action(

@@ -87,9 +87,11 @@ def _first_heading_title(md_text: str, default: str) -> str:
 
 
 def _load_meta(project: BookProject) -> dict[str, Any]:
-    if project.book_yaml.exists():
+    if project.finalized_book_yaml.exists():
         try:
-            data = yaml.safe_load(project.book_yaml.read_text(encoding="utf-8")) or {}
+            data = yaml.safe_load(
+                project.finalized_book_yaml.read_text(encoding="utf-8")
+            ) or {}
             if isinstance(data, dict):
                 return cast(dict[str, Any], data)
         except Exception:

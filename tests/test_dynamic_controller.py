@@ -32,12 +32,13 @@ from abi.orchestrator.reconcile import Reconciler
 from abi.planning.context import SnapshotBuilder
 from abi.planning.policy import PolicyEngine
 from abi.planning.scheduler import Scheduler
-from abi.project.artifacts import ArtifactConflictError, ArtifactStore
+from abi.project.artifacts import ArtifactConflictError, ArtifactStore, InjectedCrash
 from abi.project.layout import BookProject
 from abi.project.run_ledger import (
     ActionRecord,
     LedgerConflictError,
     LedgerNotFoundError,
+    PromotionIntent,
     RunLedger,
     RunSeed,
 )
@@ -63,6 +64,7 @@ from abi.types.orchestration import (
     PermanentFailure,
     PlanningContext,
     PlanPatch,
+    PredicateSpec,
     ProbeActionInput,
     ProbeResolution,
     ProposedAction,
@@ -292,6 +294,8 @@ def _definition(
     max_attempts: int = 2,
     probe_capability: str | None = None,
     may_have_side_effects: bool = False,
+    read_set: tuple[str, ...] = (),
+    prerequisites: tuple[PredicateSpec, ...] = (),
 ) -> ActionDefinition:
     return ActionDefinition(
         spec=ActionSpec(
@@ -299,6 +303,7 @@ def _definition(
             description=f"Run {capability}.",
             input_schema="EmptyInput",
             action_kind=ActionKind.DETERMINISTIC,
+            prerequisites=prerequisites,
             effects=tuple(
                 EffectSpec(name="artifact.produced", artifact_pattern=path)
                 for path, _, _ in _fixture_outputs(capability)
@@ -312,6 +317,7 @@ def _definition(
             validator=validator_id,
             probe_capability=probe_capability,
             may_have_side_effects=may_have_side_effects,
+            read_set=read_set,
             write_set=tuple(path for path, _, _ in _fixture_outputs(capability)),
         ),
         input_model=EmptyInput,
@@ -386,20 +392,25 @@ async def _controller_rig(
     probe_capabilities: frozenset[str] = frozenset(),
     controller_hook: Callable[[str, object], None] | None = None,
     timeout_s: float = 2,
+    max_plan_rejections: int = 100,
+    max_semantic_repair_attempts: int = 3,
+    artifact_hook: Callable[[str, PromotionIntent | None], None] | None = None,
 ) -> AsyncIterator[ControllerRig]:
     project = BookProject(tmp_path)
     project.root.mkdir(parents=True, exist_ok=True)
     project.run_db.parent.mkdir(parents=True, exist_ok=True)
     async with RunLedger.open(project.run_db) as ledger:
         run_id = await ledger.create_run(RunSeed(run_id="run-1"))
-        store = ArtifactStore(project, ledger)
+        store = ArtifactStore(project, ledger, test_hook=artifact_hook)
         validator_catalog: dict[str, ActionValidator] = {
             "fixture": cast(ActionValidator, _pass_gate)
         }
         for capability, validator in (validators or {}).items():
             validator_catalog[f"fixture.{capability}"] = cast(ActionValidator, validator)
         registry = ActionRegistry(
-            predicates=PredicateCatalog(),
+            predicates=PredicateCatalog(
+                {"never": lambda snapshot, arguments: False}
+            ),
             validators=validator_catalog,
             semantic_repair_mappings=semantic_repair_mappings,
         )
@@ -441,6 +452,10 @@ async def _controller_rig(
                         else None
                     ),
                     may_have_side_effects=bool(options.get("may_have_side_effects", False)),
+                    read_set=cast(tuple[str, ...], options.get("read_set", ())),
+                    prerequisites=cast(
+                        tuple[PredicateSpec, ...], options.get("prerequisites", ())
+                    ),
                 )
             )
         registry.validate_startup()
@@ -489,6 +504,8 @@ async def _controller_rig(
             reconciler=reconciler,
             projector=projector,
             complete_when=complete_when or (lambda snapshot: False),
+            max_plan_rejections=max_plan_rejections,
+            max_semantic_repair_attempts=max_semantic_repair_attempts,
             test_hook=controller_hook,
         )
         runtime = DurableLoopRuntime(
@@ -1251,6 +1268,205 @@ async def test_controller_replans_after_repair_and_completes(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_successful_semantic_repair_closes_incident_before_downstream_work(
+    tmp_path: Path,
+) -> None:
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "work.initial",
+                (
+                    RepairRequired(
+                        repair_class="semantic",
+                        repair_source="action_outcome",
+                        reason_code="term_drift",
+                        defect_codes=("term_drift",),
+                        message="repair glossary",
+                    ),
+                ),
+            ),
+            ("repair.glossary", (SuccessTemplate(),)),
+            ("work.after", (SuccessTemplate(),)),
+        ),
+        patches=(
+            _patch("initial", "work.initial"),
+            _patch("repair", "repair.glossary"),
+            _patch("after", "work.after"),
+        ),
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+        complete_when=_completed_capability("work.after"),
+    ) as rig:
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+
+        snapshot = await rig.ledger.load_snapshot(rig.run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        assert snapshot.incidents == ()
+        assert await rig.ledger.count_attempts(capability="repair.glossary") == 1
+        assert await rig.ledger.count_attempts(capability="work.after") == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_repair_supersedes_canonical_and_invalidates_downstream(
+    tmp_path: Path,
+) -> None:
+    """A real upstream repair must replace bytes and force stale consumers to rebuild."""
+    base_path = "output/work-base.txt"
+    downstream_path = "output/work-downstream.txt"
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            ("work.base", (SuccessTemplate(), SuccessTemplate())),
+            ("work.downstream", (SuccessTemplate(), SuccessTemplate())),
+        ),
+        patches=(
+            _patch("base-v1", "work.base"),
+            _patch("downstream-v1", "work.downstream"),
+            _patch("downstream-v2", "work.downstream"),
+        ),
+        semantic_repair_mappings=(("base_quality_failed", "work.base"),),
+        spec_options={"work.downstream": {"read_set": (base_path,)}},
+    ) as rig:
+        assert await rig.controller.tick(rig.run_id)
+        assert await rig.controller.tick(rig.run_id)
+        first = await rig.ledger.load_snapshot(rig.run_id)
+        assert {
+            action.capability
+            for action in first.actions
+            if action.outputs_current
+        } == {"work.base", "work.downstream"}
+
+        await rig.ledger.record_incident(
+            rig.run_id,
+            error_code="base_quality_failed",
+            message="the current base output requires semantic revision",
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code="base_quality_failed",
+        )
+        assert await rig.controller.tick(rig.run_id)
+        repaired = await rig.ledger.load_snapshot(rig.run_id)
+        assert {
+            action.capability
+            for action in repaired.actions
+            if action.outputs_current
+        } == {"work.base"}
+        assert await rig.controller.tick(rig.run_id)
+
+        final = await rig.ledger.load_snapshot(rig.run_id)
+        assert final.incidents == ()
+        current = {
+            action.capability: action.action_id
+            for action in final.actions
+            if action.outputs_current
+        }
+        assert current == {
+            "work.base": "run-1:3:repair-3-work-base",
+            "work.downstream": "run-1:4:downstream-v2",
+        }
+        assert "run-1:3:repair-3-work-base" in (tmp_path / base_path).read_text()
+        assert "run-1:4:downstream-v2" in (tmp_path / downstream_path).read_text()
+        with sqlite3.connect(tmp_path / "state" / "run.db") as db:
+            assert db.execute(
+                "SELECT COUNT(*), SUM(is_current) FROM artifacts"
+            ).fetchone() == (4, 2)
+
+
+@pytest.mark.asyncio
+async def test_replacement_recovers_after_atomic_rename_before_intent_commit(
+    tmp_path: Path,
+) -> None:
+    crashed = False
+
+    def crash_once(point: str, intent: PromotionIntent | None) -> None:
+        nonlocal crashed
+        if point == "after_replacement_rename" and not crashed:
+            crashed = True
+            raise InjectedCrash("crash after atomic replacement rename")
+
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.base", (SuccessTemplate(), SuccessTemplate())),),
+        patches=(
+            _patch("base-v1", "work.base"),
+        ),
+        semantic_repair_mappings=(("base_quality_failed", "work.base"),),
+        artifact_hook=crash_once,
+    ) as rig:
+        assert await rig.controller.tick(rig.run_id)
+        await rig.ledger.record_incident(
+            rig.run_id,
+            error_code="base_quality_failed",
+            message="replace base",
+            repair_class="semantic",
+            repair_source="validator",
+            reason_code="base_quality_failed",
+        )
+
+        with pytest.raises(
+            InjectedCrash, match="crash after atomic replacement rename"
+        ):
+            await rig.controller.tick(rig.run_id)
+
+        repair = await rig.ledger.get_action("run-1:2:repair-2-work-base")
+        assert repair.status is ActionStatus.RUNNING
+        intent = (
+            await rig.ledger.get_gate_receipt_and_intents(repair.action_id, 1)
+        )[1][0]
+        assert intent.status == "PENDING"
+        assert not (tmp_path / intent.staged_relpath).exists()
+
+        recovered = await rig.reconciler.reconcile(rig.run_id)
+        repeated = await rig.reconciler.reconcile(rig.run_id)
+        assert recovered.status is RunStatus.RUNNING, tuple(
+            (item.error_code, item.message) for item in recovered.incidents
+        )
+        assert recovered == repeated
+        current = [action for action in recovered.actions if action.outputs_current]
+        assert [(action.capability, action.action_id) for action in current] == [
+            ("work.base", "run-1:2:repair-2-work-base")
+        ], recovered.model_dump(mode="json")
+        assert recovered.incidents == ()
+        assert (await rig.ledger.get_promotion_intent(intent.intent_id)).status == "COMMITTED"
+
+
+@pytest.mark.asyncio
+async def test_repeated_semantic_repair_without_progress_blocks_at_generation_limit(
+    tmp_path: Path,
+) -> None:
+    failure = RepairRequired(
+        repair_class="semantic",
+        repair_source="action_outcome",
+        reason_code="term_drift",
+        defect_codes=("term_drift",),
+        message="unchanged repair evidence",
+    )
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            ("work.initial", (failure,)),
+            ("repair.glossary", (failure, failure, failure, SuccessTemplate())),
+        ),
+        patches=(
+            _patch("initial", "work.initial"),
+            _patch("repair-1", "repair.glossary"),
+            _patch("repair-2", "repair.glossary"),
+            _patch("repair-3", "repair.glossary"),
+            _patch("repair-4", "repair.glossary"),
+        ),
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+        max_cycles=30,
+        max_semantic_repair_attempts=3,
+    ) as rig:
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+
+        assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
+        assert await rig.ledger.count_attempts(capability="repair.glossary") == 3
+        assert await rig.ledger.has_open_incident("semantic_repair_stalled")
+        assert rig.planner.call_count == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "boundary",
     (
@@ -1273,7 +1489,7 @@ async def test_semantic_repair_crash_boundaries_create_one_replacement_action(
             matches = isinstance(detail, RunSnapshot) and any(
                 action.repair_class == "semantic" for action in detail.actions
             )
-        elif boundary == "before_semantic_replan" and point == "before_planner":
+        elif boundary == "before_semantic_replan" and point == "before_semantic_replan":
             context = cast(PlanningContext, detail)
             matches = any(
                 incident.repair_class == "semantic"
@@ -1703,6 +1919,89 @@ async def test_retryable_failure_retries_only_with_registered_bounded_code(
         assert (await rig.ledger.get_attempt(action.action_id, 1)).status is ActionStatus.RETRY_WAIT
         assert (await rig.ledger.get_attempt(action.action_id, 2)).status is ActionStatus.SUCCEEDED
         assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_closes_attempt_and_action_before_blocking(
+    tmp_path: Path,
+) -> None:
+    """Catch a final retry receipt leaving durable state falsely RUNNING."""
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            (
+                "network.fetch",
+                (RetryableFailure(error_code="temporary", message="still failing"),),
+            ),
+        ),
+        patches=(_patch("fetch", "network.fetch"),),
+        spec_options={"network.fetch": {"max_attempts": 1}},
+    ) as rig:
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+
+        action = (await rig.ledger.list_actions(rig.run_id))[0]
+        attempt = await rig.ledger.get_attempt(action.action_id, 1)
+        snapshot = await rig.ledger.load_snapshot(rig.run_id)
+
+        assert snapshot.status is RunStatus.BLOCKED
+        assert action.status is ActionStatus.PERMANENT_FAILED
+        assert attempt.status is ActionStatus.PERMANENT_FAILED
+        assert sum(
+            incident.error_code == "retry_exhausted"
+            for incident in snapshot.incidents
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_exhausted_semantic_generation_replans_within_outer_limit(
+    tmp_path: Path,
+) -> None:
+    """Operational exhaustion of one repair generation must not strand its incident."""
+    initial_failure = RepairRequired(
+        repair_class="semantic",
+        repair_source="action_outcome",
+        reason_code="term_drift",
+        defect_codes=("term_drift",),
+        message="repair glossary",
+    )
+    async with _controller_rig(
+        tmp_path,
+        definitions=(
+            ("work.initial", (initial_failure,)),
+            (
+                "repair.glossary",
+                (
+                    RetryableFailure(error_code="temporary", message="provider stalled"),
+                    SuccessTemplate(),
+                ),
+            ),
+        ),
+        patches=(
+            _patch("initial", "work.initial"),
+            _patch("repair-1", "repair.glossary"),
+            _patch("repair-2", "repair.glossary"),
+        ),
+        semantic_repair_mappings=(("term_drift", "repair.glossary"),),
+        spec_options={"repair.glossary": {"max_attempts": 1}},
+        complete_when=_completed_capability("repair.glossary"),
+        max_cycles=20,
+    ) as rig:
+        await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
+
+        repairs = [
+            action
+            for action in await rig.ledger.list_actions(rig.run_id)
+            if action.capability == "repair.glossary"
+        ]
+        snapshot = await rig.ledger.load_snapshot(rig.run_id)
+
+        assert snapshot.status is RunStatus.COMPLETED
+        assert [action.status for action in repairs] == [
+            ActionStatus.PERMANENT_FAILED,
+            ActionStatus.SUCCEEDED,
+        ]
+        assert snapshot.incidents == ()
+        assert not await rig.ledger.has_open_incident("retry_exhausted")
 
 
 @pytest.mark.asyncio
@@ -2591,12 +2890,52 @@ async def test_max_cycles_creates_incident_and_blocks(tmp_path: Path) -> None:
         definitions=(("work.never", (PermanentFailure(error_code="unused", message="unused"),)),),
         patches=(),
         max_cycles=2,
+        spec_options={
+            "work.never": {"prerequisites": (PredicateSpec(name="never"),)}
+        },
     ) as rig:
         await rig.runtime.run(run_id=rig.run_id, tick=rig.controller.tick)
 
         assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
         assert await rig.ledger.has_open_incident("controller_max_cycles_exhausted")
         assert await rig.ledger.count_attempts() == 0
+
+
+@pytest.mark.asyncio
+async def test_controller_blocks_when_durable_plan_rejection_limit_is_reached(
+    tmp_path: Path,
+) -> None:
+    """Catch a restart spending another Planner call after the durable rejection cap."""
+    async with _controller_rig(
+        tmp_path,
+        definitions=(("work.never", (PermanentFailure(error_code="unused", message="unused"),)),),
+        patches=(),
+        max_plan_rejections=2,
+        spec_options={
+            "work.never": {"prerequisites": (PredicateSpec(name="never"),)}
+        },
+    ) as rig:
+        for index in range(2):
+            plan = await rig.ledger.append_plan(
+                rig.run_id,
+                PlanPatch(
+                    objective=f"invalid plan {index}",
+                    proposed_actions=(),
+                    rationale="seed durable rejection history",
+                ),
+            )
+            await rig.ledger.record_plan_rejection(
+                rig.run_id,
+                plan_version=plan.version,
+                reason_codes=("invalid_horizon",),
+            )
+
+        keep_running = await rig.controller.tick(rig.run_id)
+
+        assert keep_running is False
+        assert rig.planner.call_count == 0
+        assert (await rig.ledger.get_run(rig.run_id)).status is RunStatus.BLOCKED
+        assert await rig.ledger.has_open_incident("planner_rejection_limit_exhausted")
 
 
 @pytest.mark.asyncio

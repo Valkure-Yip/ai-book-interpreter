@@ -394,7 +394,9 @@ async def default_run_service_factory(
 
     def complete_when(snapshot: RunSnapshot) -> bool:
         return any(
-            action.capability == "retrospective.capture" and action.status is ActionStatus.SUCCEEDED
+            action.capability == "retrospective.capture"
+            and action.status is ActionStatus.SUCCEEDED
+            and action.outputs_current
             for action in snapshot.actions
         )
 
@@ -427,6 +429,10 @@ async def default_run_service_factory(
             status_path=context.project.status_projection,
         ),
         complete_when=complete_when,
+        max_plan_rejections=context.config.planner.max_rejections,
+        max_semantic_repair_attempts=(
+            context.config.orchestration.max_semantic_repair_attempts
+        ),
     )
     runtime = DurableLoopRuntime(
         checkpoint_path=context.project.graph_checkpoints,
@@ -825,6 +831,19 @@ def _next_recovery(
         return (
             f"abi unblock {project.root} --source-action ACTION_ID --reason REASON "
             "--evidence-ref EVIDENCE --resolved-canonical PATH:removed|selected:SHA256"
+        )
+    operational = next(
+        (
+            incident
+            for incident in incidents
+            if incident.action_id is not None and incident.repair_class is None
+        ),
+        None,
+    )
+    if status is RunStatus.BLOCKED and operational is not None:
+        return (
+            f"abi unblock {project.root} --source-action {operational.action_id} "
+            "--reason REASON --evidence-ref FIX_EVIDENCE"
         )
     if status is RunStatus.BLOCKED:
         return "Repair the external condition named by the open incident, then run abi resume"

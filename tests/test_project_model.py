@@ -38,6 +38,10 @@ def test_scaffold_creates_new_state_contract(tmp_path: Path) -> None:
     assert project.run_db.is_file()
     assert project.staging_root.is_dir()
     assert project.graph_checkpoints.parent.is_dir()
+    assert project.action_checkpoints.parent.is_dir()
+    assert project.action_checkpoints != project.graph_checkpoints
+    assert project.finalized_book_yaml == project.root / "metadata/finalized_book.yaml"
+    assert project.retrospective == project.root / "retrospective/retrospective.md"
     assert not (project.root / "state/pipeline_state.json").exists()
 
 

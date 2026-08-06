@@ -84,8 +84,31 @@ def make_subagent_tools(
             "assigned samples and reference standards with the provided filesystem "
             "tools, then write your scored review to the requested path. Score every "
             "sample 0-100 with problem type, priority (P0/P1/P2), rework flag, and "
-            "rationale. Be strict: any single item <80 or any P0/P1/P2 is a FAIL."
+            "rationale. Be strict: any single item <80 or any P0/P1/P2 is a FAIL. "
+            "The report MUST end with exactly one plain, unwrapped machine-readable "
+            "line: `result: PASS` or `result: FAIL`. A heading, table cell, bold verdict, "
+            "localized verdict, or emoji does not replace that terminal line."
         )
+        if capability == "review.independent":
+            system += (
+                " This review runs before release.prepare. Versioned release files are "
+                "therefore intentionally absent and strictly out of scope; never fail or "
+                "deduct points because output/release does not exist. Evaluate the built "
+                "EPUB and the evidence you are authorized to read. Do not infer that an "
+                "unavailable directory or file is missing project evidence."
+            )
+        elif capability == "review.spotcheck":
+            if spotcheck_input is None:
+                raise RuntimeError("spot-check reviewer requires frozen controller input")
+            system += (
+                f" The controller-authorized sample count is exactly "
+                f"{spotcheck_input.samples_per_agent} per reviewer; the supplied sample "
+                "file is a complete sample set for this round. Confidence measures your "
+                "confidence in the reviewed passage assessments, not whole-book coverage. "
+                "Do not lower confidence because the authorized sample count is small, and "
+                "do not claim a sample lacks content when its source and translation are "
+                "present."
+            )
         if action_identity is None:
             raise RuntimeError("review sub-agent requires controller-owned Action identity")
         scoped_permissions, output = reviewer_permissions(agent_label)
@@ -95,23 +118,27 @@ def make_subagent_tools(
             writer=writer,
             expected_artifacts=expected_artifacts,
         )
-        from abi.providers.agent_runtime import AgentActionRequest, CheckpointResume
+        from abi.providers.agent_runtime import AgentActionRequest
 
         thread_id = (
-            f"review:{action_identity.run_id}:{action_identity.action_id}:{agent_label}"
+            f"review:{action_identity.run_id}:{action_identity.action_id}:"
+            f"{action_identity.attempt}:{agent_label}"
         )
 
         result = await ctx.services.agent.run_action(
             AgentActionRequest(
                 system_prompt=system,
-                user_prompt=f"{instructions}\n\nWrite only to {output}.",
+                user_prompt=(
+                    f"{instructions}\n\nWrite only to {output}. End the written file with "
+                    "exactly `result: PASS` or `result: FAIL` on its own line."
+                ),
                 tools=tuple(tools),
                 agent_name=f"review_{agent_label}",
-                checkpoint_path=ctx.project.graph_checkpoints,
+                checkpoint_path=ctx.project.action_checkpoints,
                 max_iterations=30,
                 thread_id=thread_id,
                 may_have_side_effects=True,
-                resume=CheckpointResume() if action_identity.attempt > 1 else None,
+                resume=None,
             )
         )
         return json.dumps(

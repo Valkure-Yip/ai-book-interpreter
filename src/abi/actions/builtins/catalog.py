@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
@@ -27,7 +28,7 @@ from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.actions.validators import validator_catalog
 from abi.epub.result import GateResult
-from abi.project.artifacts import ArtifactStore, BufferedAttemptWriter
+from abi.project.artifacts import ArtifactConflictError, ArtifactStore, BufferedAttemptWriter
 from abi.prompts.actions import ActionPromptRegistry, ActionPromptSnapshot
 from abi.tools.belt import build_belt
 from abi.tools.context import ToolContext
@@ -40,11 +41,14 @@ from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     ActionSpec,
     ActionStatus,
+    AgentCompleted,
+    ArtifactBundle,
     EffectSpec,
     EvidenceSpec,
     PermanentFailure,
     PredicateSpec,
     RepairRequired,
+    RetryableFailure,
     RetryPolicySpec,
     Succeeded,
 )
@@ -141,7 +145,7 @@ _BUILTINS = (
         "qa/benchmark",
         "qa/benchmark",
         ("read_file", "write_file", "grep"),
-        (),
+        _QUALITY_SKILLS,
         ("references",),
         ("qa/benchmark",),
         0.20,
@@ -155,7 +159,7 @@ _BUILTINS = (
         "metadata/style_profile.md",
         "metadata/style_profile.md",
         ("read_file", "write_file", "grep"),
-        (),
+        _QUALITY_SKILLS,
         ("source", "references"),
         ("metadata",),
         0.50,
@@ -295,7 +299,7 @@ _BUILTINS = (
             "spawn_review_agent",
         ),
         _QUALITY_SKILLS,
-        ("chapters/src", "chapters/final", "references", "skills", "output"),
+        ("chapters/src", "chapters/final", "references", "skills"),
         ("reviews/random_spotcheck",),
         2.00,
     ),
@@ -309,7 +313,16 @@ _BUILTINS = (
         "reviews/agent_b",
         ("read_file", "write_file", "grep", "spawn_review_agent"),
         _QUALITY_SKILLS,
-        ("chapters/src", "chapters/final", "references", "skills", "output"),
+        (
+            "chapters/src",
+            "chapters/final",
+            "references",
+            "skills",
+            "output/book.epub",
+            "output/epubcheck.json",
+            "output/publication_lint.json",
+            "output/asset_manifest_check.json",
+        ),
         ("reviews/agent_a", "reviews/agent_b", "reviews/revision_route.md"),
         1.20,
     ),
@@ -372,7 +385,9 @@ def _action_succeeded(snapshot: object, arguments: tuple[ActionArgument, ...]) -
         return False
     actions = getattr(snapshot, "actions", ())
     return any(
-        action.capability == dependency and action.status == ActionStatus.SUCCEEDED
+        action.capability == dependency
+        and action.status == ActionStatus.SUCCEEDED
+        and action.outputs_current
         for action in actions
     )
 
@@ -402,6 +417,71 @@ def _declared_tools() -> dict[str, ToolBinding]:
         name: ToolBinding(name, f"Declared built-in tool {name}.", EmptyInput, _unbound_tool)
         for name in names
     }
+
+
+def _fixed_arguments_for(
+    capability: str, *, tool_context: ToolContext | None
+) -> tuple[ActionArgument, ...]:
+    """Return deterministic argument values the Planner may copy into a proposal."""
+    if capability == "release.prepare":
+        # A fresh autonomous run publishes its first immutable release.  Release
+        # versioning is controller-owned so neither the planner nor the agent may
+        # invent or override the semantic version at the final boundary.
+        return (ActionArgument(name="version", value_json='"v0.0.1"'),)
+    if not isinstance(tool_context, ToolContext) or capability not in {
+        "source.split",
+        "chapter.translate",
+        "chapter.control",
+        "chapter.review",
+        "review.independent",
+        "review.spotcheck",
+    }:
+        return ()
+    source_relpath = "source/source_text_raw.txt"
+    try:
+        source_data = tool_context.read_authorized_bytes(
+            source_relpath,
+            ActionPathPermissions(read_dirs=("source",)),
+        )
+    except (FileNotFoundError, PermissionError):
+        return ()
+
+    from abi.ir import ingest_bytes
+    from abi.ir.split import plan_chapters
+
+    book, _ = ingest_bytes(source_data, source_name=source_relpath)
+    chapters = tuple(entry.slug for entry in plan_chapters(book))
+    if not chapters:
+        return ()
+    chapter_json = json.dumps(chapters, separators=(",", ":"))
+    if capability == "source.split":
+        return (
+            ActionArgument(name="expected_chapters", value_json=chapter_json),
+            ActionArgument(name="refine_toc", value_json="true"),
+            ActionArgument(
+                name="source_relpath", value_json=json.dumps(source_relpath)
+            ),
+        )
+    if capability == "review.independent":
+        return (
+            ActionArgument(name="chapters", value_json=chapter_json),
+            ActionArgument(
+                name="reviewers",
+                value_json=json.dumps(("agent_a", "agent_b"), separators=(",", ":")),
+            ),
+        )
+    if capability == "review.spotcheck":
+        return (
+            ActionArgument(name="round_id", value_json='"round_001"'),
+            ActionArgument(
+                name="reviewers",
+                value_json=json.dumps(("agent_a", "agent_b"), separators=(",", ":")),
+            ),
+            ActionArgument(name="chapters", value_json=chapter_json),
+            ActionArgument(name="samples_per_agent", value_json="1"),
+            ActionArgument(name="seed", value_json="42"),
+        )
+    return (ActionArgument(name="chapters", value_json=chapter_json),)
 
 
 def _permissions_for(capability: str, parameters: FrozenModel) -> ActionPathPermissions:
@@ -524,6 +604,11 @@ def _prompt_snapshot(
         "publication_mode": context.publication_mode,
         "book_slug": context.book_slug,
         "profile": context.profile,
+        "repair_context": tuple(
+            f"{incident.reason_code}: {incident.message}"
+            for incident in context.snapshot.incidents
+            if incident.repair_class == "semantic"
+        ),
     }
     if capability != "chapter.translate" or not isinstance(parameters, ChapterBatchInput):
         return ActionPromptSnapshot(**values)
@@ -684,6 +769,85 @@ class AgentActionExecutor:
             else attempt_writer
         )
         manifest = expand_expected_artifacts(self._capability, action_id, parameters)
+
+        def finalized_outcome(
+            completion: AgentCompleted,
+            *,
+            recovered_bundle: ArtifactBundle | None = None,
+        ) -> ActionOutcome:
+            expected_effects = tuple(
+                (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
+                for item in manifest.entries
+            )
+            actual_effects = tuple(
+                (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
+                for item in (
+                    recovered_bundle.entries
+                    if recovered_bundle is not None
+                    else writer.entries
+                )
+            )
+            if actual_effects != expected_effects:
+                expected_paths = {item[0] for item in expected_effects}
+                actual_paths = {item[0] for item in actual_effects}
+                missing_paths = tuple(sorted(expected_paths - actual_paths))
+                unexpected_paths = tuple(sorted(actual_paths - expected_paths))
+                if missing_paths and not unexpected_paths:
+                    return RetryableFailure(
+                        error_code="agent_incomplete_outputs",
+                        message=(
+                            "The agent completed before emitting the full authorized manifest. "
+                            f"Missing: {', '.join(missing_paths)}. "
+                            "Retry this side-effect-free Action in a fresh attempt."
+                        ),
+                    )
+                return RepairRequired(
+                    repair_class="integrity",
+                    repair_source="action_outcome",
+                    reason_code="artifact_bundle_conflict",
+                    defect_codes=("artifact_bundle_conflict",),
+                    message=(
+                        "Recorded attempt effects do not equal the authorized manifest; "
+                        f"the agent completion summary was {completion.summary!r}."
+                    ),
+                )
+            if self._capability == "review.independent":
+                invalid_results: list[str] = []
+                for relpath in (
+                    "reviews/agent_a/review.md",
+                    "reviews/agent_b/review.md",
+                    "reviews/revision_route.md",
+                ):
+                    try:
+                        content = (
+                            store.read_staged_bytes(action_id, context.attempt, relpath)
+                            if recovered_bundle is not None
+                            else writer.read_bytes(relpath)
+                        ).decode("utf-8")
+                    except (KeyError, OSError, UnicodeError):
+                        invalid_results.append(relpath)
+                        continue
+                    if _terminal_review_result(content) is None:
+                        invalid_results.append(relpath)
+                if invalid_results:
+                    return RetryableFailure(
+                        error_code="review_result_protocol_invalid",
+                        message=(
+                            "Independent review outputs must end with exactly one plain "
+                            "`result: PASS` or `result: FAIL` line. Invalid: "
+                            f"{', '.join(invalid_results)}. Retry the side-effect-free review "
+                            "in a fresh attempt."
+                        ),
+                    )
+            bundle = (
+                recovered_bundle
+                if recovered_bundle is not None
+                else writer.artifact_bundle()
+            )
+            if recovered_bundle is None and isinstance(writer, BufferedAttemptWriter):
+                bundle = writer.flush_to(attempt_writer)
+            return Succeeded(artifact_bundle=bundle, evidence_refs=())
+
         belt = build_belt(
             self._tool_context,
             get_run_snapshot=lambda: context.snapshot,
@@ -738,43 +902,71 @@ class AgentActionExecutor:
                 tools=tools,
                 agent_name=self._capability.replace(".", "_"),
                 thread_id=f"{context.run_id}/{action_id}/{context.attempt}",
-                checkpoint_path=context.project.graph_checkpoints,
+                checkpoint_path=context.project.action_checkpoints,
                 max_iterations=40,
                 may_have_side_effects=False,
                 resume=resume,
                 approval_tools=envelope.approval_tools,
             )
             if inspect_only:
-                return await self._tool_context.services.agent.inspect_hitl_checkpoint(request)
-            result = await self._tool_context.services.agent.run_action(request)
-            outcome: ActionOutcome
-            if isinstance(result.outcome, Succeeded):
-                bundle = writer.artifact_bundle()
-                expected_effects = tuple(
-                    (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
-                    for item in manifest.entries
+                from abi.providers.agent_runtime import HitlCheckpointInspection
+
+                inspection = await self._tool_context.services.agent.inspect_hitl_checkpoint(
+                    request
                 )
-                actual_effects = tuple(
-                    (item.canonical_relpath, item.media_type, item.evidence_role, item.metadata)
-                    for item in bundle.entries
-                )
-                if actual_effects != expected_effects:
-                    return ActionOutcomeEnvelope(
-                        action_id=action_id,
-                        attempt=context.attempt,
+                if inspection.disposition != "outcome" or not isinstance(
+                    inspection.outcome, AgentCompleted
+                ):
+                    return inspection
+                try:
+                    recovered_bundle = store.rebuild_exact_staged_bundle(
+                        action_id, context.attempt, manifest
+                    )
+                except ArtifactConflictError as exc:
+                    return HitlCheckpointInspection(
+                        disposition="outcome",
                         outcome=RepairRequired(
                             repair_class="integrity",
                             repair_source="action_outcome",
                             reason_code="artifact_bundle_conflict",
                             defect_codes=("artifact_bundle_conflict",),
-                            message="Recorded attempt effects do not equal the authorized manifest.",
+                            message=str(exc),
                         ),
                     )
-                if isinstance(writer, BufferedAttemptWriter):
-                    bundle = writer.flush_to(attempt_writer)
-                outcome = Succeeded(
-                    artifact_bundle=bundle, evidence_refs=result.outcome.evidence_refs
+                return HitlCheckpointInspection(
+                    disposition="outcome",
+                    outcome=finalized_outcome(
+                        inspection.outcome, recovered_bundle=recovered_bundle
+                    ),
                 )
+            result = await self._tool_context.services.agent.run_action(request)
+            outcome: ActionOutcome
+            if isinstance(result.outcome, AgentCompleted):
+                continued_bundle: ArtifactBundle | None = None
+                if resume is not None:
+                    # A HITL/checkpoint continuation executes with tool bindings
+                    # reconstructed around the same durable staging directory.  The
+                    # new writer object does not carry the pre-pause in-memory entry
+                    # list, so rebuild the exact authorized bundle from disk before
+                    # deciding whether the Action emitted all required artifacts.
+                    try:
+                        continued_bundle = store.rebuild_exact_staged_bundle(
+                            action_id, context.attempt, manifest
+                        )
+                    except ArtifactConflictError as exc:
+                        outcome = RepairRequired(
+                            repair_class="integrity",
+                            repair_source="action_outcome",
+                            reason_code="artifact_bundle_conflict",
+                            defect_codes=("artifact_bundle_conflict",),
+                            message=str(exc),
+                        )
+                    else:
+                        outcome = finalized_outcome(
+                            result.outcome, recovered_bundle=continued_bundle
+                        )
+                else:
+                    outcome = finalized_outcome(result.outcome)
             else:
                 outcome = result.outcome
             return ActionOutcomeEnvelope(
@@ -940,6 +1132,29 @@ class DeterministicActionExecutor:
                     media_type="application/json",
                     evidence_role="publication_gate",
                 )
+                gate_failure: tuple[str, GateResult] | None = None
+                if not epubcheck_result.ok:
+                    gate_failure = (
+                        "epubcheck_unavailable"
+                        if epubcheck_result.message == "EPUBCheck not available"
+                        else "epubcheck_failed",
+                        epubcheck_result,
+                    )
+                elif not asset_result.ok:
+                    gate_failure = ("asset_manifest_failed", asset_result)
+                elif not lint_result.ok:
+                    gate_failure = ("publication_lint_failed", lint_result)
+                if gate_failure is not None:
+                    error_code, failed_gate = gate_failure
+                    detail = "; ".join(failed_gate.hard_errors) or failed_gate.message
+                    return ActionOutcomeEnvelope(
+                        action_id=action_id,
+                        attempt=context.attempt,
+                        outcome=PermanentFailure(
+                            error_code=error_code,
+                            message=detail,
+                        ),
+                    )
                 evidence_refs = (
                     "asset_gate",
                     "epub",
@@ -1034,7 +1249,32 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
         validators=validators,
         tools=_declared_tools(),
         skill_refs=_QUALITY_SKILLS,
-        semantic_repair_mappings=(("term_drift", "glossary.prepare"),),
+        semantic_repair_mappings=(
+            ("source_evidence_invalid", "source.ingest"),
+            ("source_split_invalid", "source.split"),
+            ("global_research_missing", "research.global"),
+            ("book_research_missing", "research.book"),
+            ("pretranslation_not_passed", "translation.trial"),
+            ("glossary_terms_empty", "glossary.prepare"),
+            ("glossary_terms_invalid", "glossary.prepare"),
+            ("chapter_translation_missing", "chapter.translate"),
+            ("chapter_control_not_passed", "chapter.control"),
+            ("chapter_control_revision_invalid", "chapter.control"),
+            ("chapter_review_scope_empty", "chapter.review"),
+            ("chapter_gate_not_passed", "chapter.review"),
+            ("chapter_final_missing", "chapter.review"),
+            ("production_spec_missing", "preproduction.spec"),
+            ("finalized_metadata_invalid", "preproduction.spec"),
+            ("sample_review_not_passed", "preproduction.spec"),
+            ("spotcheck_not_passed", "chapter.review"),
+            ("independent_review_protocol_invalid", "review.independent"),
+            ("translation_quality_failed", "chapter.review"),
+            ("epub_quality_failed", "preproduction.spec"),
+            ("release_not_passed", "release.prepare"),
+            ("final_manifest_missing", "output.finalize"),
+            ("retrospective_missing", "retrospective.capture"),
+            ("term_drift", "glossary.prepare"),
+        ),
     )
     prompts = ActionPromptRegistry()
     for item in _BUILTINS:
@@ -1053,7 +1293,13 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
             write_set=item.write_set,
             retry_policy=RetryPolicySpec(
                 max_attempts=3,
-                retryable_codes=("transient_provider_error", "provider_timeout"),
+                retryable_codes=(
+                    "agent_incomplete_outputs",
+                    "iteration_limit",
+                    "review_result_protocol_invalid",
+                    "transient_provider_error",
+                    "provider_timeout",
+                ),
                 base_delay_s=1.0,
                 max_delay_s=30.0,
             ),
@@ -1078,7 +1324,26 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
                 validator=validator,
                 effect_expander=expand_expected_artifacts,
                 access_expander=_access_for,
+                fixed_arguments=_fixed_arguments_for(
+                    item.capability, tool_context=tool_context
+                ),
             )
         )
     registry.validate_startup()
     return registry
+
+
+_REVIEW_RESULT_LINE = re.compile(r"(?m)^result: (PASS|FAIL)$")
+
+
+def _terminal_review_result(text: str) -> str | None:
+    """Parse the one canonical reviewer result line at the end of a report."""
+    stripped = text.rstrip()
+    if not stripped:
+        return None
+    match = _REVIEW_RESULT_LINE.search(stripped)
+    if match is None or match.end() != len(stripped):
+        return None
+    if len(_REVIEW_RESULT_LINE.findall(stripped)) != 1:
+        return None
+    return match.group(1)

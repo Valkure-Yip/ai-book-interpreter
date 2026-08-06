@@ -50,10 +50,6 @@ class Reconciler:
     async def reconcile(self, run_id: str) -> RunSnapshot:
         """Reconcile post-success drift and every RUNNING attempt without reexecution."""
         actions = {action.action_id: action for action in await self._ledger.list_actions(run_id)}
-        await self._verify_prior_successes(run_id, tuple(actions.values()))
-        if (await self._ledger.get_run(run_id)).status is RunStatus.BLOCKED:
-            return await self._ledger.load_snapshot(run_id)
-
         for attempt in await self._ledger.running_attempts(run_id):
             action = actions[attempt.action_id]
             try:
@@ -71,12 +67,38 @@ class Reconciler:
             envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
             await self._route_receipt(run_id, action, envelope)
 
+        if (await self._ledger.get_run(run_id)).status is RunStatus.BLOCKED:
+            return await self._ledger.load_snapshot(run_id)
+
+        # A crash may occur after an authorized replacement atomically renames the
+        # canonical file but before its intent/artifact transaction commits. Finish
+        # RUNNING receipts first so the predecessor is durably superseded before
+        # ordinary post-success drift verification examines the current generation.
+        refreshed_actions = tuple(await self._ledger.list_actions(run_id))
+        snapshot = await self._ledger.load_snapshot(run_id)
+        current_action_ids = {
+            action.action_id for action in snapshot.actions if action.outputs_current
+        }
+        await self._verify_prior_successes(
+            run_id, refreshed_actions, current_action_ids
+        )
+        if (await self._ledger.get_run(run_id)).status is RunStatus.BLOCKED:
+            return await self._ledger.load_snapshot(run_id)
+
         await self._project_reconciled_intents(run_id)
         return await self._ledger.load_snapshot(run_id)
 
-    async def _verify_prior_successes(self, run_id: str, actions: tuple[ActionRecord, ...]) -> None:
+    async def _verify_prior_successes(
+        self,
+        run_id: str,
+        actions: tuple[ActionRecord, ...],
+        current_action_ids: set[str],
+    ) -> None:
         for action in actions:
-            if action.status is not ActionStatus.SUCCEEDED:
+            if (
+                action.status is not ActionStatus.SUCCEEDED
+                or action.action_id not in current_action_ids
+            ):
                 continue
             attempts = await self._ledger.attempt_numbers(action.action_id)
             if not attempts:
@@ -145,6 +167,22 @@ class Reconciler:
             try:
                 await self._ledger.route_retry_from_receipt(action.action_id, attempt=attempt)
             except LedgerTransitionError:
+                # A retryable receipt at the frozen attempt limit is a durable
+                # terminal failure, not an indefinitely RUNNING attempt. Close the
+                # attempt and Action before blocking the run so resume/reconciliation
+                # observes one self-consistent state.
+                await self._ledger.finish_attempt(
+                    action.action_id,
+                    attempt=attempt,
+                    status=ActionStatus.PERMANENT_FAILED,
+                )
+                # A semantic replacement generation may fail operationally even
+                # after its internal retries are spent. Keep the original semantic
+                # incident open and let bounded replanning authorize another
+                # generation; the controller's semantic-repair limit is the outer
+                # non-progress guard.
+                if await self._ledger.semantic_repair_incident_ids(action.action_id):
+                    return
                 await self._ledger.record_incident(
                     run_id,
                     error_code="retry_exhausted",

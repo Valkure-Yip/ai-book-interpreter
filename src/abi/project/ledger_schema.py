@@ -1,6 +1,6 @@
 """SQLite schema for the durable orchestration business ledger."""
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 SCHEMA_SQL = f"""
 PRAGMA journal_mode = WAL;
@@ -191,11 +191,17 @@ CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY,
     action_id TEXT NOT NULL REFERENCES actions(action_id),
     attempt INTEGER NOT NULL,
-    canonical_relpath TEXT NOT NULL UNIQUE,
+    canonical_relpath TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     media_type TEXT NOT NULL,
-    committed_at TEXT NOT NULL
+    committed_at TEXT NOT NULL,
+    is_current INTEGER NOT NULL,
+    superseded_at TEXT
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS current_artifact_path
+ON artifacts(canonical_relpath)
+WHERE is_current = 1;
 
 CREATE TABLE IF NOT EXISTS promotion_intents (
     intent_id TEXT PRIMARY KEY,
@@ -209,12 +215,13 @@ CREATE TABLE IF NOT EXISTS promotion_intents (
     metadata_json TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     bundle_digest TEXT NOT NULL,
+    replaces_artifact_id TEXT REFERENCES artifacts(artifact_id),
+    replaces_checksum TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     committed_at TEXT,
     UNIQUE (action_id, attempt, staged_relpath, canonical_relpath),
-    UNIQUE (action_id, attempt, ordinal),
-    UNIQUE (canonical_relpath)
+    UNIQUE (action_id, attempt, ordinal)
 );
 
 CREATE TABLE IF NOT EXISTS gate_evidence (
@@ -245,6 +252,17 @@ CREATE TABLE IF NOT EXISTS incidents (
 CREATE UNIQUE INDEX IF NOT EXISTS open_promotion_incident_subject
 ON incidents(action_id, error_code, subject)
 WHERE status = 'OPEN' AND subject IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS semantic_repair_bindings (
+    incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+    replacement_action_id TEXT NOT NULL REFERENCES actions(action_id),
+    bound_at TEXT NOT NULL,
+    resolved_at TEXT,
+    PRIMARY KEY (incident_id, replacement_action_id)
+);
+
+CREATE INDEX IF NOT EXISTS semantic_repair_replacement_action
+ON semantic_repair_bindings(replacement_action_id);
 
 CREATE TABLE IF NOT EXISTS interrupts (
     interrupt_id TEXT PRIMARY KEY,

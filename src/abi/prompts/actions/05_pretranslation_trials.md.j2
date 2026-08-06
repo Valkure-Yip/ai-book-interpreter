@@ -3,7 +3,7 @@
 Read `metadata/book_specific_translation_research.md` and `metadata/style_profile.md`.
 Follow `skills/expert-translation-quality/SKILL.md`.
 
-Pick 3-5 representative source passages (per the sample plan). For each, write
+Pick exactly 5 representative source passages (per the sample plan). For each, write
 `qa/pretranslation/source_NN.md` (the passage) and `qa/pretranslation/trial_NN.md`
 containing:
 1. source text
@@ -18,8 +18,10 @@ containing:
 10. PASS or FAIL
 
 Then write `qa/pretranslation/pretranslation_report.md` with an overall
-conclusion line `result: PASS` or `result: FAIL`, and refine `style_profile.md`
-with anything learned.
+conclusion line `result: PASS` or `result: FAIL`. Incorporate anything learned
+by writing the complete revised style profile to
+`metadata/pretranslation_style_profile.md`. Do not overwrite
+`metadata/style_profile.md`; canonical evidence is immutable.
 
 If the report concludes FAIL, revise the trials and retry. Do NOT proceed to
 translation. Only the controller records the deterministic gate decision.

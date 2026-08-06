@@ -12,7 +12,7 @@ from typing import Literal, Self, cast
 from uuid import uuid4
 
 import aiosqlite
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
 from abi.project.artifact_paths import canonical_artifact_key
 from abi.project.ledger_schema import LEDGER_SCHEMA_VERSION, SCHEMA_SQL
@@ -258,9 +258,19 @@ class PromotionIntent(FrozenModel):
     metadata_json: str
     ordinal: int = Field(ge=0)
     bundle_digest: str
+    replaces_artifact_id: str | None = None
+    replaces_checksum: str | None = None
     status: PromotionStatus
     created_at: datetime
     committed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _replacement_binding_is_complete(self) -> Self:
+        if (self.replaces_artifact_id is None) != (self.replaces_checksum is None):
+            raise ValueError(
+                "replacement promotion needs both artifact identity and checksum"
+            )
+        return self
 
 
 class AttemptOutcomeReceiptRecord(AttemptOutcomeReceiptPayload):
@@ -601,6 +611,20 @@ class RunLedger:
             )
         return rejection
 
+    async def consecutive_plan_rejection_count(self, run_id: str) -> int:
+        """Count rejected plans since the latest plan that authorized an Action."""
+        await self.get_run(run_id)
+        row = await self._fetch_one(
+            "SELECT COUNT(DISTINCT pr.plan_version) AS rejection_count "
+            "FROM plan_rejections pr WHERE pr.run_id = ? AND pr.plan_version > "
+            "COALESCE((SELECT MAX(a.plan_version) FROM actions a WHERE a.run_id = ?), 0) "
+            "AND pr.created_at > COALESCE((SELECT MAX(u.resolved_at) "
+            "FROM unblock_resolutions u WHERE u.run_id = ?), '')",
+            (run_id, run_id, run_id),
+        )
+        assert row is not None
+        return int(row["rejection_count"])
+
     async def pending_plan(self, run_id: str) -> PlanVersionRecord | None:
         """Return the latest appended plan only while it has no durable disposition."""
         await self.get_run(run_id)
@@ -676,6 +700,28 @@ class RunLedger:
                         action.retry_policy_fingerprint,
                     ),
                 )
+                for incident_id in action.repairs_incident_ids:
+                    cursor = await db.execute(
+                        "SELECT run_id, repair_class, status FROM incidents "
+                        "WHERE incident_id = ?",
+                        (incident_id,),
+                    )
+                    incident = await cursor.fetchone()
+                    if (
+                        incident is None
+                        or incident["run_id"] != run_id
+                        or incident["repair_class"] != "semantic"
+                        or incident["status"] != "OPEN"
+                    ):
+                        raise LedgerTransitionError(
+                            f"semantic repair incident {incident_id} is not an open incident "
+                            "for this run; rebuild the authorization snapshot"
+                        )
+                    await db.execute(
+                        "INSERT INTO semantic_repair_bindings "
+                        "(incident_id, replacement_action_id, bound_at) VALUES (?, ?, ?)",
+                        (incident_id, action.action_id, self._now()),
+                    )
                 await self._insert_outbox(
                     db,
                     run_id=run_id,
@@ -1755,9 +1801,10 @@ class RunLedger:
         """Persist PASS plus the complete ordered intent set before canonical mutation."""
         now = self._now()
         replay_conflict = False
+        replacement_conflict = False
         try:
             async with self.transaction() as db:
-                await self._require_action(db, payload.action_id)
+                action = await self._require_action(db, payload.action_id)
                 attempt = await self._attempt_row(db, payload.action_id, payload.attempt)
                 effective = await self._effective_attempt_outcome(
                     db, payload.action_id, payload.attempt
@@ -1834,25 +1881,77 @@ class RunLedger:
                         now,
                     ),
                 )
+                cursor = await db.execute(
+                    "SELECT 1 FROM semantic_repair_bindings "
+                    "WHERE replacement_action_id = ? LIMIT 1",
+                    (payload.action_id,),
+                )
+                is_semantic_repair = await cursor.fetchone() is not None
                 for ordinal, (identity, artifact) in enumerate(
                     zip(payload.artifacts, expected.entries, strict=True)
                 ):
+                    canonical_relpath = canonical_artifact_key(
+                        identity.canonical_relpath
+                    )
+                    cursor = await db.execute(
+                        "SELECT intent_id FROM promotion_intents "
+                        "WHERE canonical_relpath = ? AND action_id != ? "
+                        "AND status != 'COMMITTED' LIMIT 1",
+                        (canonical_relpath, payload.action_id),
+                    )
+                    if await cursor.fetchone() is not None:
+                        replacement_conflict = True
+                        raise LedgerConflictError(
+                            "canonical artifact has an unresolved promotion intent; "
+                            "inspect and choose the canonical artifact"
+                        )
+                    cursor = await db.execute(
+                        "SELECT ar.*, producer.capability AS producer_capability "
+                        "FROM artifacts ar JOIN actions producer "
+                        "ON producer.action_id = ar.action_id "
+                        "WHERE ar.canonical_relpath = ? "
+                        "ORDER BY ar.is_current DESC, ar.committed_at DESC, ar.artifact_id DESC "
+                        "LIMIT 1",
+                        (canonical_relpath,),
+                    )
+                    previous_artifact = await cursor.fetchone()
+                    replaces_artifact_id: str | None = None
+                    replaces_checksum: str | None = None
+                    if previous_artifact is not None:
+                        replaces_current = bool(previous_artifact["is_current"])
+                        stale_same_capability = (
+                            not replaces_current
+                            and previous_artifact["producer_capability"]
+                            == action["capability"]
+                        )
+                        if not is_semantic_repair and not stale_same_capability:
+                            replacement_conflict = True
+                            raise LedgerConflictError(
+                                "canonical artifact replacement requires a bound semantic "
+                                "repair or a stale rerun of the same capability; inspect and "
+                                "choose the canonical artifact"
+                            )
+                        replaces_artifact_id = str(previous_artifact["artifact_id"])
+                        replaces_checksum = str(previous_artifact["sha256"])
                     await db.execute(
                         "INSERT INTO promotion_intents (intent_id, action_id, attempt, staged_relpath, "
                         "canonical_relpath, checksum, media_type, evidence_role, metadata_json, ordinal, "
-                        "bundle_digest, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "bundle_digest, replaces_artifact_id, replaces_checksum, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             f"intent:{payload.action_id}:{payload.attempt}:{ordinal}",
                             payload.action_id,
                             payload.attempt,
                             identity.staged_relpath,
-                            canonical_artifact_key(identity.canonical_relpath),
+                            canonical_relpath,
                             identity.checksum,
                             artifact.media_type,
                             artifact.evidence_role,
                             canonical_model_json(_MetadataList(items=artifact.metadata)),
                             ordinal,
                             payload.bundle_digest,
+                            replaces_artifact_id,
+                            replaces_checksum,
                             "PENDING",
                             now,
                         ),
@@ -1864,6 +1963,16 @@ class RunLedger:
                     payload.attempt,
                     reason_code="partial_intent_set",
                     message="gate/intents replay conflicts",
+                )
+            elif replacement_conflict:
+                await self.mark_bundle_conflict(
+                    payload.action_id,
+                    payload.attempt,
+                    reason_code="artifact_checksum_conflict",
+                    message=(
+                        "canonical artifact replacement lacks semantic-repair or stale-rerun "
+                        "authority; preserve both versions and inspect the planner route"
+                    ),
                 )
             raise
         except aiosqlite.IntegrityError as exc:
@@ -1978,6 +2087,14 @@ class RunLedger:
                     bundle_entry_count = -1
                     if isinstance(outcome, Succeeded):
                         bundle_entry_count = len(outcome.artifact_bundle.entries)
+                    authorized_evidence_refs = set(
+                        getattr(outcome, "evidence_refs", ())
+                    )
+                    if isinstance(outcome, Succeeded):
+                        authorized_evidence_refs.update(
+                            entry.canonical_relpath
+                            for entry in outcome.artifact_bundle.entries
+                        )
                     exact_receipt_fact = (
                         isinstance(outcome, Succeeded)
                         and not validator_decision.passed
@@ -1989,7 +2106,10 @@ class RunLedger:
                         and message == validator_decision.message
                         and validator_decision.bundle_digest
                         == sha256_canonical_json(canonical_bundle_json(outcome.artifact_bundle))
-                        and validator_decision.evidence_refs == outcome.evidence_refs
+                        and all(
+                            ref in authorized_evidence_refs
+                            for ref in validator_decision.evidence_refs
+                        )
                         and len(validator_decision.artifact_checksums) == bundle_entry_count
                     )
 
@@ -2575,9 +2695,20 @@ class RunLedger:
             envelope = ActionOutcomeEnvelope.model_validate_json(receipt.canonical_outcome_json)
             expected_status = _finish_status_for_outcome(envelope.outcome)
             if status is not expected_status:
-                raise LedgerTransitionError(
-                    f"{envelope.outcome.kind} receipt cannot finish as {status.value}"
-                )
+                terminal_retry = False
+                if (
+                    isinstance(envelope.outcome, RetryableFailure)
+                    and status is ActionStatus.PERMANENT_FAILED
+                ):
+                    policy = RetryPolicySpec.model_validate_json(row["retry_policy_json"])
+                    terminal_retry = (
+                        envelope.outcome.error_code not in policy.retryable_codes
+                        or attempt >= policy.max_attempts
+                    )
+                if not terminal_retry:
+                    raise LedgerTransitionError(
+                        f"{envelope.outcome.kind} receipt cannot finish as {status.value}"
+                    )
             if status is ActionStatus.REPAIR_REQUIRED:
                 cursor = await db.execute(
                     "SELECT 1 FROM repair_facts WHERE action_id = ? AND attempt = ?",
@@ -2679,10 +2810,54 @@ class RunLedger:
                         "UPDATE action_attempts SET status = ?, finished_at = ? WHERE action_id = ? AND attempt = ?",
                         (ActionStatus.SUCCEEDED.value, now, commit.action_id, commit.attempt),
                     )
+                    replaced_paths: set[str] = set()
                     for artifact in commit.artifacts:
+                        cursor = await db.execute(
+                            "SELECT replaces_artifact_id, replaces_checksum FROM promotion_intents "
+                            "WHERE action_id = ? AND attempt = ? AND canonical_relpath = ? "
+                            "AND status = 'COMMITTED'",
+                            (commit.action_id, commit.attempt, artifact.relpath),
+                        )
+                        intent = await cursor.fetchone()
+                        if intent is None:
+                            raise LedgerTransitionError(
+                                "success artifact lacks its committed promotion intent"
+                            )
+                        replaces_artifact_id = intent["replaces_artifact_id"]
+                        if replaces_artifact_id is None:
+                            cursor = await db.execute(
+                                "SELECT artifact_id FROM artifacts WHERE canonical_relpath = ? "
+                                "AND is_current = 1",
+                                (artifact.relpath,),
+                            )
+                            if await cursor.fetchone() is not None:
+                                raise LedgerTransitionError(
+                                    "ordinary success cannot replace a current canonical artifact"
+                                )
+                        else:
+                            cursor = await db.execute(
+                                "SELECT * FROM artifacts WHERE artifact_id = ?",
+                                (replaces_artifact_id,),
+                            )
+                            predecessor = await cursor.fetchone()
+                            if (
+                                predecessor is None
+                                or predecessor["canonical_relpath"] != artifact.relpath
+                                or predecessor["sha256"] != intent["replaces_checksum"]
+                            ):
+                                raise LedgerTransitionError(
+                                    "replacement promotion is not bound to its predecessor artifact"
+                                )
+                            await db.execute(
+                                "UPDATE artifacts SET is_current = 0, superseded_at = COALESCE(superseded_at, ?) "
+                                "WHERE artifact_id = ?",
+                                (now, replaces_artifact_id),
+                            )
+                            replaced_paths.add(artifact.relpath)
                         await db.execute(
                             "INSERT INTO artifacts (artifact_id, action_id, attempt, canonical_relpath, sha256, "
-                            "media_type, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            "media_type, committed_at, is_current, superseded_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL)",
                             (
                                 artifact.artifact_id,
                                 commit.action_id,
@@ -2692,6 +2867,14 @@ class RunLedger:
                                 artifact.media_type,
                                 now,
                             ),
+                        )
+                    if replaced_paths:
+                        await self._invalidate_dependent_artifacts_tx(
+                            db,
+                            run_id=action["run_id"],
+                            changed_paths=replaced_paths,
+                            replacement_action_id=commit.action_id,
+                            now=now,
                         )
                     for evidence in commit.gate_evidence:
                         await db.execute(
@@ -2719,6 +2902,33 @@ class RunLedger:
                             now,
                         ),
                     )
+                    cursor = await db.execute(
+                        "SELECT b.incident_id, i.status, i.repair_class "
+                        "FROM semantic_repair_bindings b "
+                        "JOIN incidents i ON i.incident_id = b.incident_id "
+                        "WHERE b.replacement_action_id = ?",
+                        (commit.action_id,),
+                    )
+                    repair_bindings = await cursor.fetchall()
+                    for binding in repair_bindings:
+                        if (
+                            binding["status"] != "OPEN"
+                            or binding["repair_class"] != "semantic"
+                        ):
+                            raise LedgerTransitionError(
+                                "bound semantic repair incident is no longer open; "
+                                "reconcile its durable lineage before committing"
+                            )
+                        await db.execute(
+                            "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
+                            "WHERE incident_id = ?",
+                            (now, binding["incident_id"]),
+                        )
+                        await db.execute(
+                            "UPDATE semantic_repair_bindings SET resolved_at = ? "
+                            "WHERE incident_id = ?",
+                            (now, binding["incident_id"]),
+                        )
                     await self._insert_outbox(
                         db,
                         run_id=action["run_id"],
@@ -2782,6 +2992,54 @@ class RunLedger:
                 "and create a repair action"
             )
         return await self._committed_action(self._db, commit.action_id)
+
+    async def _invalidate_dependent_artifacts_tx(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        run_id: str,
+        changed_paths: set[str],
+        replacement_action_id: str,
+        now: str,
+    ) -> None:
+        """Recursively mark downstream evidence stale after a canonical replacement."""
+        frontier = set(changed_paths)
+        invalidated_actions: set[str] = {replacement_action_id}
+        while frontier:
+            cursor = await db.execute(
+                "SELECT * FROM actions WHERE run_id = ? AND status = ?",
+                (run_id, ActionStatus.SUCCEEDED.value),
+            )
+            candidates = await cursor.fetchall()
+            newly_changed: set[str] = set()
+            for candidate in candidates:
+                action_id = str(candidate["action_id"])
+                if action_id in invalidated_actions:
+                    continue
+                read_set = tuple(json.loads(candidate["read_set_json"]))
+                if not any(
+                    _artifact_paths_overlap(read_path, changed_path)
+                    for read_path in read_set
+                    for changed_path in frontier
+                ):
+                    continue
+                cursor = await db.execute(
+                    "SELECT canonical_relpath FROM artifacts "
+                    "WHERE action_id = ? AND is_current = 1",
+                    (action_id,),
+                )
+                current = await cursor.fetchall()
+                if not current:
+                    invalidated_actions.add(action_id)
+                    continue
+                newly_changed.update(str(row["canonical_relpath"]) for row in current)
+                await db.execute(
+                    "UPDATE artifacts SET is_current = 0, superseded_at = COALESCE(superseded_at, ?) "
+                    "WHERE action_id = ? AND is_current = 1",
+                    (now, action_id),
+                )
+                invalidated_actions.add(action_id)
+            frontier = newly_changed
 
     async def verify_committed_bundle(
         self, action_id: str, attempt: int
@@ -3119,7 +3377,7 @@ class RunLedger:
         return await self.get_run(run_id)
 
     async def unblock_run(self, run_id: str, request: UnblockRequest) -> UnblockResult:
-        """Apply one evidence-bound budget resume or immutable integrity replacement."""
+        """Apply one evidence-bound budget resume or immutable blocked-Action replacement."""
         request_json = canonical_model_json(request)
         request_digest = sha256_canonical_json(request_json)
         resolution_id = f"unblock:{run_id}:{request_digest[:20]}"
@@ -3192,25 +3450,88 @@ class RunLedger:
                     "inspect the next safe recovery instruction"
                 )
             if request.source_action_id is None:
-                raise LedgerTransitionError(
-                    "integrity unblock requires a source Action and explicit operator evidence"
+                if request.canonical_resolutions:
+                    raise LedgerTransitionError(
+                        "controller unblock cannot resolve canonical artifact conflicts"
+                    )
+                cursor = await db.execute(
+                    "SELECT * FROM incidents WHERE run_id = ? AND status = 'OPEN' "
+                    "AND action_id IS NULL AND repair_class IS NULL ORDER BY incident_id",
+                    (run_id,),
                 )
+                controller_incidents = list(await cursor.fetchall())
+                recoverable_codes = {
+                    "planner_rejection_limit_exhausted",
+                    "controller_max_cycles_exhausted",
+                }
+                if not controller_incidents or any(
+                    incident["error_code"] not in recoverable_codes
+                    for incident in controller_incidents
+                ):
+                    raise LedgerTransitionError(
+                        "blocked run has no evidence-resolved controller incident; provide a "
+                        "source Action for integrity or operational recovery"
+                    )
+                await db.execute(
+                    "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
+                    "WHERE run_id = ? AND status = 'OPEN' AND action_id IS NULL "
+                    "AND repair_class IS NULL",
+                    (now, run_id),
+                )
+                await db.execute(
+                    "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    (RunStatus.RUNNING.value, now, run_id),
+                )
+                await db.execute(
+                    "INSERT INTO unblock_resolutions (resolution_id, run_id, source_action_id, "
+                    "request_digest, request_json, plan_version, replacement_action_id, "
+                    "staging_relpath, resolved_at) VALUES (?, ?, NULL, ?, ?, NULL, NULL, NULL, ?)",
+                    (resolution_id, run_id, request_digest, request_json, now),
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=run_id,
+                    event_name="run.unblocked",
+                    aggregate_id=run_id,
+                    payload_json=json.dumps(
+                        {
+                            "reason": request.reason,
+                            "recovery_class": "controller",
+                            "resolved_error_codes": sorted(
+                                incident["error_code"] for incident in controller_incidents
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    idempotency_key=resolution_id,
+                    now=now,
+                )
+                return UnblockResult(run_id=run_id, status=RunStatus.RUNNING)
             action = await self._require_action(db, request.source_action_id)
             if action["run_id"] != run_id:
                 raise LedgerTransitionError(
                     "unblock source Action belongs to another run; inspect the blocked run"
                 )
             action_status = _action_status(action["status"], "actions.status")
-            if (
+            integrity_recovery = (
                 action_status
-                not in {ActionStatus.REPAIR_REQUIRED, ActionStatus.INDETERMINATE}
-                or action["repair_class"] != "integrity"
-                or action["repair_source"] != "integrity_guard"
-                or not action["reason_code"]
-            ):
+                in {ActionStatus.REPAIR_REQUIRED, ActionStatus.INDETERMINATE}
+                and action["repair_class"] == "integrity"
+                and action["repair_source"] == "integrity_guard"
+                and bool(action["reason_code"])
+            )
+            operational_recovery = action_status is ActionStatus.PERMANENT_FAILED
+            evaluation_recovery = (
+                action_status is ActionStatus.REPAIR_REQUIRED
+                and action["repair_class"] == "semantic"
+                and str(action["capability"]).startswith("review.")
+                and bool(action["reason_code"])
+            )
+            if not integrity_recovery and not operational_recovery and not evaluation_recovery:
                 raise LedgerTransitionError(
-                    "blocked Action lacks a stable integrity_guard repair fact; preserve evidence "
-                    "and repair the classification instead of unblocking"
+                    "blocked Action is neither a stable integrity_guard fact, terminal "
+                    "operational failure, nor a semantic review verdict invalidated by an "
+                    "evaluator repair"
                 )
             cursor = await db.execute(
                 "SELECT * FROM action_attempts WHERE action_id = ? AND status = ? "
@@ -3218,9 +3539,13 @@ class RunLedger:
                 (request.source_action_id, action_status.value),
             )
             attempt = await cursor.fetchone()
-            if (
-                attempt is None
-                or attempt["repair_class"] != "integrity"
+            if attempt is None:
+                raise LedgerTransitionError(
+                    "blocked Action has no matching terminal attempt; repair the ledger before "
+                    "unblocking"
+                )
+            if integrity_recovery and (
+                attempt["repair_class"] != "integrity"
                 or attempt["repair_source"] != "integrity_guard"
                 or attempt["reason_code"] != action["reason_code"]
             ):
@@ -3228,18 +3553,111 @@ class RunLedger:
                     "blocked attempt does not match the Action integrity fact; repair the ledger "
                     "before unblocking"
                 )
-            cursor = await db.execute(
-                "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? AND status = 'OPEN' "
-                "AND repair_class = 'integrity' AND repair_source = 'integrity_guard'",
-                (run_id, request.source_action_id),
-            )
-            incidents = list(await cursor.fetchall())
-            if not incidents or any(
-                incident["reason_code"] != action["reason_code"] for incident in incidents
-            ):
-                raise LedgerTransitionError(
-                    "integrity unblock needs an open incident with the same stable reason code"
+            if evaluation_recovery:
+                cursor = await db.execute(
+                    "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? "
+                    "AND status = 'OPEN' AND repair_class = 'semantic'",
+                    (run_id, request.source_action_id),
                 )
+                incidents = list(await cursor.fetchall())
+                if not incidents or any(
+                    incident["reason_code"] != action["reason_code"]
+                    for incident in incidents
+                ):
+                    raise LedgerTransitionError(
+                        "evaluation recovery needs an open semantic incident matching the "
+                        "review Action verdict"
+                    )
+                await db.execute(
+                    "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
+                    "WHERE run_id = ? AND action_id = ? AND status = 'OPEN' "
+                    "AND repair_class = 'semantic'",
+                    (now, run_id, request.source_action_id),
+                )
+                await db.execute(
+                    "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
+                    "WHERE run_id = ? AND status = 'OPEN' AND action_id IS NULL "
+                    "AND repair_class IS NULL AND error_code IN "
+                    "('planner_rejection_limit_exhausted', 'controller_max_cycles_exhausted')",
+                    (now, run_id),
+                )
+                await db.execute(
+                    "UPDATE runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    (RunStatus.RUNNING.value, now, run_id),
+                )
+                await db.execute(
+                    "INSERT INTO unblock_resolutions (resolution_id, run_id, source_action_id, "
+                    "request_digest, request_json, plan_version, replacement_action_id, "
+                    "staging_relpath, resolved_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?)",
+                    (
+                        resolution_id,
+                        run_id,
+                        request.source_action_id,
+                        request_digest,
+                        request_json,
+                        now,
+                    ),
+                )
+                await self._insert_outbox(
+                    db,
+                    run_id=run_id,
+                    event_name="run.unblocked",
+                    aggregate_id=run_id,
+                    payload_json=json.dumps(
+                        {
+                            "reason": request.reason,
+                            "recovery_class": "evaluation",
+                            "source_action_id": request.source_action_id,
+                            "invalidated_reason_code": action["reason_code"],
+                            "evidence_refs": request.evidence_refs,
+                        },
+                        sort_keys=True,
+                    ),
+                    idempotency_key=resolution_id,
+                    now=now,
+                )
+                return UnblockResult(run_id=run_id, status=RunStatus.RUNNING)
+            if integrity_recovery:
+                cursor = await db.execute(
+                    "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? AND status = 'OPEN' "
+                    "AND repair_class = 'integrity' AND repair_source = 'integrity_guard'",
+                    (run_id, request.source_action_id),
+                )
+                incidents = list(await cursor.fetchall())
+                if not incidents or any(
+                    incident["reason_code"] != action["reason_code"]
+                    for incident in incidents
+                ):
+                    raise LedgerTransitionError(
+                        "integrity unblock needs an open incident with the same stable reason code"
+                    )
+                recovery_class = "integrity"
+            else:
+                receipt = await self._effective_attempt_outcome(
+                    db, request.source_action_id, int(attempt["attempt"])
+                )
+                envelope = ActionOutcomeEnvelope.model_validate_json(
+                    receipt.canonical_outcome_json
+                )
+                if not isinstance(
+                    envelope.outcome, (PermanentFailure, RetryableFailure)
+                ):
+                    raise LedgerTransitionError(
+                        "operational unblock requires a permanent or exhausted-retry receipt"
+                    )
+                cursor = await db.execute(
+                    "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? "
+                    "AND status = 'OPEN'",
+                    (run_id, request.source_action_id),
+                )
+                incidents = list(await cursor.fetchall())
+                if not incidents or any(
+                    incident["repair_class"] is not None for incident in incidents
+                ):
+                    raise LedgerTransitionError(
+                        "operational unblock requires only unclassified open execution incidents"
+                    )
+                recovery_class = "operational"
             cursor = await db.execute(
                 "SELECT canonical_relpath FROM promotion_intents WHERE action_id = ? "
                 "AND attempt = ? AND status = 'CONFLICT' ORDER BY canonical_relpath",
@@ -3256,6 +3674,11 @@ class RunLedger:
             if not conflict_paths and resolution_paths:
                 raise LedgerTransitionError(
                     "side-effect evidence recovery has no canonical conflict to resolve"
+                )
+            if operational_recovery and conflict_paths:
+                raise LedgerTransitionError(
+                    "operational recovery cannot resolve canonical conflicts; use the integrity "
+                    "recovery protocol"
                 )
 
             cursor = await db.execute(
@@ -3274,7 +3697,10 @@ class RunLedger:
             new_manifest = old_manifest.model_copy(update={"action_id": replacement_action_id})
             manifest_json = canonical_manifest_json(new_manifest)
             patch = PlanPatch(
-                objective=f"replace integrity-blocked Action {request.source_action_id}",
+                objective=(
+                    f"replace {recovery_class}-blocked Action "
+                    f"{request.source_action_id}"
+                ),
                 proposed_actions=(
                     ProposedAction(
                         proposal_id=proposal_id,
@@ -3333,8 +3759,20 @@ class RunLedger:
                 ),
             )
             await db.execute(
+                "INSERT INTO semantic_repair_bindings "
+                "(incident_id, replacement_action_id, bound_at, resolved_at) "
+                "SELECT incident_id, ?, ?, NULL FROM semantic_repair_bindings "
+                "WHERE replacement_action_id = ? AND resolved_at IS NULL",
+                (replacement_action_id, now, request.source_action_id),
+            )
+            incident_clause = (
+                "AND repair_class = 'integrity'"
+                if integrity_recovery
+                else "AND repair_class IS NULL"
+            )
+            await db.execute(
                 "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? WHERE run_id = ? "
-                "AND action_id = ? AND status = 'OPEN' AND repair_class = 'integrity'",
+                f"AND action_id = ? AND status = 'OPEN' {incident_clause}",
                 (now, run_id, request.source_action_id),
             )
             await db.execute(
@@ -3365,7 +3803,7 @@ class RunLedger:
                 payload_json=json.dumps(
                     {
                         "reason": request.reason,
-                        "recovery_class": "integrity",
+                        "recovery_class": recovery_class,
                         "source_action_id": request.source_action_id,
                         "replacement_action_id": replacement_action_id,
                         "plan_version": version,
@@ -3518,12 +3956,14 @@ class RunLedger:
         )
         artifacts = await self._fetch_all(
             "SELECT a.* FROM artifacts a JOIN actions ac ON ac.action_id = a.action_id "
-            "WHERE ac.run_id = ? ORDER BY a.artifact_id",
+            "WHERE ac.run_id = ? AND a.is_current = 1 ORDER BY a.artifact_id",
             (run_id,),
         )
         evidence = await self._fetch_all(
             "SELECT ge.* FROM gate_evidence ge JOIN actions ac ON ac.action_id = ge.action_id "
-            "WHERE ac.run_id = ? ORDER BY ge.evidence_id",
+            "WHERE ac.run_id = ? AND EXISTS (SELECT 1 FROM artifacts current "
+            "WHERE current.action_id = ge.action_id AND current.is_current = 1) "
+            "ORDER BY ge.evidence_id",
             (run_id,),
         )
         incidents = await self._fetch_all(
@@ -3547,6 +3987,11 @@ class RunLedger:
         remaining = (
             None if run.budget_usd is None else max(0.0, run.budget_usd - float(spent_row["spent"]))
         )
+        current_paths_by_action: dict[str, set[str]] = {}
+        for artifact in artifacts:
+            current_paths_by_action.setdefault(artifact["action_id"], set()).add(
+                artifact["canonical_relpath"]
+            )
         return RunSnapshot(
             run_id=run_id,
             status=run.status,
@@ -3560,6 +4005,17 @@ class RunLedger:
                     repair_class=row["repair_class"],
                     repair_source=row["repair_source"],
                     reason_code=row["reason_code"],
+                    outputs_current=(
+                        _action_status(row["status"], "actions.status")
+                        is ActionStatus.SUCCEEDED
+                        and {
+                            item.canonical_relpath
+                            for item in ExpectedArtifactManifest.model_validate_json(
+                                row["expected_manifest_json"]
+                            ).entries
+                        }
+                        == current_paths_by_action.get(row["action_id"], set())
+                    ),
                 )
                 for row in actions
             ),
@@ -3760,6 +4216,27 @@ class RunLedger:
             (run_id,),
         )
         return tuple(self._incident_from_row(row) for row in rows)
+
+    async def semantic_repair_attempt_count(self, incident_id: str) -> int:
+        """Count distinct replacement Actions already bound to one semantic incident."""
+        row = await self._fetch_one(
+            "SELECT COUNT(DISTINCT replacement_action_id) AS count "
+            "FROM semantic_repair_bindings WHERE incident_id = ?",
+            (incident_id,),
+        )
+        assert row is not None
+        return int(row["count"])
+
+    async def semantic_repair_incident_ids(self, action_id: str) -> tuple[str, ...]:
+        """Return open semantic incidents durably bound to one replacement Action."""
+        rows = await self._fetch_all(
+            "SELECT b.incident_id FROM semantic_repair_bindings b "
+            "JOIN incidents i ON i.incident_id = b.incident_id "
+            "WHERE b.replacement_action_id = ? AND i.status = 'OPEN' "
+            "ORDER BY b.incident_id",
+            (action_id,),
+        )
+        return tuple(str(row["incident_id"]) for row in rows)
 
     async def budget_spent_usd(self, run_id: str) -> float:
         """Return the ledger-owned committed budget total."""
@@ -4288,6 +4765,8 @@ class RunLedger:
             metadata_json=row["metadata_json"],
             ordinal=row["ordinal"],
             bundle_digest=row["bundle_digest"],
+            replaces_artifact_id=row["replaces_artifact_id"],
+            replaces_checksum=row["replaces_checksum"],
             status=status,
             created_at=_parse_time(row["created_at"]),
             committed_at=None if row["committed_at"] is None else _parse_time(row["committed_at"]),
@@ -4637,6 +5116,17 @@ def _intent_rows_match_payload(
         ):
             return False
     return True
+
+
+def _artifact_paths_overlap(left: str, right: str) -> bool:
+    """Return whether two canonical file/directory resource keys overlap."""
+    left_key = canonical_artifact_key(left).rstrip("/")
+    right_key = canonical_artifact_key(right).rstrip("/")
+    return (
+        left_key == right_key
+        or left_key.startswith(f"{right_key}/")
+        or right_key.startswith(f"{left_key}/")
+    )
 
 
 def _finish_status_for_outcome(outcome: object) -> ActionStatus:
