@@ -34,6 +34,60 @@ class _ChatModel:
         return _StructuredModel()
 
 
+class _JsonTokenRequiredStructuredModel:
+    def with_retry(self, **kwargs: object) -> _JsonTokenRequiredStructuredModel:
+        return self
+
+    async def ainvoke(self, messages: object, config: object) -> _Reply:
+        if not isinstance(messages, list) or not any(
+            isinstance(message, BaseMessage) and "json" in str(message.content).lower()
+            for message in messages
+        ):
+            raise ValueError("provider requires an explicit json output instruction")
+        if not any(
+            isinstance(message, BaseMessage) and '"answer"' in str(message.content)
+            for message in messages
+        ):
+            raise ValueError("provider requires the requested json schema")
+        return _Reply(answer="provider accepted the structured request")
+
+
+class _JsonTokenRequiredChatModel:
+    def with_structured_output(
+        self, schema: object, *, method: str
+    ) -> _JsonTokenRequiredStructuredModel:
+        return _JsonTokenRequiredStructuredModel()
+
+
+@pytest.mark.asyncio
+async def test_structured_router_supplies_provider_owned_json_schema_instruction(
+    tmp_path: Path,
+) -> None:
+    """Catch JSON-mode calls that rely on incidental wording in business prompts."""
+    router = LLMRouter(
+        config=LLMConfig(model="gpt-4o-mini", max_output_tokens=64),
+        api_key="test-key",
+        budget=BudgetGate(None),
+        events=EventLogger(tmp_path / "events.jsonl", "run-1"),
+        metrics=MetricsAggregator(tmp_path / "metrics.json", "run-1", "book-1"),
+        langfuse_handler=None,
+        langfuse_status=LangfuseStatus(False, False, "", reason="test"),
+        sem=asyncio.Semaphore(1),
+    )
+    router._chat = _JsonTokenRequiredChatModel()  # type: ignore[assignment]
+    router._chat_by_model = {router.model: router._chat}
+
+    reply, _ = await router.invoke_structured(
+        _Reply,
+        [HumanMessage(content="choose the next eligible action")],
+        agent_name="orchestration.planner",
+        metadata={"logical_invocation_id": "planner:run-1:plan:1"},
+        max_retries=0,
+    )
+
+    assert reply == _Reply(answer="provider accepted the structured request")
+
+
 @pytest.mark.asyncio
 async def test_identical_legitimate_calls_have_distinct_stable_provider_events(
     tmp_path: Path,

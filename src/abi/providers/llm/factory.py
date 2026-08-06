@@ -35,6 +35,18 @@ from abi.types.run import LLMConfig, RunConfig
 _log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
+_JSON_MODE_SYSTEM_INSTRUCTION = "Return only a valid JSON object matching this JSON schema:"
+
+
+def _json_mode_system_instruction(schema: type[BaseModel]) -> str:
+    schema_json = json.dumps(
+        schema.model_json_schema(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"{_JSON_MODE_SYSTEM_INSTRUCTION}\n{schema_json}"
+
 
 def _build_transient_error_tuple() -> tuple[type[BaseException], ...]:
     """Collect transient OpenAI-SDK error types if the SDK is installed.
@@ -245,14 +257,18 @@ class LLMRouter:
     ) -> tuple[T, LLMResponse]:
         active_model = model_override or self._config.model
         chat = self._chat_for(model_override)
+        effective_messages = [
+            SystemMessage(content=_json_mode_system_instruction(schema)),
+            *messages,
+        ]
         # Pre-flight budget check (cheap estimate based on input length).
-        est_in = self._estimate_tokens(messages)
+        est_in = self._estimate_tokens(effective_messages)
         est_cost = estimate_cost_usd(
             active_model, tokens_in=est_in, tokens_out=self._config.max_output_tokens
         )
         self._budget.admit(est_cost)
 
-        prompt_hash = self._prompt_hash(messages)
+        prompt_hash = self._prompt_hash(effective_messages)
 
         # Use ``with_structured_output`` which selects best strategy for the endpoint.
         # ``method="json_mode"`` works on the broadest set of OpenAI-compatible endpoints.
@@ -271,7 +287,7 @@ class LLMRouter:
             t0 = time.perf_counter()
             try:
                 result = await structured.ainvoke(
-                    messages,
+                    effective_messages,
                     config={
                         "callbacks": callbacks,
                         "metadata": {
