@@ -1,66 +1,71 @@
 # Core Beliefs
 
-> 在做任何设计取舍前，这些信念都成立。它们是**前提**，不是结论。
+> 这些信念是 ABI 做设计取舍时的前提。具体执行协议以
+> [`dynamic-agent-orchestration.md`](./dynamic-agent-orchestration.md) 为准。
 
-## 1. 翻译质量来自上下文，而非模型规模
+## 1. 翻译质量来自全书证据，而非单次模型规模
 
-一个会读完整本书、记住术语、感受作者语气的小模型，胜过一个孤立翻译每段的大模型。
-**所以**：我们把工程力气放在**上下文工程**（pass 1 摘要、滑动窗口、术语锁）上，而不是堆 token 给单次调用。
+模型需要作者语气、体裁、本书研究、试译经验、术语和相邻语境，但不应在每次翻译调用中接收整套
+QA、EPUB 与发布规则。ABI 把长期上下文沉淀为 `metadata/`、`glossary/` 和 `qa/` 下的版本化工件；
+每章翻译只注入原文、5–8 条关键文体规则与命中术语。
 
-## 2. 学术翻译的死敌是"术语漂移"
+## 2. 术语和文体必须成为显式工件
 
-同一个 `embodiment` 在第 2 章是"具身"，在第 7 章变成"实体化"，整本书就毁了。
-**所以**：Pass 1 必须产出**全局术语表**，Pass 2 必须**机械遵循**；并且有自定义 linter 在装配前校验。
+同一术语跨章漂移会破坏整本书。全局研究、本书研究、style profile、style guide 与 terms.csv 都是
+后续 Action 的 committed prerequisites，而不是隐藏在对话历史中的记忆。机械 validator 与独立评审共同
+检查一致性。
 
-## 3. 段落是翻译的原子单位
+## 3. 章节是调度与修复单元，段落是稳定证据单元
 
-不是句子（缺乏上下文），不是章节（粒度太粗、无法增量重跑）。
-**所以**：所有调度、checkpoint、重试、缓存都以段落 ID 为键；段落 ID 必须是输入内容的纯函数。
+章节具备可独立授权的 read/write set，适合翻译、章控、评审和并行调度；段落 ID 仍是原文内容与位置的
+稳定函数，用于采样、定位缺陷和质量证据。不同章节可并行，同章或目录/后代路径冲突必须互斥。
 
-## 4. 智能体的输出 = 智能体的输入
+## 4. 工件是 agent 之间的接口
 
-LLM 唯一能看到的是被注入到上下文里的字符串。任何"应当让模型知道"的信息，必须显式被构造进 prompt 或被注入到可读的工件中。
-**所以**：
-- 没有"隐式约定"。所有翻译约束（术语、风格、长度比）都进 prompt 或进 system message。
-- 没有"内部状态"。Pass 间通过版本化的 JSON / Markdown 工件传递信息，而不是内存中的对象。
+任何“模型应当知道”的信息都必须显式进入 prompt、skill 或可读工件。agent 的消息历史和 LangGraph
+checkpoint 只帮助恢复运行时游标，不能充当业务完成事实。跨 Action 的知识通过强类型、可校验的文件与
+RunLedger provenance 传递。
 
 ## 5. 仓库就是记录系统
 
-模仿 OpenAI Codex 团队的实践：所有设计决策、产品规范、运行结果、术语词典都以**可被智能体直接消费**的形式入库。
-任何存在于 Slack、口头讨论、人类脑中的知识等于不存在。
+设计、产品行为、运行协议、质量标准和执行记录都以可被人和 agent 直接消费的形式入库。口头约定不能
+替代 schema、文档、测试或可执行门禁。
 
-## 6. 渐进式披露 > 大而全
+## 6. 渐进式披露优于大而全
 
-短 `AGENTS.md` + 分文档的 `docs/` 优于一份 5000 行的"规范"。
-原因（来自 Codex 实践）：
-- 上下文是稀缺资源，巨型文件挤掉真正重要的内容
-- "什么都重要"等于"什么都不重要"
-- 庞大文档容易腐烂、难以核验
+`AGENTS.md` 只负责导航；架构、可靠性、质量、安全和产品行为分别进入专门文档。Action harness 同样按
+能力渐进加载 skills 与工具，避免把全项目规则塞进每次调用。
 
-## 7. 不变量优先于流程
+## 7. 不变量优先于固定流程
 
-我们**不**告诉智能体"先做 A 再做 B 再做 C"；我们**告诉**它"这些条件必须为真，违反会失败"。
-**所以**：用 linter、schema 校验、pydantic 边界解析来表达约束；让"如何做"的自由度留给实现。
+ABI 不规定唯一的 happy path。Planner 可以动态选择、重排或重复 eligible Action，但依赖、权限、预算、
+expected manifest、validator 和 completion predicate 都由确定性代码强制。模型不能直接改变 run、Action、
+gate 或成功状态。
 
-## 8. 一切可恢复、可重放
+## 8. 成功必须可证明，未知必须阻断
 
-LLM 调用会失败，pdf 解析会卡，token 会超限。任何 pass 必须能从 checkpoint 续跑，且重跑同一段落产出**字节级相同**的内容（在 temperature=0 时）。
-**所以**：段落 ID 纯函数化、所有中间产物落盘、prompt 模板版本化（写入 manifest）。
+“agent 说完成了”不是成功。每个普通成功都必须有 immutable outcome receipt、exact staged bundle、PASS
+gate、完整 promotion intents、canonical postcheck 与最终 ledger transaction。崩溃恢复无法证明结果时
+fail closed；不得用旧 canonical 文件或推测补写成功。
 
-## 9. 双语对照是默认调试视图
+## 9. 重试、修复和人工恢复是三种不同协议
 
-无论用户最终要不要双语输出，**内部**总是保留 `source_text` 与 `translated_text` 的成对存储。
-原因：双语对照是检查翻译质量、排查问题、做评测最直接的视图。
+瞬时失败只有 frozen retry policy 允许时才能创建同 Action 的下一 attempt；语义缺陷创建新 plan/action/
+staging；integrity 或未知分类进入 `BLOCKED`，只能带明确证据人工恢复。三者都保留旧 receipt 与历史，
+不覆盖失败事实。
 
-## 10. 学术书有它的"硬骨头"，必须显式处理
+## 10. 双语和多审证据必须可追溯
 
-代码块、数学公式、引文、脚注、图标题、参考文献——这些**不应被翻译**或需要**特殊处理**。把它们识别为 IR 中的特定 `kind`，并在翻译阶段路由到不同策略，而不是放任 LLM 自由发挥。
+原文章节始终保存在 `chapters/src/`，译文依次进入 `translated/`、`controlled/`、`final/`。忠实度、
+可读性/意象、术语、独立 agent A/B 与随机抽检报告都绑定具体 committed 工件，便于定位和复核。
 
-## 11. 成本与质量同等重要
+## 11. 成本、可观测性与质量同等重要
 
-每次运行必须有清晰的 token / cost 报告。**所以**：`providers.llm` 强制记账，CLI 默认输出成本汇总；不允许悄悄烧钱的代码路径。
+所有 LLM 调用都必须经过 providers，受 BudgetGate 约束并写入 Langfuse 与本地事件。Langfuse 可以安全
+降级，但本地 durable facts 不能丢；正文是否上传由显式 payload 开关控制。
 
-## 12. 失败要响亮，不要静默
+## 12. 发布是门禁结果，不是模型决定
 
-任何一段 LLM 返回的内容不符合 schema、术语违规、长度比异常——必须**响亮地标记**为 `flagged`，进入待检列表，而不是悄悄合入装配输出。
-理由：学术书每段都重要，宁可"看到红色 100 处"也不要"看不到的 5 处错误"。
+只有最终章节、制作规格、EPUB 构建、publication lint、asset manifest、EPUBCheck、独立评审与随机抽检
+满足 completion predicate，run 才能 `COMPLETED`。release 只是把已通过门禁的 EPUB 复制到版本化位置并
+记录状态，不能绕过质量链。

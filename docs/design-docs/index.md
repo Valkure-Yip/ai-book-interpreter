@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`agentic-pipeline.md`](./agentic-pipeline.md) | **当前总览**：受约束动态 Action loop + prompt/翻译方法论 | core-beliefs, tech-stack |
 | [`langgraph-and-state-machine.md`](./langgraph-and-state-machine.md) | 两层 LangGraph runtime 与 RunLedger/checkpointer 持久化边界 | agentic-pipeline, tech-stack |
-| [`dynamic-agent-orchestration.md`](./dynamic-agent-orchestration.md) | 已落地、待 Task 12 全量验证：Planner + Policy + durable action loop 权威协议 | agentic-pipeline, langgraph-and-state-machine, tech-stack |
+| [`dynamic-agent-orchestration.md`](./dynamic-agent-orchestration.md) | **已实现并验证**：Planner + Policy + durable Action loop 权威协议与验证记录 | agentic-pipeline, langgraph-and-state-machine, tech-stack |
 | [`core-beliefs.md`](./core-beliefs.md) | 项目设计哲学，影响所有取舍 | 无 |
 | [`tech-stack.md`](./tech-stack.md) | 技术选型（LangChain/LangGraph / OpenAI-compatible / Langfuse）与取舍 | core-beliefs |
 | [`data-model.md`](./data-model.md) | Book IR 等数据契约 | 无 |

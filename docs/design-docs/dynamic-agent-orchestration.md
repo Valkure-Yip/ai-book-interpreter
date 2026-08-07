@@ -1,7 +1,8 @@
 # 受约束的动态 Agent 编排
 
-> **状态：Implemented。** 2026-08-06；书面设计于 2026-08-04 经用户确认，Task 12 的全量验证
-> 与完成证据见第 19.1 节。本文中的旧符号只保留在明确标注的旧设计、拒绝方案或迁移边界中。
+> **状态：Implemented and hardened。** 书面设计于 2026-08-04 经用户确认；初始全量验证见 19.1，
+> `short_book` 完整实跑见 19.2，2026-08-07 的 Langfuse/agent harness 加固与长书验证边界见 19.3。
+> 本文中的旧符号只保留在明确标注的旧设计、拒绝方案或迁移边界中。
 >
 > **协议修订：已批准、具有约束力。** 2026-08-05；artifact bundle、attempt-scoped staging、
 > staging-aware validation、multi-intent commit 与 typed probe resolution 是对 Tasks 1/4/7/8/9
@@ -1408,6 +1409,35 @@ dict/Any。
 - **最终自动化：** Python 3.12 执行全量 pytest 为 `760 passed, 55 warnings`；
   `mypy --strict --python-version 3.12 src` 对 98 个 source files 为 0 issues；Ruff 全仓库通过，
   `git diff --check` 通过。warnings 均为既有 datetime/ebooklib 弃用提示。
+
+### 19.3 Agent harness、Langfuse 与长书验证加固（2026-08-07）
+
+- **实现提交：** `7c3a22c220f1fd3e1fd018928889bcd36792f944`（`feat: harden agent
+  orchestration and add Langfuse tracing`）。依赖已升级为 Langfuse v4 范围，当前 lock 为
+  `langfuse==4.14.3`；19.1 中的版本列表是当时 Task 12 验证快照，不代表当前 lock。
+- **Langfuse identity：** 每次 invocation 使用独立 `CallbackHandler`；共享 v4 client 负责 mask 与 flush。
+  `run_id` 作为 session，stable capability/planner 名作为 trace name，action/attempt/chapter 进入 tags 与
+  metadata；嵌套 LangGraph agent 使用 `propagate_attributes`，确保身份落到 trace root。缺凭据、认证失败
+  或不可达时 provider no-op，本地 ledger/events 不受影响。
+- **payload 安全：** `LANGFUSE_FULL_PAYLOAD=0` 递归 mask 字符串正文并保留消息结构、数字、模型、token
+  与时延；设置为 `1` 才上传完整 prompt/completion。本地 `observability.langfuse` 事件记录 enabled、host、
+  full-payload 与降级原因。
+- **agent completion：** agent 在同一 attempt 漏写 expected manifest 真子集时，最多执行一次有界
+  completion turn。该 turn 保留原 task context，并只授权缺失路径；已有 staged 文件继续受 create-only
+  约束。第二次仍不完整才产生 `agent_incomplete_outputs`，再由 frozen retry policy 决定下一 attempt。
+- **章节隔离与 provider 兼容：** `chapter.review` 为每章创建隔离 loop；只并行纯读取工具，mutation、构建
+  与门禁串行，并对兼容端点关闭 parallel tool calls。content-filter 与结构化输出错误采用有界、可分类的
+  provider 处理，不能绕过 Action-level retry。
+- **质量路由：** staged write 对 zh final chapter 规范化与 CJK 相邻的 ASCII 引号，publication lint 再次
+  拒绝残留；独立 agent A 的 FAIL 路由翻译修复，agent B 根据证据区分章节 typography 与 EPUB 制作修复；
+  failure excerpt 保留受影响 `chapters/final/...` 路径。spot-check prompt 要求 summary score 与 sample
+  verdict 一致，确定性 validator 仍重算最终报告。
+- **自动化基线：** Python 测试为 `777 passed`，Ruff 全仓库通过。
+- **长书实跑边界：** 使用 `tests/fixtures/the_communist_manifesto.txt` 的真实 LLM/Langfuse 运行已覆盖
+  ingest、研究、试译、逐章翻译/评审及多 Action 链路，但一次人为终止发生在 attempt 已持久化为
+  `RUNNING`、outcome receipt 尚未落盘之后。恢复扫描只能看到 expected manifest 的真子集，因此按协议
+  产生 `artifact_bundle_conflict` 并 `BLOCKED`。这证明“缺 receipt 且结果不可证明时 fail closed”的恢复
+  边界；它不应被记录为长书 `COMPLETED`，也不授权自动重跑同一 attempt。
 
 ## 20. 实现完成判据
 

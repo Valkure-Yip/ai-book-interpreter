@@ -1,239 +1,131 @@
-# Tech Stack（v0.1 锁定）
+# Tech Stack（当前）
 
-> 本文件记录 v0.1 的技术选型与**取舍理由**。所有跨层影响（依赖、lint 白名单、provider 接口）以本文件为准。
-> 变更选型 = 破坏性变更，需新计划 + 迁移说明。
+> 本文件记录 v0.2 受约束动态编排实现的技术选型。精确版本以 `pyproject.toml` 和 `uv.lock` 为准；
+> 业务协议以 [`dynamic-agent-orchestration.md`](./dynamic-agent-orchestration.md) 为准。
 
 ## 概览
 
-| 关注点 | v0.1 选型 | 备选（未来） |
-|---|---|---|
-| LLM 编排 | **LangChain (LCEL)** | LlamaIndex / DSPy / 裸 SDK |
-| LLM 协议 | **OpenAI-compatible Chat Completions** | Anthropic Messages、Gemini、自研协议 |
-| 观测 / 追踪 | **Langfuse** | OpenTelemetry + Phoenix / LangSmith / 自建 |
-| Prompt 管理 | 仓库内 Jinja2 + Langfuse Prompt Mgmt（可选） | 纯 Langfuse / 纯本地 |
-| 数据模型 | pydantic v2 | dataclasses、attrs |
-| 输入解析 | ebooklib + bs4（EPUB）、内置启发式（TXT） | unstructured.io |
-| 输出装配 | jinja2 + markdown-it-py | pandoc |
-| 测试 | pytest + pytest-asyncio + respx | unittest |
+| 关注点 | 当前选型 | 边界 |
+| --- | --- | --- |
+| 宏观编排 | LangGraph v1 + 定制 controller | LangGraph 保存运行游标；RunLedger 保存业务真相 |
+| Action agent | LangChain v1 `create_agent` | 只在 `providers/agent_runtime` 使用，工具和路径按 Action 授权 |
+| 结构化 LLM | LangChain / `langchain-openai` | Planner 与结构化调用统一经过 `providers.llm.LLMRouter` |
+| LLM 协议 | OpenAI-compatible Chat Completions | `base_url`、key 与 model 可配置 |
+| 业务持久化 | SQLite + `aiosqlite` | `state/run.db`，append-oriented durable facts |
+| 运行时 checkpoint | LangGraph SQLite checkpointer | 宏观与 Action/HITL 使用独立数据库和 ownership marker |
+| 观测 | Langfuse v4 + `events.jsonl` | Langfuse 管模型链路；本地事件是可重建投影 |
+| 数据边界 | Pydantic v2 frozen models | 外部输入、模型输出、文件与 CLI 边界全部解析 |
+| EPUB | ebooklib、lxml、自有 builder、EPUBCheck | 构建、出版 lint、asset manifest 与外部规范门禁 |
+| CLI | Typer + Rich | lifecycle 命令只调用公开的强类型服务接口 |
 
-## 1. 为什么选 LangChain
+## 1. 为什么是定制控制平面 + LangGraph
 
-### 我们要的能力
-1. **prompt 模板**：版本化、可测试、与代码解耦
-2. **结构化输出**：强制 pydantic schema，失败时可重试
-3. **链路组合**：prompt → llm → parser → validator → retry，可读、可测
-4. **回调/钩子**：让 Langfuse 自动接管追踪
-5. **并发原语**：与 `asyncio` 协作良好
+ABI 的业务状态包含 plan、Action、attempt、receipt、gate、promotion intent、incident、预算和人工决定。
+这些事实需要精确的事务、幂等与审计语义，不能由通用 agent 消息历史推断。因此：
 
-### LangChain 的现状评估
-- **LCEL**（`prompt | llm | parser` 风格）是稳定的、文档完备的核心；legacy chains 已被弃用
-- `langchain-openai` 内置 `with_structured_output()`，自动选择 `json_schema` / `function_calling` / `json_mode` 三种策略
-- `Runnable.with_retry()` / `with_fallbacks()` 是组合原语，与"业务级重试（带反馈）"互补
-- Langfuse 通过 `CallbackHandler` 一行接入
+- `providers/orchestration_runtime` 提供与领域无关的 durable tick loop；
+- `orchestrator/controller.py` 负责 snapshot、plan、authorize、dispatch、route、commit；
+- `planning/PolicyEngine` 确定性计算 eligibility 并复核 Planner 的 `PlanPatch`；
+- `project/RunLedger` 是唯一业务真相；
+- LangGraph checkpoint 只恢复 graph cursor，不参与 completion 判定。
 
-### 反对意见与回应
-- "LangChain 抽象过重，黑魔法多" → 我们**只用 LCEL + structured output + retry**，不碰 agents / tools / memory 等高层抽象
-- "锁定到 LangChain 风险" → 抽象在 `providers/llm/` 内部；业务层只见我们的 `invoke_structured(chain, input, schema)`，可在未来替换
-- "性能开销" → 与 LLM 调用 latency（秒级）相比可忽略
+这个组合保留动态规划和断点恢复，同时避免让模型拥有状态写权限。
 
-### 不变量（lint 强制）
-- `langchain*` 包**仅可**在 `src/providers/**` 中 import（D2 白名单扩展）
-- 业务层（survey / translate / assemble）**不得**直接构造 `ChatOpenAI` 或 `PromptTemplate`，必须经 `providers/llm` 工厂
-- 新 lint：`tools/lint/no_direct_chat_model.py`
+## 2. 为什么用 LangChain Action harness
 
-## 2. 为什么用 OpenAI-compatible 统一接入
+开放式工作仍需要 tool-calling loop，例如本书研究、翻译、审校与复盘。ABI 使用 LangChain v1
+`create_agent`，但在 provider 层之外不暴露框架对象：
 
-### 现状
-Chat Completions API 已成事实标准。下列均提供官方或社区维护的兼容端点：
+- ActionRegistry 冻结 skills、tool allowlist、read/write sets 与 expected manifest；
+- filesystem tools 使用 attempt-scoped create-only writer；
+- 读取可并行，写入、构建、门禁和其他副作用串行；
+- provider 不支持并行 tool calls 时显式设置 `parallel_tool_calls=False`；
+- 每章 review 使用隔离的 agent loop，避免跨章消息和 tool history 污染；
+- HITL interrupt 通过 durable public ID 与 append-only continuation 恢复。
 
-| 来源 | base_url 形态 |
-|---|---|
-| OpenAI 官方 | `https://api.openai.com/v1` |
-| DeepSeek | `https://api.deepseek.com/v1` |
-| Together.ai | `https://api.together.xyz/v1` |
-| Moonshot Kimi | `https://api.moonshot.cn/v1` |
-| SiliconFlow | `https://api.siliconflow.cn/v1` |
-| Ollama 本地 | `http://localhost:11434/v1` |
-| vLLM 自建 | `http://<host>:<port>/v1` |
-| LiteLLM 网关 | `http://<host>:4000/v1`（可代理任意非兼容模型） |
+业务模块不得直接 import `langchain*`、`langgraph*` 或 `langfuse*`，该约束由 linter 强制。
 
-### 收益
-- **一份代码，N 个 provider**：切换仅改 `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`
-- **离线可跑**：本地 Ollama / vLLM 完全离线，敏感书籍可用
-- **未来扩展平滑**：Anthropic / Gemini 通过 LiteLLM 代理转换为兼容形式
+## 3. OpenAI-compatible 接入
 
-### 已知不兼容差异（要在 v0.1 处理）
+统一配置为：
 
-不同端点对"结构化输出"的支持差异最大：
-
-| 策略 | OpenAI | DeepSeek | Ollama | 其他兼容 |
-|---|---|---|---|---|
-| `response_format=json_schema` | ✅ | 部分支持 | ❌ | 不一定 |
-| Function calling / tool use | ✅ | ✅ | 部分 | 多数 |
-| JSON mode（自由 JSON） | ✅ | ✅ | ✅ | 多数 |
-| 纯 prompt + 后处理 | ✅ | ✅ | ✅ | ✅ |
-
-`providers/llm/structured.py` 实现**自动降级**：
-```
-json_schema → tool_calling → json_mode → prompt-only
-```
-启动时对配置的 `(base_url, model)` 探测一次，缓存能力描述符到 `runs/<run-id>/manifest.json`。
-
-### 配置形式
-
-```yaml
-llm:
-  base_url: https://api.openai.com/v1  # 由 LLM_BASE_URL env 覆盖
-  api_key_env: LLM_API_KEY
-  model: gpt-4o-mini
-  temperature: 0.2
-  max_output_tokens: 2048
-  request_timeout_s: 60
-  # 探测得到的能力（启动时自动填）：
-  capabilities:
-    structured_output: json_schema  # | tool_calling | json_mode | prompt_only
-    prompt_caching: false
+```text
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=...
+LLM_MODEL=gpt-4o-mini
+ABI_LLM_THINKING=provider_default
 ```
 
-不使用历史的多 provider 区分（`provider: openai` vs `provider: deepseek`）——v0.1 只有一个"OpenAI 兼容"provider，靠 base_url 区分。
+OpenAI、DeepSeek、兼容网关、本地 Ollama/vLLM 可通过同一边界接入。兼容并不意味着行为完全一致；
+tool choice、thinking mode、content filter、structured output 和并行 tool-call history 都可能不同。
+兼容处理集中在 providers：
 
-## 3. 为什么选 Langfuse
+- 结构化输出在 Pydantic 边界解析，非法响应不会进入业务层；
+- provider 瞬时错误使用调用层的有界退避；
+- content-filter 类错误只在可判定为瞬时/可改写时进入有界重试；
+- Action-level retry 仍由冻结的 policy 决定，不能被 SDK retry 替代。
 
-### 我们要的能力
-1. 每次 LLM 调用的完整 trace（inputs / outputs / model / tokens / latency / cost）
-2. 按业务实体（book / chapter / paragraph）聚合检索
-3. Prompt 版本管理（可选）
-4. Dataset + 评测回归（v0.2 用）
-5. 开源、可自托管，不锁定云端
+## 4. Langfuse v4 观测
 
-### 与 LangChain 的集成
+`providers/observability/langfuse_client.py` 创建共享 Langfuse client；每次 LangChain invocation 创建独立
+`CallbackHandler`，防止并行 Action 共享 handler 状态。`propagate_attributes` 把以下身份传播到 trace root：
 
-```python
-from langfuse.callback import CallbackHandler
+- `run_id` → session；
+- 稳定的 planner/Action trace name；
+- capability、action ID、attempt、book 与 chapter metadata/tags。
 
-handler = CallbackHandler(
-    public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
-    secret_key=os.environ["LANGFUSE_SECRET_KEY"],
-    host=os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-)
+payload 由单一开关控制：
 
-# 在 chain.invoke 时：
-result = chain.invoke(
-    input_data,
-    config={
-        "callbacks": [handler],
-        "metadata": {
-            "book_id": book_id,
-            "run_id": run_id,
-            "paragraph_id": paragraph_id,
-            "pass": "translate",
-            "prompt_version": "paragraph-translator@v1",
-        },
-        "tags": ["pass-2", "translate"],
-    },
-)
-```
+| `LANGFUSE_FULL_PAYLOAD` | 行为 |
+| --- | --- |
+| `1` | 上传完整 prompt、messages 与 completion，适合受控调试环境 |
+| `0`（默认） | 递归 mask 字符串正文，保留 role/type、token、模型、时延和结构 metadata |
 
-### Trace 结构
+缺少凭据、认证失败或服务不可达时，Langfuse provider 安全降级；业务 run、RunLedger 和本地
+`events.jsonl` 不依赖远端观测成功。进程结束前调用共享 client 的 `flush()`，降低短任务 trace 丢失风险。
 
-```
-trace (root)         id = run_id
-├── span "pass-1"
-│   ├── span "chapter-summarizer:ch-01"
-│   │   └── generation (LLM call)
-│   └── ...
-├── span "pass-2"
-│   └── span "paragraph:ab12...-00047"
-│       ├── generation (initial translate)
-│       └── generation (revision, if any)
-└── span "pass-3"
-```
+## 5. 持久化分层
 
-### 数据安全权衡（关键决策）
+| 文件 | 内容 | 是否可判定业务成功 |
+| --- | --- | --- |
+| `state/run.db` | run、plan、Action、attempt、receipt、gate、intent、incident、budget、HITL | 是，唯一权威 |
+| `state/graph_checkpoints.sqlite` | 宏观 LangGraph cursor | 否 |
+| `state/action_checkpoints.sqlite` | Action agent messages、tool cursor、interrupt | 否 |
+| `state/staging/...` | 当前 attempt 的候选输出 | 否，必须通过完整 commit 协议 |
+| canonical 文件 | 已提升工件 | 只有与 ledger checksum/receipt 绑定后才算 committed |
+| `events.jsonl` / `metrics.json` | 可观测投影 | 否，可从 durable facts 重建 |
 
-由 `observability.langfuse.upload_full_payload` / `LANGFUSE_FULL_PAYLOAD` 单一开关切换：
+SQLite schema 使用显式版本与 ownership marker；零 run、多 run、foreign checkpoint、identity drift 或
+checksum 冲突都 fail closed。
 
-| 取值 | 行为 | 适用场景 |
-|---|---|---|
-| `true` / `1` | 上传完整 prompt、completion、messages | 开发期 prompt 调试；个人书库；自托管 Langfuse |
-| `false` / `0` | 用 Langfuse `mask` 钩子把字符串内容替换为 `[REDACTED]`，保留消息结构与 token / latency / model 等 metadata | 处理版权书籍；合规环境 |
+## 6. 主要依赖范围
 
-实现：
-- `providers/observability/langfuse_client.py` 先构造 Langfuse v4 client，并根据开关按需把 `_redacting_mask` 作为 `mask=` 注入 client；每次 LangChain invocation 再创建独立 `CallbackHandler`，避免并行 Action 共享 handler 状态。
-- 每个 agent Action / structured planner call 是一个稳定命名的 trace；`run_id` 写入 `langfuse_session_id`，把同一本书的所有 traces 聚合为一个 session。动态的 action ID、attempt 和 capability 只进入 metadata/tags，不进入 trace 名称。
-- 嵌套 LangGraph agent 除 LangChain metadata 外还使用 Langfuse v4 `propagate_attributes`，确保 session、trace name 与 tags 落到 trace root，而不是只停留在子 observation metadata。
-- mask 函数递归遍历输入：`str → [REDACTED]`、`list/dict → 递归`、`role`/`type` 等结构 key 保留、原始数字/布尔保留。
-- 段落 ID / 章节 ID / book_id 是 hash，本身无内容信息，由本地 `events.jsonl` 承担——不依赖 Langfuse 是否上传全文。
-- CLI 启动横幅 + run 结尾摘要均显式打印 `payload=full|redacted`，避免"以为开了其实没开"。
-- run 结束通过共享 client 调用 `flush()`，阻塞等待所有 Action / planner traces 上传，避免短任务退出导致 trace 丢失。
-
-### 降级行为
-
-- 缺 Langfuse 凭据 → handler 为 no-op，本地 `events.jsonl` / `metrics.json` 仍正常工作；CLI 显示 `disabled (missing env: ...)`。
-- 凭据无效（`auth_check` 失败）→ 同上，`disabled (auth_check failed)`。
-- Langfuse 不可达 → 异步上传失败静默重试；本地事件流为真相源。
-
-## 4. 两套观测的分工
-
-| 关注点 | Langfuse | 本地 `events.jsonl` |
-|---|---|---|
-| LLM 调用层（prompt/response/token/cost） | ✅ 主 | 摘要 |
-| 业务事件（paragraph.translated、glossary.updated、checkpoint.saved） | ❌ | ✅ 主 |
-| 跨 run 检索 | ✅ | grep |
-| 离线分析 | 导出 | ✅ |
-| CI / 自动化消费 | API 不便 | ✅ 主 |
-| 人工排查体验 | ✅ UI | text |
-
-两者**不重复**，互为补充。
-
-## 5. 关键依赖版本（pin）
+当前 `pyproject.toml` 的关键范围：
 
 ```toml
-# pyproject.toml 摘录
-[project]
-requires-python = ">=3.11"
-dependencies = [
-  "pydantic>=2.7,<3",
-  "langchain>=0.3,<0.4",
-  "langchain-openai>=0.2,<0.3",
-  "langfuse>=4.14.1,<5",
-  "typer>=0.12,<1",
-  "rich>=13,<14",
-  "ebooklib>=0.18,<0.19",
-  "beautifulsoup4>=4.12,<5",
-  "markdown-it-py>=3,<4",
-  "jinja2>=3.1,<4",
-  "chardet>=5,<6",
-  "httpx>=0.27,<0.28",
-  "aiolimiter>=1.1,<2",
-]
-[dependency-groups]
-dev = [
-  "pytest>=8",
-  "pytest-asyncio>=0.23",
-  "respx>=0.21",
-  "ruff>=0.6",
-  "mypy>=1.11",
-]
+aiosqlite = ">=0.20,<1"
+pydantic = ">=2.7,<3"
+langchain = ">=1.3.14,<2"
+langchain-openai = ">=1.3.5,<2"
+langchain-core = ">=1.3,<2"
+langgraph = ">=1.2.9,<2"
+langgraph-checkpoint-sqlite = ">=3.1,<4"
+langfuse = ">=4.14.1,<5"
 ```
 
-LangChain 在 0.3 之后 LCEL API 稳定；pin 到 0.3.x 兼容范围。
+不要从本文复制精确锁定版本；使用 `uv sync` 与已提交的 `uv.lock` 复现开发环境。
 
-## 6. 变更管理
+## 7. 被拒绝的替代方案
 
-修改本文件 = 修改技术契约：
-1. 必须先在 `docs/exec-plans/active/` 新增一份"切换计划"
-2. 必须更新所有受影响的 lint 白名单
-3. 必须为旧实现保留 ≥ 1 个 minor 版本的兼容路径
-4. 必须在 CHANGELOG 顶部用 "BREAKING" 标记
+- **固定阶段链：** 易预测，但无法根据缺陷做精确修复，也把恢复粒度放得过大。
+- **通用 agent TodoList 直接做业务计划：** 无法表达 ABI 的 evidence、manifest、gate、write-set 与事务。
+- **checkpoint 作为业务数据库：** provider schema 与消息历史不能证明工件提交。
+- **业务层直接调用 SDK：** 会绕开预算、追踪、错误分类与 provider 兼容边界。
+- **第一版引入外部 durable engine：** ABI 当前是单进程、本地文件密集型 CLI；复杂度收益不足。
 
-## 7. 与已有设计文档的关系
+## 8. 相关文档
 
-| 已有文档 | 本文件如何影响它 |
-|---|---|
-| `agentic-pipeline.md` §1 providers | `LLMClient` = `langchain.BaseChatModel`；`ChatResponse` = LangChain 的 `AIMessage` + 解析后的 pydantic 实例 |
-| `RELIABILITY.md` §2 重试 | tenacity 替换为 `Runnable.with_retry`；业务语义重试（带错误反馈）走阶段 runner 的校验回灌 |
-| `RELIABILITY.md` §7 可观测性 | events.jsonl 仍主导业务事件；LLM 链路改由 Langfuse 提供 |
-| `agentic-pipeline.md` §3 Prompt 设计 | 本地 Jinja2 仍是真相源；Langfuse Prompt Mgmt 是可选镜像（同步推送） |
-| `SECURITY.md` §1 API key | 新增"Langfuse keys 也走 env，绝不入仓" |
-| `product-specs/cli-and-config.md` | provider 列表收敛为"OpenAI-compatible"；增加 `LLM_BASE_URL` 环境变量与 `--base-url` flag |
+- [LangGraph 与 ABI 动态状态机](./langgraph-and-state-machine.md)
+- [ABI Agentic Pipeline](./agentic-pipeline.md)
+- [可靠性协议](../RELIABILITY.md)
+- [安全边界](../SECURITY.md)

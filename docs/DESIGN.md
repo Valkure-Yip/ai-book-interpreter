@@ -182,7 +182,7 @@ CI 中跑 `tools/codegen/dump_*.py`，diff 非空即失败。
 
 所有自定义 lint / 异常类，message 必须包含 "如何修复" 的提示。
 反例：`"invalid paragraph id"`。
-正例：`"invalid paragraph_id 'xyz' for paragraph at position 47. paragraph_id must be sha1(normalize(text))[:10]+'-'+f'{position:06d}'. Re-run pass 0 to regenerate, or call ir.recompute_ids()."`
+正例：`"invalid paragraph_id 'xyz' at position 47. Re-run source.split from the original committed source; do not edit chapters/src or ledger rows by hand."`
 
 ## 与 OpenAI 工程规范的对应
 

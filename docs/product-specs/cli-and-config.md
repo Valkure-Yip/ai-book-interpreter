@@ -6,7 +6,7 @@
 abi make-book SOURCE [options]
 abi resume PROJECT_ROOT [options]
 abi inspect PROJECT_ROOT
-abi approve PROJECT_ROOT --interrupt ID --decision approve|reject [--feedback TEXT]
+abi approve PROJECT_ROOT INTERRUPT_ID --decision approve|reject [--feedback TEXT]
 abi unblock PROJECT_ROOT --reason TEXT --evidence-ref REF ... [recovery options]
 abi cancel PROJECT_ROOT
 ```
@@ -33,7 +33,7 @@ abi make-book SOURCE \
   [--base-url URL] [--model MODEL] [--max-cost-usd N] [--config FILE]
 ```
 
-输入仅支持实现声明的 txt/epub path 或 URL。`private_use` 写入 private books root。命令创建书籍工程、
+输入仅支持实现声明的 txt/epub path 或 URL。`private_use` 写入 `{books_root}/private/`。命令创建书籍工程、
 `state/run.db`、attempt staging 和 checkpoint 父目录；同一工程只拥有一个 business run。
 
 ## 3. HITL approve
@@ -66,7 +66,7 @@ Action ID 与 staging。budget-only unblock 只需 reason/evidence，不带 sour
 ```text
 abi eval trace PROJECT_ROOT
 abi eval book PROJECT_ROOT [--source-lang en] [--target-lang zh-Hans]
-abi eval calibrate DATASET
+abi eval calibrate --dataset DATASET [--min-samples N]
 ```
 
 `trace` 从 RunLedger typed reads 重放 L1 gate/policy conformance；`book` 汇总 L1/L2/L3。eval 不读取
@@ -82,20 +82,23 @@ llm:
   api_key_env: LLM_API_KEY
   model: gpt-4o-mini
   temperature: 0.2
-  request_timeout_s: 60
+  request_timeout_s: 240
 
-observability:
-  langfuse:
-    enabled: true
-    upload_full_payload: false
+langfuse:
+  enabled: true
+  host: https://cloud.langfuse.com
+  public_key_env: LANGFUSE_PUBLIC_KEY
+  secret_key_env: LANGFUSE_SECRET_KEY
+  upload_full_payload: false
 
 cost:
   hard_cap_usd: 50
   warn_at_usd: 10
 ```
 
-API keys 只从环境变量读取，不写入工程、events、checkpoint 或 report。`--max-cost-usd` 只覆盖本次运行
-预算；hard cap 产生 durable budget pause，可提高额度后显式恢复。
+CLI 会加载当前目录和仓库根的 `.env`，且不会覆盖已经存在的进程环境变量。API keys 只从环境变量读取，
+不写入工程、events、checkpoint 或 report。`--max-cost-usd` 只覆盖本次运行预算；hard cap 产生 durable
+budget pause，可提高额度后显式恢复。
 
 ## 7. 退出与安全停止
 

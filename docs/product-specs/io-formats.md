@@ -1,105 +1,114 @@
 # I/O Formats
 
-## 输入格式
+## 1. 输入
 
-### v0.1 支持
-
-| 格式 | 扩展名 | 备注 |
+| 格式 | 来源 | 当前行为 |
 | --- | --- | --- |
-| 纯文本 | `.txt` | UTF-8；其他编码自动检测（chardet） |
-| EPUB | `.epub` | EPUB 2 / EPUB 3 |
-| PDF | `.pdf` | 文本型 PDF；扫描版需 `--ocr` |
+| TXT | 本地 path 或 HTTP(S) URL | 保存原始 bytes，检测编码，规范化为 UTF-8，再确定性拆章 |
+| EPUB 2/3 | 本地 path 或 HTTP(S) URL | 从受控副本解析 spine/内容，保存 source manifest 与目录，再确定性拆章 |
 
-### v0.2+ 路线
+PDF、DOCX、LaTeX、MOBI/AZW3 当前不在 CLI 支持范围。输入不匹配 `.txt` / `.epub` 或无法安全解析时
+fail closed，不通过扩展名猜测其他格式。
 
-- `.docx`（学术草稿常见）
-- `.tex`（LaTeX 源文件，理想情况——结构最规范）
-- `.html` / 网址（在线书籍）
-- `.mobi` / `.azw3`（先转 EPUB）
-
-### 输入元数据
-
-CLI 可显式提供（覆盖自动检测）：
 ```bash
-abi translate book.pdf \
-  --title "The Structure of Scientific Revolutions" \
-  --authors "Thomas S. Kuhn" \
-  --source-lang en \
-  --target zh
+abi make-book SOURCE \
+  --source-target en-zh-Hans \
+  [--title SLUG] \
+  [--mode public_domain|licensed|private_use]
 ```
 
-## 输出格式
+`--source-target` 是语言对模板；当前默认 `en-zh-Hans`。版权模式决定所需的 evidence 与输出位置，
+不改变质量门禁。
 
-### v0.1：Markdown only
+## 2. 书籍工程布局
 
-四种 mode：
+每次 `make-book` 创建一个工程和唯一 durable run：
 
-| mode | 文件名 | 内容 |
-| --- | --- | --- |
-| `translated` | `translated.md` | 仅目标语言 |
-| `bilingual` | `bilingual.md` | 源/译段落对照 |
-| `annotated` | `annotated.md` | 译文 + 章节摘要 + 思维导图 + 术语表 |
-| `survey-only` | `survey.md` | 仅 Pass 1 产物（不翻译） |
-
-可通过 `--mode translated,bilingual,annotated` 一次性产出多种。
-
-每次运行还会产出：
-- `report.md`：质量与成本报告
-- `glossary.json` / `glossary.md`：术语表（机器+人类版本）
-- `mindmap.mmd`：Mermaid 思维导图源码
-
-### v0.2+ 路线
-
-- EPUB 输出（带 nav.xhtml，可直接读）
-- DOCX 输出（带样式）
-- PDF 输出（通过 typst 或 pandoc + LaTeX）
-- HTML 单文件（嵌入 mermaid 渲染）
-- 思维导图独立图像（PNG/SVG，通过 mermaid CLI）
-
-### 输出目录布局
-
-用户指定 `-o ./out`：
-```
-./out/
-├── translated.md
-├── bilingual.md
-├── annotated.md
-├── report.md
-├── glossary.md
-├── glossary.json
-├── mindmap.mmd
-└── survey/
-    ├── overview.md
-    ├── style-guide.md
-    └── chapters/...
+```text
+books/{target}/{NNNN}_{slug}/
+├── source/
+│   ├── source_text_raw.txt
+│   ├── source_text.txt
+│   ├── source_manifest.json
+│   └── toc.json
+├── metadata/
+├── glossary/
+├── chapters/
+│   ├── src/
+│   ├── translated/
+│   ├── controlled/
+│   └── final/
+├── qa/
+├── reviews/
+├── preproduction/
+├── output/
+│   ├── book.epub
+│   ├── publication_lint.json
+│   ├── asset_manifest_check.json
+│   ├── epubcheck.json
+│   ├── final_manifest.md
+│   └── release/
+├── retrospective/
+├── state/
+│   ├── run.db
+│   ├── graph_checkpoints.sqlite
+│   ├── action_checkpoints.sqlite
+│   └── staging/{action_id}/{attempt}/
+├── events.jsonl
+└── metrics.json
 ```
 
-如果用户指定 `-o book.zh.md`（单文件），则**只产出**该文件（隐含 `--mode translated`，其他工件在 `runs/<book-id>/<run-id>/` 中保留）。
+并非所有文件在 scaffold 时就存在。只有 committed prerequisite 满足后，PolicyEngine 才会授权产生后继
+工件的 Action。
 
-## 编码与规范化
+## 3. 章节文件
 
-- 全部输出 UTF-8，无 BOM，LF 换行
-- 中文标点：默认全角；用户可 `--punctuation=half|full|preserve`
-- 数字：默认保留原文形式；用户可 `--number-style`
+章节文件统一为 UTF-8、LF 换行的 Markdown：
 
-## Markdown 方言
+- `chapters/src/{chapter}.md`：受控原文；
+- `chapters/translated/{chapter}.md`：初译，不被后继覆盖；
+- `chapters/controlled/{chapter}.md`：零问题章控后的修订；
+- `chapters/final/{chapter}.md`：忠实度、可读性/意象、术语和章节 gate 通过后的版本。
 
-默认 **CommonMark + 部分 GFM 扩展**：
-- 表格、删除线、任务列表、围栏代码块
-- 脚注：`[^id]` 语法
-- 数学：`$...$` 与 `$$...$$`（KaTeX 兼容）
-- mermaid：在围栏 ```mermaid 中嵌入
+`chapter` stem 只能使用小写命名空间：`[a-z0-9_.-]+`。同一 stem 贯穿全部目录和 QA 报告，以便
+PolicyEngine 精确授权、Scheduler 检测冲突、repair 路由定位受影响章节。
 
-可通过 `--md-flavor=commonmark|gfm|pandoc` 切换。
+## 4. 最终输出
 
-## 大型书籍切分
+当前用户产物是 EPUB，而不是旧的单文件 Markdown mode：
 
-`--split-by-chapter` 时，输出按章节切分多个 .md 文件：
+| 路径 | 含义 |
+| --- | --- |
+| `output/book.epub` | 通过构建、publication lint、asset manifest 与 EPUBCheck 的 canonical EPUB |
+| `output/release/book_{version}.epub` | 通过最终评审与抽检后的版本化发布副本 |
+| `output/release/release_state.json` | latest version、status 与 release metadata |
+| `output/final_manifest.md` | 最终 committed 工件清单 |
+
+私人自用模式的受限产物进入 gitignored 的 `output/private_artifacts/`；系统不会把版权模式当作绕过质量
+或安全门禁的理由。
+
+## 5. 质量证据
+
+主要证据路径：
+
+```text
+qa/chapter_controls/{chapter}.control.md
+qa/fidelity/{chapter}.md
+qa/readability/{chapter}.md
+qa/imagery/{chapter}.imagery.md
+qa/terminology/{chapter}.md
+qa/gates/{chapter}.gate.md
+reviews/agent_a/review.md
+reviews/agent_b/review.md
+reviews/random_spotcheck/round_NNN/
 ```
-./out/translated/
-├── 00-front-matter.md
-├── 01-chapter-1.md
-├── 02-chapter-2.md
-└── ...
-```
-配合 `index.md` 汇总目录。
+
+这些文件必须与对应 Action、attempt、manifest digest、checksum 和 gate receipt 绑定；单纯存在于文件系统
+不能证明质量通过。
+
+## 6. 编码与安全
+
+- 文本 canonical 输出为 UTF-8、无 BOM、LF 换行；
+- 文件名和 artifact path 必须是相对路径，禁止 `..`、绝对路径、NUL 和 symlink traversal；
+- 中文最终章节在 staged-write 边界规范化与 CJK 相邻的 ASCII 引号，publication lint 再次拒绝残留；
+- EPUB 内部路径、媒体类型、导航、资源清单和 ZIP 结构由确定性 validator 检查。

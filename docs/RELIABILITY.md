@@ -35,10 +35,16 @@ receipt 都 fail closed；不得隐式创建第二个 run 或复活旧 attempt�
 checksum、目录安全或后验 drift 会把 intent 变为不可逆 `CONFLICT` 并阻断，而不是猜测成功。
 
 Agent 报告完成但只写出 expected manifest 的真子集时，executor 在原 Action/attempt 和同一 create-only
-writer 内最多启动一次有界的 manifest-completion loop。该 loop 只获得缺失路径清单，已有 staged 输出
-保持不可改写；补齐后仍按完整 exact-manifest 走 validator。若补齐后仍缺失，才生成
+writer 内最多启动一次有界的 manifest-completion loop。该 loop 保留原 Action task context，并追加只允许
+写缺失路径的明确指令与缺失清单；已有 staged 输出保持不可改写。补齐后仍按完整 exact-manifest 走
+validator。若补齐后仍缺失，才生成
 `agent_incomplete_outputs`，交给 frozen Action retry policy 创建新 attempt。这样偶发漏写不会让已完成的
 多章节工作整批重跑，同时也不会用 canonical 旧文件伪造本次 review evidence。
+
+如果进程已经在 attempt 持久化为 `RUNNING` 后退出，但尚未写 outcome receipt，则不能事后把上述
+completion loop 当作通用恢复器。Reconciler 只按 frozen manifest 精确扫描 staging：只有完整 bundle 可
+重建 receipt；真子集或无法证明的结果必须产生 integrity incident 并 `BLOCKED`。这是当前单进程模型下
+故意保留的 fail-closed 边界。
 
 ## 3. 结果分类与恢复矩阵
 
