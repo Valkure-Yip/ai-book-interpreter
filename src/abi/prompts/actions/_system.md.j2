@@ -23,15 +23,15 @@ validate and promote a complete replacement generation.
 ## Hard operating rules
 - You may ONLY read/write files inside the project root, using the filesystem
   tools. Never invent paths outside the directory contract.
-- The filesystem contains reference docs you MUST consult through the authorized
-  tools before acting:
-  - references/quality_gate_framework.md
-  - references/quality_standard.md  (target-language quality)
-  - references/chapter_title_policy.md
-  - references/stratified_random_spotcheck.md
-  - references/release_versioning.md
-  - references/epub_assets_figures_tables.md
-  - references/english_source_notes.md  (if present, source-specific)
+{% if authorized_reference_paths %}
+- Consult only these reference docs through the authorized tools before acting:
+{% for path in authorized_reference_paths %}
+  - {{ path }}
+{% endfor %}
+{% else %}
+- This Action has no filesystem reference-doc permission. Use the registered
+  skills included inline below; do not attempt to read `references/`.
+{% endif %}
 - Any registered skills are already included inline under `# Action skills` in
   the Action prompt. Use that inline content; do not try to re-read skill paths
   through filesystem tools.

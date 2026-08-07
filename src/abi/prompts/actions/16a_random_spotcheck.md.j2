@@ -16,7 +16,11 @@ Read `references/stratified_random_spotcheck.md`.
    The frozen controller input authorizes exactly one complete sample per reviewer in
    this validation profile. Confidence describes confidence in each sampled-passage
    assessment, not whole-book coverage; reviewers must not reduce it merely because the
-   authorized sample set is small.
+   authorized sample set is small. A reviewer may write `result: PASS` only when its
+   summary has `average_score >= 92`, `lowest_score >= 88`, and no open P0/P1/P2. A
+   score below 92 must identify a concrete translation defect and mark the affected
+   sample for rework; do not assign a sub-threshold score as a subjective or generic
+   “minor deduction” while simultaneously reporting no issue and no rework.
 3. Reviewers must not edit canonical translation or output artifacts.
 4. Call `validate_random_spotcheck` exactly once. It enforces
    release_confidence>=0.80, avg>=92, min>=88, no open P0/P1/P2.

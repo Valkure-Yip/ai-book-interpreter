@@ -34,6 +34,25 @@ class _ChatModel:
         return _StructuredModel()
 
 
+class _ConfigRecordingStructuredModel(_StructuredModel):
+    def __init__(self) -> None:
+        self.config: object | None = None
+
+    async def ainvoke(self, messages: object, config: object) -> _Reply:
+        self.config = config
+        return await super().ainvoke(messages, config)
+
+
+class _ConfigRecordingChatModel:
+    def __init__(self) -> None:
+        self.structured = _ConfigRecordingStructuredModel()
+
+    def with_structured_output(
+        self, schema: object, *, method: str
+    ) -> _ConfigRecordingStructuredModel:
+        return self.structured
+
+
 class _JsonTokenRequiredStructuredModel:
     def with_retry(self, **kwargs: object) -> _JsonTokenRequiredStructuredModel:
         return self
@@ -86,6 +105,37 @@ async def test_structured_router_supplies_provider_owned_json_schema_instruction
     )
 
     assert reply == _Reply(answer="provider accepted the structured request")
+
+
+@pytest.mark.asyncio
+async def test_structured_router_groups_trace_by_run_session(tmp_path: Path) -> None:
+    router = LLMRouter(
+        config=LLMConfig(model="gpt-4o-mini", max_output_tokens=64),
+        api_key="test-key",
+        budget=BudgetGate(None),
+        events=EventLogger(tmp_path / "events.jsonl", "run-1"),
+        metrics=MetricsAggregator(tmp_path / "metrics.json", "run-1", "book-1"),
+        langfuse_handler=None,
+        langfuse_status=LangfuseStatus(False, False, "", reason="test"),
+        sem=asyncio.Semaphore(1),
+    )
+    chat = _ConfigRecordingChatModel()
+    router._chat = chat  # type: ignore[assignment]
+    router._chat_by_model = {router.model: router._chat}
+
+    await router.invoke_structured(
+        _Reply,
+        [HumanMessage(content="choose the next eligible action")],
+        agent_name="orchestration.planner",
+        metadata={"run_id": "run-1", "logical_invocation_id": "planner:run-1:plan:1"},
+        max_retries=0,
+    )
+
+    assert isinstance(chat.structured.config, dict)
+    assert chat.structured.config["run_name"] == "abi.structured-call"
+    metadata = chat.structured.config["metadata"]
+    assert metadata["langfuse_session_id"] == "run-1"
+    assert metadata["langfuse_trace_name"] == "abi.structured-call"
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,7 @@ def build_belt(
     writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
     expected_artifacts: dict[str, ExpectedArtifact] | None = None,
     spotcheck_input: SpotcheckInput | None = None,
+    write_transform: Callable[[str, str], str] | None = None,
 ) -> ToolBelt:
     return ToolBelt(
         fs=make_fs_tools(
@@ -70,6 +71,7 @@ def build_belt(
             permissions=permissions,
             writer=writer,
             expected_artifacts=expected_artifacts,
+            write_transform=write_transform,
         ),
         content=make_content_tools(
             ctx,

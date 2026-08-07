@@ -100,6 +100,19 @@ def test_scheduler_rechecks_current_eligibility() -> None:
     assert tuple(item.action_id for item in batch) == ("eligible",)
 
 
+def test_scheduler_keeps_durable_unblock_replacement_dispatchable() -> None:
+    """A controller-selected recovery must not be stranded after its incident closes."""
+    recovery = _action("recovery", priority=100)
+
+    batch = Scheduler(max_parallel=2).select_batch(
+        (recovery,),
+        eligible_capabilities=frozenset(),
+        recovery_action_ids=frozenset({recovery.action_id}),
+    )
+
+    assert batch == (recovery,)
+
+
 def test_scheduler_blocks_directory_and_descendant_resource_overlap() -> None:
     """Catch a directory lock and its child being treated as independent resources."""
     batch = Scheduler(max_parallel=2).select_batch(

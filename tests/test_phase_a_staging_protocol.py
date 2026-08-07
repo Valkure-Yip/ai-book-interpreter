@@ -198,6 +198,152 @@ async def test_agent_completion_without_required_outputs_is_bounded_retry(
 
 
 @pytest.mark.asyncio
+async def test_agent_completes_missing_manifest_in_same_attempt(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    for skill in (
+        "skills/expert-translation-quality/SKILL.md",
+        "skills/translation-quality-defect-families/SKILL.md",
+    ):
+        path = project.root / skill
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# policy\n", encoding="utf-8")
+
+    requests: list[object] = []
+
+    class PartialThenCompleteAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            write_file = next(
+                tool
+                for tool in request.tools  # type: ignore[attr-defined]
+                if tool.name == "write_file"
+            )
+            if len(requests) == 1:
+                write_file.callable(
+                    path="chapters/controlled/001.md", content="# controlled\n"
+                )
+            else:
+                write_file.callable(
+                    path="qa/chapter_controls/001.control.md",
+                    content="result: PASS\n",
+                )
+            return SimpleNamespace(outcome=AgentCompleted(summary="done"))
+
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(agent=PartialThenCompleteAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+
+    result = await build_action_registry(tool_context=tool_context).get(
+        "chapter.control"
+    ).executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id="control-1",
+            snapshot=snapshot,
+        ),
+        ChapterBatchInput(chapters=("001",)),
+    )
+
+    assert isinstance(result.outcome, Succeeded)
+    assert len(result.outcome.artifact_bundle.entries) == 2
+    assert len(requests) == 2
+    assert requests[1].thread_id.endswith(":manifest-completion")  # type: ignore[attr-defined]
+    assert requests[0].user_prompt in requests[1].user_prompt  # type: ignore[attr-defined]
+    assert "write only every missing output" in requests[1].user_prompt  # type: ignore[attr-defined]
+    assert "qa/chapter_controls/001.control.md" in requests[1].user_prompt  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_chapter_review_uses_one_isolated_agent_loop_per_chapter(
+    tmp_path: Path,
+) -> None:
+    project = BookProject(tmp_path)
+    for skill in (
+        "skills/expert-translation-quality/SKILL.md",
+        "skills/translation-quality-defect-families/SKILL.md",
+    ):
+        path = project.root / skill
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# policy\n", encoding="utf-8")
+
+    requests: list[object] = []
+
+    class WritingAgent:
+        async def run_action(self, request: object) -> object:
+            requests.append(request)
+            thread_id = request.thread_id  # type: ignore[attr-defined]
+            chapter = thread_id.rsplit(":", 1)[1]
+            write_file = next(
+                tool
+                for tool in request.tools  # type: ignore[attr-defined]
+                if tool.name == "write_file"
+            )
+            for relpath in (
+                f"chapters/final/{chapter}.md",
+                f"qa/fidelity/{chapter}.md",
+                f"qa/gates/{chapter}.gate.md",
+                f"qa/imagery/{chapter}.imagery.md",
+                f"qa/readability/{chapter}.md",
+                f"qa/terminology/{chapter}.md",
+            ):
+                content = (
+                    '所谓"现金交易"和\'永恒真理\'。\n'
+                    if relpath.startswith("chapters/final/")
+                    else "result: PASS\n"
+                )
+                write_file.callable(path=relpath, content=content)
+            return SimpleNamespace(outcome=AgentCompleted(summary="chapter reviewed"))
+
+    snapshot = RunSnapshot(run_id="run-1", status=RunStatus.RUNNING)
+    tool_context = ToolContext(
+        project=project,
+        services=SimpleNamespace(agent=WritingAgent()),  # type: ignore[arg-type]
+        run_id="run-1",
+        get_run_snapshot=lambda: snapshot,
+    )
+    result = await build_action_registry(tool_context=tool_context).get(
+        "chapter.review"
+    ).executor(
+        ActionExecutionContext(
+            project=project,
+            run_id="run-1",
+            action_id="review-1",
+            snapshot=snapshot,
+            target_lang="zh-Hans",
+            repair_context=(
+                "translation_quality_failed: replace half-width straight quotes",
+            ),
+        ),
+        ReviewBatchInput(chapters=("001", "002")),
+    )
+
+    assert isinstance(result.outcome, Succeeded)
+    assert len(result.outcome.artifact_bundle.entries) == 12
+    final_entry = next(
+        entry
+        for entry in result.outcome.artifact_bundle.entries
+        if entry.canonical_relpath == "chapters/final/001.md"
+    )
+    final_text = (project.root / final_entry.staged_relpath).read_text(encoding="utf-8")
+    assert final_text == "所谓“现金交易”和‘永恒真理’。\n"
+    assert [request.thread_id for request in requests] == [  # type: ignore[attr-defined]
+        "run-1/review-1/1:001",
+        "run-1/review-1/1:002",
+    ]
+    assert all(
+        "replace half-width straight quotes" in request.system_prompt
+        for request in requests  # type: ignore[attr-defined]
+    )
+
+
+@pytest.mark.asyncio
 async def test_hitl_inspection_rebuilds_completed_bundle_from_exact_staging(
     tmp_path: Path,
 ) -> None:

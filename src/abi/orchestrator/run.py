@@ -206,6 +206,9 @@ class _DefaultHitlContinuation:
             publication_mode=self._run.publication_mode,
             book_slug=self._run.book_slug,
             profile=self._run.profile,
+            repair_context=await self._ledger.semantic_repair_context(
+                request.action_id
+            ),
             runtime_metadata=GateRuntimeMetadata(
                 target_language=self._run.target_lang,
                 publication_mode=self._run.publication_mode,

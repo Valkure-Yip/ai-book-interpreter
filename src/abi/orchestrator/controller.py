@@ -107,12 +107,24 @@ class DynamicController:
         if await self._block_if_semantic_repair_stalled(run_id, snapshot):
             await self._projector.flush(run_id)
             return False
+        actions = await self._ledger.list_actions(run_id)
         candidates = tuple(
-            action
-            for action in await self._ledger.list_actions(run_id)
-            if action.status is ActionStatus.AUTHORIZED
+            action for action in actions if action.status is ActionStatus.AUTHORIZED
         )
-        batch = self._select_batch(candidates, snapshot)
+        actions_by_id = {action.action_id: action for action in actions}
+        recovery_action_ids = frozenset(
+            resolution.replacement_action_id
+            for resolution in await self._ledger.list_unblock_resolutions(run_id)
+            if resolution.replacement_action_id is not None
+            and resolution.source_action_id is not None
+            and (
+                source := actions_by_id.get(resolution.source_action_id)
+            ) is not None
+            and source.repair_class == "integrity"
+        )
+        batch = self._select_batch(
+            candidates, snapshot, recovery_action_ids=recovery_action_ids
+        )
         if not batch:
             if self._complete_when(snapshot):
                 await self._complete(run_id)
@@ -176,7 +188,9 @@ class DynamicController:
             self._invoke_hook("after_authorization", authorized)
             current = (await self._snapshots.build(run_id)).policy_snapshot
             snapshot = current
-            batch = self._select_batch(authorized, current)
+            batch = self._select_batch(
+                authorized, current, recovery_action_ids=recovery_action_ids
+            )
             if not batch:
                 await self._ledger.record_incident(
                     run_id,
@@ -485,7 +499,11 @@ class DynamicController:
         return False
 
     def _select_batch(
-        self, candidates: tuple[ActionRecord, ...], snapshot: RunSnapshot
+        self,
+        candidates: tuple[ActionRecord, ...],
+        snapshot: RunSnapshot,
+        *,
+        recovery_action_ids: frozenset[str] = frozenset(),
     ) -> tuple[ActionRecord, ...]:
         committed = frozenset(
             action.action_id
@@ -497,6 +515,7 @@ class DynamicController:
             candidates,
             committed_action_ids=committed,
             eligible_capabilities=eligible,
+            recovery_action_ids=recovery_action_ids,
         )
 
     async def _complete(self, run_id: str) -> None:

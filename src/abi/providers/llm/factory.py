@@ -28,7 +28,9 @@ from abi.providers.observability.events import EventLogger, MetricsAggregator
 from abi.providers.observability.langfuse_client import (
     LangfuseStatus,
     build_langfuse_handler,
+    callback_handler,
     flush_handler,
+    observation_context,
 )
 from abi.types.run import LLMConfig, RunConfig
 
@@ -280,29 +282,44 @@ class LLMRouter:
             wait_exponential_jitter=True,
             stop_after_attempt=3,
         )
-        # Inject Langfuse callback if available; otherwise empty list.
-        callbacks = [self._langfuse] if self._langfuse is not None else []
+        # Langfuse v4 handlers own invocation-local run maps, so concurrent
+        # structured calls must not share one handler instance.
+        langfuse_callback = callback_handler(self._langfuse)
+        callbacks = [langfuse_callback] if langfuse_callback is not None else []
+        invocation_metadata = {
+            "agent": agent_name,
+            "prompt_version": prompt_version,
+            "prompt_hash": prompt_hash,
+            "attempt": attempt,
+            **(metadata or {}),
+        }
+        run_id = invocation_metadata.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            invocation_metadata["langfuse_session_id"] = run_id
+        invocation_metadata["langfuse_trace_name"] = "abi.structured-call"
+        invocation_metadata["langfuse_tags"] = ["abi", "structured-call", agent_name]
 
-        async with self._sem:
-            t0 = time.perf_counter()
-            try:
-                result = await structured.ainvoke(
-                    effective_messages,
-                    config={
-                        "callbacks": callbacks,
-                        "metadata": {
-                            "agent": agent_name,
-                            "prompt_version": prompt_version,
-                            "prompt_hash": prompt_hash,
-                            "attempt": attempt,
-                            **(metadata or {}),
+        with observation_context(
+            self._langfuse,
+            session_id=run_id if isinstance(run_id, str) and run_id else None,
+            trace_name="abi.structured-call",
+            tags=["abi", "structured-call", agent_name],
+            metadata={"agent": agent_name, "prompt_version": prompt_version},
+        ):
+            async with self._sem:
+                t0 = time.perf_counter()
+                try:
+                    result = await structured.ainvoke(
+                        effective_messages,
+                        config={
+                            "callbacks": callbacks,
+                            "metadata": invocation_metadata,
+                            "tags": ["abi", "structured-call", agent_name],
+                            "run_name": "abi.structured-call",
                         },
-                        "tags": [agent_name],
-                        "run_name": agent_name,
-                    },
-                )
-            finally:
-                latency_ms = int((time.perf_counter() - t0) * 1000)
+                    )
+                finally:
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
 
         if not isinstance(result, schema):
             # with_structured_output may already validate; in case it returns dict, parse.

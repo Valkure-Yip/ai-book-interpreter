@@ -1,7 +1,9 @@
-"""Langfuse callback handler factory.
+"""Langfuse v4 client and per-invocation callback factory.
 
-Returns a LangChain ``CallbackHandler`` when keys are configured, else ``None``.
-Honors the ``upload_full_payload`` flag via Langfuse's ``mask`` hook.
+Returns a shared client wrapper when keys are configured, else ``None``. The
+wrapper creates a fresh LangChain ``CallbackHandler`` for every invocation so
+parallel Actions never share callback-local run state. Payload masking lives
+on the shared v4 client.
 
 See SECURITY.md and design-docs/tech-stack.md §3 for the payload policy.
 """
@@ -10,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,7 +24,7 @@ _log = logging.getLogger(__name__)
 _REDACTED = "[REDACTED: enable LANGFUSE_FULL_PAYLOAD=1 to view content in Langfuse]"
 
 
-def _redacting_mask(data: Any) -> Any:
+def _redacting_mask(data: Any, **kwargs: dict[str, Any]) -> Any:
     """Langfuse ``mask`` callable: replace any structured payload with a sentinel.
 
     Langfuse calls this on every input/output before persisting. We replace
@@ -52,8 +56,26 @@ class LangfuseStatus:
     reason: str = ""
 
 
-def build_langfuse_handler(config: LangfuseConfig) -> tuple[Any | None, LangfuseStatus]:
-    """Return ``(handler, status)``. Handler is ``None`` when disabled.
+@dataclass(frozen=True, slots=True)
+class LangfuseObserver:
+    """One run-scoped v4 client with invocation-scoped LangChain callbacks."""
+
+    client: Any
+    public_key: str
+
+    def callback_handler(self) -> Any:
+        from langfuse.langchain import CallbackHandler
+
+        return CallbackHandler(public_key=self.public_key)
+
+    def flush(self) -> None:
+        self.client.flush()
+
+
+def build_langfuse_handler(
+    config: LangfuseConfig,
+) -> tuple[LangfuseObserver | None, LangfuseStatus]:
+    """Return ``(observer, status)``. Observer is ``None`` when disabled.
 
     Failures are logged and swallowed — observability must never break the run.
     """
@@ -70,48 +92,85 @@ def build_langfuse_handler(config: LangfuseConfig) -> tuple[Any | None, Langfuse
 
     try:
         from langfuse import Langfuse
-        from langfuse.callback import CallbackHandler
     except Exception as exc:  # pragma: no cover
         return None, LangfuseStatus(False, False, config.host, reason=f"import failed: {exc}")
 
     # auth_check — give the user a fast, friendly error if creds are bad.
     try:
-        probe = Langfuse(public_key=public_key, secret_key=secret_key, host=config.host)
-        if not probe.auth_check():
+        client = Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=config.host,
+            mask=None if config.upload_full_payload else _redacting_mask,
+            environment=os.environ.get("ABI_ENVIRONMENT", "development"),
+        )
+        if not client.auth_check():
             return None, LangfuseStatus(
                 False, False, config.host, reason="auth_check failed (invalid keys?)"
             )
     except Exception as exc:  # pragma: no cover
         _log.warning("langfuse auth_check raised: %s", exc)
-        # Continue anyway — auth_check failure shouldn't necessarily break tracing.
-
-    mask = None if config.upload_full_payload else _redacting_mask
-    try:
-        handler = CallbackHandler(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=config.host,
-            mask=mask,
+        return None, LangfuseStatus(
+            False,
+            False,
+            config.host,
+            reason=f"auth_check raised: {type(exc).__name__}",
         )
+
+    try:
+        observer = LangfuseObserver(client=client, public_key=public_key)
+        observer.callback_handler()
     except Exception as exc:  # pragma: no cover
         return None, LangfuseStatus(False, False, config.host, reason=f"init failed: {exc}")
 
-    return handler, LangfuseStatus(
+    return observer, LangfuseStatus(
         enabled=True,
         full_payload=config.upload_full_payload,
         host=config.host,
     )
 
 
-def flush_handler(handler: Any | None) -> None:
+def callback_handler(observer: LangfuseObserver | None) -> Any | None:
+    """Return a fresh callback for one invocation, or ``None`` when disabled."""
+    if observer is None:
+        return None
+    try:
+        return observer.callback_handler()
+    except Exception as exc:  # pragma: no cover
+        _log.debug("langfuse callback creation ignored: %s", exc)
+        return None
+
+
+@contextmanager
+def observation_context(
+    observer: LangfuseObserver | None,
+    *,
+    session_id: str | None,
+    trace_name: str,
+    tags: list[str],
+    metadata: dict[str, Any],
+) -> Iterator[None]:
+    """Propagate trace attributes through nested LangGraph/LangChain runs."""
+    if observer is None:
+        yield
+        return
+    from langfuse import propagate_attributes
+
+    with propagate_attributes(
+        session_id=session_id,
+        trace_name=trace_name,
+        tags=tags,
+        metadata=metadata,
+    ):
+        yield
+
+
+def flush_handler(observer: LangfuseObserver | None) -> None:
     """Block until pending traces are sent. Safe to call with ``None``."""
-    if handler is None:
+    if observer is None:
         return
     try:
-        # Langfuse's CallbackHandler exposes the underlying client at ``langfuse``.
-        client = getattr(handler, "langfuse", None) or getattr(handler, "client", None)
-        if client is not None and hasattr(client, "flush"):
-            client.flush()
+        observer.flush()
     except Exception as exc:  # pragma: no cover
         _log.debug("langfuse flush ignored: %s", exc)
 
@@ -132,7 +191,13 @@ def get_langfuse_client(config: LangfuseConfig) -> Any | None:
         return None
     try:
         from langfuse import Langfuse
-        return Langfuse(public_key=public_key, secret_key=secret_key, host=config.host)
+
+        return Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=config.host,
+            mask=None if config.upload_full_payload else _redacting_mask,
+        )
     except Exception as exc:  # pragma: no cover
         _log.warning("langfuse client init failed: %s", exc)
         return None

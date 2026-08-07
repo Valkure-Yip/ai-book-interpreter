@@ -10,6 +10,8 @@ from abi.providers.observability.langfuse_client import (
     _REDACTED,
     _redacting_mask,
     build_langfuse_handler,
+    callback_handler,
+    flush_handler,
 )
 from abi.types.run import LangfuseConfig
 
@@ -65,3 +67,28 @@ class TestBuildLangfuseHandler:
         assert handler is None
         assert status.enabled is False
         assert "missing env" in status.reason
+
+
+class _FakeObserver:
+    def __init__(self) -> None:
+        self.callbacks = 0
+        self.flushes = 0
+
+    def callback_handler(self) -> object:
+        self.callbacks += 1
+        return object()
+
+    def flush(self) -> None:
+        self.flushes += 1
+
+
+def test_callbacks_are_invocation_scoped_and_flush_is_run_scoped() -> None:
+    observer = _FakeObserver()
+
+    first = callback_handler(observer)  # type: ignore[arg-type]
+    second = callback_handler(observer)  # type: ignore[arg-type]
+    flush_handler(observer)  # type: ignore[arg-type]
+
+    assert first is not second
+    assert observer.callbacks == 2
+    assert observer.flushes == 1

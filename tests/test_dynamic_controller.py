@@ -26,7 +26,7 @@ from abi.actions.predicates import PredicateCatalog
 from abi.actions.registry import ActionRegistry
 from abi.orchestrator.committer import Committer
 from abi.orchestrator.controller import DynamicController
-from abi.orchestrator.dispatcher import Dispatcher
+from abi.orchestrator.dispatcher import Dispatcher, _action_timeout_s
 from abi.orchestrator.projector import OutboxProjector
 from abi.orchestrator.reconcile import Reconciler
 from abi.planning.context import SnapshotBuilder
@@ -254,6 +254,34 @@ def _expand_probe(
     capability: str, action_id: str, parameters: FrozenModel
 ) -> ExpectedArtifactManifest:
     return ExpectedArtifactManifest(action_id=action_id, entries=())
+
+
+def test_action_timeout_scales_by_frozen_manifest_work_units() -> None:
+    one = ExpectedArtifactManifest(
+        action_id="a1",
+        entries=(
+            ExpectedArtifact(
+                canonical_relpath="output/one.txt",
+                media_type="text/plain",
+                evidence_role="fixture",
+            ),
+        ),
+    )
+    twelve = ExpectedArtifactManifest(
+        action_id="a2",
+        entries=tuple(
+            ExpectedArtifact(
+                canonical_relpath=f"output/{index:02d}.txt",
+                media_type="text/plain",
+                evidence_role="fixture",
+            )
+            for index in range(12)
+        ),
+    )
+
+    assert _action_timeout_s(10.0, one) == 10.0
+    assert _action_timeout_s(10.0, twelve) == 20.0
+    assert _action_timeout_s(10.0, one, resource_class="review") == 40.0
 
 
 def _patch(proposal_id: str, capability: str) -> PlanPatch:

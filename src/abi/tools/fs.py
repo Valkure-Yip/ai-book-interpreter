@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mimetypes
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from pydantic import Field
 
@@ -57,6 +57,7 @@ def make_fs_tools(
     permissions: ActionPathPermissions | None = None,
     writer: AttemptStagingWriter | BufferedAttemptWriter | None = None,
     expected_artifacts: Mapping[str, ExpectedArtifact] | None = None,
+    write_transform: Callable[[str, str], str] | None = None,
 ) -> list[ToolBinding]:
     def require_read(path: str) -> None:
         if permissions is not None and not permissions.can_read(path):
@@ -99,6 +100,8 @@ def make_fs_tools(
             raise PermissionError(
                 "write_file requires an AttemptStagingWriter; dispatch this tool inside an authorized attempt"
             )
+        if write_transform is not None:
+            content = write_transform(path, content)
         expected = None if expected_artifacts is None else expected_artifacts.get(path)
         writer.write_text(
             path,

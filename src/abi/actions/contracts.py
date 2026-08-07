@@ -35,6 +35,7 @@ class ActionExecutionContext:
     publication_mode: str = "public_domain"
     book_slug: str = "book"
     profile: str | None = None
+    repair_context: tuple[str, ...] = ()
     runtime_metadata: GateRuntimeMetadata | None = None
 
     def __post_init__(self) -> None:

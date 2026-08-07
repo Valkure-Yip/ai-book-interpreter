@@ -578,6 +578,49 @@ def test_independent_review_routes_protocol_and_real_quality_failures_separately
         assert "problem details" in result.message
 
 
+def test_independent_review_routes_final_chapter_typography_to_chapter_repair(
+    tmp_path: Path,
+) -> None:
+    project = scaffold_without_ledger(tmp_path)
+    parameters = ReviewBatchInput()
+    action_id = "chapter-typography-review"
+    manifest = expand_expected_artifacts("review.independent", action_id, parameters)
+    store = ArtifactStore(project, None)
+    try:
+        writer = store.writer(action_id, 1)
+        contents = {
+            "reviews/agent_a/review.md": "# Translation\n\nresult: PASS\n",
+            "reviews/agent_b/review.md": (
+                "# EPUB\n\n"
+                + ("context " * 180)
+                + "publication_lint found a stray space between CJK characters "
+                "in chapters/final/001_front_matter.md. "
+                + ("details " * 180)
+                + "\n\nresult: FAIL\n"
+            ),
+            "reviews/revision_route.md": (
+                "affected_files:\n  - chapters/final/001_front_matter.md\n\nresult: FAIL\n"
+            ),
+        }
+        for expected in manifest.entries:
+            writer.write_text(
+                expected.canonical_relpath,
+                contents[expected.canonical_relpath],
+                media_type=expected.media_type,
+                evidence_role=expected.evidence_role,
+                metadata=expected.metadata,
+            )
+        bundle = writer.artifact_bundle()
+        view = StagingEvidenceView.for_bundle(project, (), bundle)
+        result = validate_evidence("review.independent", view, parameters, bundle)
+    finally:
+        store.close()
+
+    assert result.passed is False
+    assert result.reason_code == "chapter_typography_failed"
+    assert "chapters/final/001_front_matter.md" in result.message
+
+
 def test_epub_validator_accepts_existing_gate_report_shape(tmp_path: Path) -> None:
     project = scaffold_without_ledger(tmp_path)
     project.book_epub.parent.mkdir(parents=True, exist_ok=True)

@@ -47,13 +47,13 @@ CLI 启动时根据 `LLM_BASE_URL` 显示一行警示，例如：
 
 行为由 `observability.langfuse.upload_full_payload` / `LANGFUSE_FULL_PAYLOAD` 开关控制：
 - **`true` / `1`**（开发期推荐）：上传完整的 prompt / completion / messages，便于 Langfuse UI 上调试 prompt 与回看上下文。
-- **`false` / `0`**（生产 / 处理敏感书籍时推荐）：通过 Langfuse 的 `mask` 钩子（`providers/observability/langfuse_client.py::_redacting_mask`）把所有字符串内容替换为 `[REDACTED]` 哨兵，仅保留消息的 `role` / `type` 结构与 token usage / 时延 / 模型名等 metadata。
+- **`false` / `0`**（生产 / 处理敏感书籍时推荐）：通过 Langfuse v4 client 的 `mask` 钩子（`providers/observability/langfuse_client.py::_redacting_mask`）把所有字符串内容替换为 `[REDACTED]` 哨兵，仅保留消息的 `role` / `type` 结构与 token usage / 时延 / 模型名等 metadata。
 
 无论开关如何：
 - API key 永不进入 trace（langchain-openai 不会把 key 放到调用参数里）。
 - 自托管 Langfuse 实例同样受此开关控制，保持开发/生产环境行为一致。
 - CLI 启动横幅会显式打印 `payload=full` 或 `payload=redacted`，便于交叉确认。
-- run 结束时调用 `router.flush()` 阻塞等待队列发送，避免短任务导致 trace 丢失。
+- 每次 invocation 使用独立 CallbackHandler；run 结束时由共享 client 调用 `flush()` 阻塞等待队列发送，避免并发串线或短任务导致 trace 丢失。
 
 ## 4. Prompt 注入防御
 

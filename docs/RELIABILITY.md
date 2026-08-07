@@ -34,6 +34,12 @@ receipt 都 fail closed；不得隐式创建第二个 run 或复活旧 attempt�
 文件系统与 SQLite 不跨介质原子。任一步崩溃都由 Reconciler 按 durable intent/checksum 补完；identity、
 checksum、目录安全或后验 drift 会把 intent 变为不可逆 `CONFLICT` 并阻断，而不是猜测成功。
 
+Agent 报告完成但只写出 expected manifest 的真子集时，executor 在原 Action/attempt 和同一 create-only
+writer 内最多启动一次有界的 manifest-completion loop。该 loop 只获得缺失路径清单，已有 staged 输出
+保持不可改写；补齐后仍按完整 exact-manifest 走 validator。若补齐后仍缺失，才生成
+`agent_incomplete_outputs`，交给 frozen Action retry policy 创建新 attempt。这样偶发漏写不会让已完成的
+多章节工作整批重跑，同时也不会用 canonical 旧文件伪造本次 review evidence。
+
 ## 3. 结果分类与恢复矩阵
 
 | Durable facts | 安全恢复 |
@@ -74,17 +80,30 @@ postcheck/commit，不因人工批准而直接成功。
 
 - budget pause，且不携带 replacement/canonical resolution；或
 - integrity block，带 source Action、reason、evidence refs，以及每个 conflict canonical path 的 exact
-  `removed` / `selected:sha256` 处置。
+`removed` / `selected:sha256` 处置。integrity fact 可以来自 controller 的 `integrity_guard`，也可以来自
+Dispatcher 边界已经写入 immutable outcome receipt 的 `action_outcome`；两者都必须由 Action、attempt、
+reason code 与 open incident 精确绑定后才能人工替换。
 
 integrity unblock 保留旧 Action、attempt、receipt、intent 与 conflict，创建 exactly one new plan version、
 new Action ID 和 `state/staging/{new_action}/1`。request canonical JSON/digest 与 replacement identity 写入
-`unblock_resolutions`。semantic repair 禁止借 manual unblock 绕过自动 policy-mapped replan。
+`unblock_resolutions`。该 replacement 是已经人工确认的恢复工作，即使原 incident 的普通 eligibility
+发生漂移也保持可调度；普通 operational replacement 仍必须重新通过当前 eligibility，不能越过 stale
+上游产物。
+
+常规 semantic repair 禁止借 manual unblock 绕过自动 policy-mapped replan。只有 `review.*` 的修复代数
+达到上限并进入 `semantic_repair_stalled` 后，才允许带 source review Action、reason 与修复证据执行一次
+route reset：它只重置“自上次证据修复以来”的 replacement 计数，不关闭真实质量 incident。缺陷消息通过
+`semantic_repair_bindings` 绑定到 replacement Action，并直接进入 Action prompt；不依赖 incident 当时是否
+仍在 snapshot 的 open 集合中。只有成功工件提交才能最终关闭该 semantic incident。
 
 ## 6. 预算、限流与可观测性
 
 预算在 Planner、Action、agent turn 与工具调用前检查；hard cap 产生 `PAUSED_BUDGET`，不取消 durable
 事实。provider 的瞬时网络/429 退避属于调用层；它不能替代 Action-level frozen retry policy。所有 LLM
 调用经 providers 写 trace、token/cost/latency；outbox 事件在业务事务中创建，再幂等投影到本地事件流。
+agent 内部允许并行 `read_file` / `grep`，但所有写入、构建、门禁和其他有副作用的工具调用都串行，
+避免 OpenAI-compatible provider 对大型并行 tool-call 历史产生协议误判，并保持 mutation 顺序可审计；
+Action 之间的并行仍由 Scheduler/Dispatcher 的 read/write set 与并发上限控制。
 
 ## 7. 故障演练要求
 

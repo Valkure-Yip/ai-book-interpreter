@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from abi.prompts.planner import PLANNER_SYSTEM_PROMPT
 from abi.providers.llm.factory import system_message, user_message
-from abi.types.orchestration import PlanningContext, PlanPatch
+from abi.types.orchestration import PlanningContext, PlanPatch, ProposedAction
 
 
 class StructuredPlanRouter(Protocol):
@@ -45,6 +45,7 @@ class Planner:
             agent_name="orchestration.planner",
             prompt_version="dynamic-plan-v1",
             metadata={
+                "run_id": context.policy_snapshot.run_id,
                 "logical_invocation_id": (
                     f"planner:{context.policy_snapshot.run_id}:"
                     f"plan:{context.policy_snapshot.plan_version + 1}"
@@ -53,8 +54,19 @@ class Planner:
             max_retries=2,
         )
         if not 1 <= len(patch.proposed_actions) <= self._horizon:
-            raise ValueError(
-                f"planner returned {len(patch.proposed_actions)} actions; return one to at most "
-                f"{self._horizon} actions"
+            count = len(patch.proposed_actions)
+            return PlanPatch(
+                objective="record an invalid provider planning contract response",
+                proposed_actions=(
+                    ProposedAction(
+                        proposal_id="planner-contract-invalid",
+                        capability="planner.contract.invalid",
+                    ),
+                ),
+                rationale=(
+                    f"The structured provider returned {count} actions outside the bounded "
+                    f"1..{self._horizon} horizon. Persist a policy rejection so the next "
+                    "controller cycle can use its deterministic frontier fallback."
+                ),
             )
         return patch

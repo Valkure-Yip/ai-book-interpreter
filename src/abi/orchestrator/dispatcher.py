@@ -15,6 +15,7 @@ from abi.project.run_ledger import ActionRecord, RunLedger
 from abi.types.orchestration import (
     ActionOutcomeEnvelope,
     AttemptOutcomeReceiptPayload,
+    ExpectedArtifactManifest,
     Indeterminate,
     PermanentFailure,
     ProbeActionInput,
@@ -31,6 +32,21 @@ from abi.types.orchestration import (
 from abi.types.tools import GateRuntimeMetadata
 
 DispatchHook = Callable[[str, object], None]
+
+
+def _action_timeout_s(
+    base_timeout_s: float,
+    manifest: ExpectedArtifactManifest,
+    *,
+    resource_class: str = "default",
+) -> float:
+    """Allocate one bounded deadline slice per six expected artifacts."""
+    # Independent dual review reads the complete source, translation and EPUB
+    # through two isolated reviewers.  Its artifact count is small but its read
+    # workload is book-sized, so reserve four base slices for this resource class.
+    minimum_slices = 4 if resource_class == "review" else 1
+    slices = max(minimum_slices, (len(manifest.entries) + 5) // 6)
+    return base_timeout_s * slices
 
 
 class Dispatcher:
@@ -103,11 +119,18 @@ class Dispatcher:
                 publication_mode=self._runtime_metadata.publication_mode,
                 book_slug=self._book_slug,
                 profile=self._profile,
+                repair_context=await self._ledger.semantic_repair_context(
+                    action.action_id
+                ),
                 runtime_metadata=self._runtime_metadata,
             )
             raw = await asyncio.wait_for(
                 resolved.definition.executor(context, resolved.parameters),
-                timeout=self._timeout_s,
+                timeout=_action_timeout_s(
+                    self._timeout_s,
+                    action.expected_artifact_manifest,
+                    resource_class=resolved.definition.spec.resource_class,
+                ),
             )
             envelope = ActionOutcomeEnvelope.model_validate(raw)
         except TimeoutError:

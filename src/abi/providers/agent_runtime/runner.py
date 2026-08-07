@@ -18,10 +18,14 @@ from typing import Any, Literal, TypeAlias, cast
 from uuid import UUID, uuid4
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.agents.middleware import (
+    HumanInTheLoopMiddleware,
+    ModelResponse,
+    wrap_model_call,
+)
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -34,7 +38,11 @@ from abi.providers.llm.budget import BudgetExceeded, BudgetGate
 from abi.providers.llm.factory import _PERMANENT_LLM_ERRORS, _TRANSIENT_LLM_ERRORS
 from abi.providers.llm.pricing import estimate_cost_usd
 from abi.providers.observability.events import EventLogger, MetricsAggregator
-from abi.providers.observability.langfuse_client import LangfuseStatus
+from abi.providers.observability.langfuse_client import (
+    LangfuseStatus,
+    callback_handler,
+    observation_context,
+)
 from abi.types._base import FrozenModel
 from abi.types.orchestration import (
     ActionOutcome,
@@ -51,6 +59,51 @@ from abi.types.orchestration import (
 )
 from abi.types.run import LLMConfig
 from abi.types.tools import ToolBinding
+
+_READ_ONLY_AGENT_TOOLS = frozenset({"grep", "read_file"})
+
+
+def _limit_tool_call_batch(response: ModelResponse[Any]) -> ModelResponse[Any]:
+    """Allow parallel reads, but serialize every state-changing tool request."""
+    result: list[BaseMessage] = []
+    for message in response.result:
+        if isinstance(message, AIMessage) and len(message.tool_calls) > 1:
+            non_read_calls = [
+                call
+                for call in message.tool_calls
+                if call.get("name") not in _READ_ONLY_AGENT_TOOLS
+            ]
+            if non_read_calls:
+                message = message.model_copy(update={"tool_calls": non_read_calls[:1]})
+        result.append(message)
+    return ModelResponse(result=result, structured_response=response.structured_response)
+
+
+def _response_is_content_filtered(response: ModelResponse[Any]) -> bool:
+    return any(
+        isinstance(message, AIMessage)
+        and message.response_metadata.get("finish_reason") == "content_filter"
+        for message in response.result
+    )
+
+
+async def _invoke_with_content_filter_retries(
+    request: Any, handler: Any
+) -> ModelResponse[Any]:
+    response = await handler(request)
+    for _ in range(2):
+        if not _response_is_content_filtered(response):
+            break
+        response = await handler(request)
+    return response
+
+
+@wrap_model_call(name="abi_serial_mutation_tools")
+async def _serial_mutation_tool_middleware(
+    request: Any, handler: Any
+) -> ModelResponse[Any]:
+    response = await _invoke_with_content_filter_retries(request, handler)
+    return _limit_tool_call_batch(response)
 
 
 class CheckpointResume(FrozenModel):
@@ -1076,6 +1129,10 @@ class AgentRuntime:
                 max_tokens=self._config.max_output_tokens,
                 timeout=self._config.request_timeout_s,
                 max_retries=0,
+                # Keep tool messages strictly one request/response pair at a
+                # time for OpenAI-compatible providers with fragile parallel
+                # tool-call history validation. Actions can still run in parallel.
+                model_kwargs={"parallel_tool_calls": False},
                 **provider_options,
             )
         return self._model
@@ -1180,15 +1237,28 @@ class AgentRuntime:
             invocation_id=invocation_id,
         )
         callbacks: list[BaseCallbackHandler] = [callback]
-        if self._langfuse is not None:
-            callbacks.append(self._langfuse)
+        langfuse_callback = callback_handler(self._langfuse)
+        if langfuse_callback is not None:
+            callbacks.append(langfuse_callback)
+        thread_parts = request.thread_id.split("/", 2)
+        run_id = thread_parts[0]
+        action_id = thread_parts[1] if len(thread_parts) > 1 else ""
+        attempt = thread_parts[2] if len(thread_parts) > 2 else ""
         config: RunnableConfig = {
             "configurable": {"thread_id": request.thread_id},
             "recursion_limit": request.max_iterations * 2 + 6,
             "callbacks": callbacks,
-            "metadata": {"agent": request.agent_name},
-            "tags": [request.agent_name],
-            "run_name": request.agent_name,
+            "metadata": {
+                "agent": request.agent_name,
+                "run_id": run_id,
+                "action_id": action_id,
+                "attempt": attempt,
+                "langfuse_session_id": run_id,
+                "langfuse_trace_name": "abi.agent-action",
+                "langfuse_tags": ["abi", "agent-action", request.agent_name],
+            },
+            "tags": ["abi", "agent-action", request.agent_name],
+            "run_name": "abi.agent-action",
         }
         self._events.event(
             "agent.run.start",
@@ -1294,7 +1364,7 @@ class AgentRuntime:
                                 )
                             ]
                             if hitl_middleware_tools or isinstance(request.resume, HitlResume)
-                            else ()
+                            else [_serial_mutation_tool_middleware]
                         ),
                     )
                     if isinstance(request.resume, HitlResume):
@@ -1311,11 +1381,23 @@ class AgentRuntime:
                         graph_input = None
                     else:
                         graph_input = _hitl_resume_command(request.resume)
-                    async with self._sem:
-                        raw_result = cast(
-                            dict[str, Any],
-                            await agent.ainvoke(graph_input, config=config),
-                        )
+                    with observation_context(
+                        self._langfuse,
+                        session_id=run_id,
+                        trace_name="abi.agent-action",
+                        tags=["abi", "agent-action", request.agent_name],
+                        metadata={
+                            "agent": request.agent_name,
+                            "run_id": run_id,
+                            "action_id": action_id,
+                            "attempt": attempt,
+                        },
+                    ):
+                        async with self._sem:
+                            raw_result = cast(
+                                dict[str, Any],
+                                await agent.ainvoke(graph_input, config=config),
+                            )
                 checkpoint_phase = "saver_exit"
             checkpoint_phase = "graph_result"
             if control_result is not None:

@@ -2903,7 +2903,12 @@ class RunLedger:
                         ),
                     )
                     cursor = await db.execute(
-                        "SELECT b.incident_id, i.status, i.repair_class "
+                        "SELECT b.incident_id, b.bound_at, b.resolved_at AS binding_resolved_at, "
+                        "i.status, i.repair_class, EXISTS("
+                        "SELECT 1 FROM unblock_resolutions u WHERE u.run_id = i.run_id "
+                        "AND u.source_action_id = i.action_id "
+                        "AND u.replacement_action_id IS NULL "
+                        "AND u.resolved_at >= b.bound_at) AS route_reset "
                         "FROM semantic_repair_bindings b "
                         "JOIN incidents i ON i.incident_id = b.incident_id "
                         "WHERE b.replacement_action_id = ?",
@@ -2911,23 +2916,29 @@ class RunLedger:
                     )
                     repair_bindings = await cursor.fetchall()
                     for binding in repair_bindings:
-                        if (
-                            binding["status"] != "OPEN"
-                            or binding["repair_class"] != "semantic"
+                        if binding["repair_class"] != "semantic":
+                            raise LedgerTransitionError(
+                                "bound repair incident changed classification; reconcile its "
+                                "durable lineage before committing"
+                            )
+                        if binding["status"] == "OPEN":
+                            await db.execute(
+                                "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
+                                "WHERE incident_id = ?",
+                                (now, binding["incident_id"]),
+                            )
+                        elif not (
+                            binding["status"] == "RESOLVED"
+                            and bool(binding["route_reset"])
                         ):
                             raise LedgerTransitionError(
-                                "bound semantic repair incident is no longer open; "
-                                "reconcile its durable lineage before committing"
+                                "bound semantic repair incident is no longer open and has no "
+                                "matching evidence-backed route reset"
                             )
                         await db.execute(
-                            "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
-                            "WHERE incident_id = ?",
-                            (now, binding["incident_id"]),
-                        )
-                        await db.execute(
-                            "UPDATE semantic_repair_bindings SET resolved_at = ? "
-                            "WHERE incident_id = ?",
-                            (now, binding["incident_id"]),
+                            "UPDATE semantic_repair_bindings SET resolved_at = COALESCE(resolved_at, ?) "
+                            "WHERE incident_id = ? AND replacement_action_id = ?",
+                            (now, binding["incident_id"], commit.action_id),
                         )
                     await self._insert_outbox(
                         db,
@@ -3517,7 +3528,7 @@ class RunLedger:
                 action_status
                 in {ActionStatus.REPAIR_REQUIRED, ActionStatus.INDETERMINATE}
                 and action["repair_class"] == "integrity"
-                and action["repair_source"] == "integrity_guard"
+                and action["repair_source"] in {"action_outcome", "integrity_guard"}
                 and bool(action["reason_code"])
             )
             operational_recovery = action_status is ActionStatus.PERMANENT_FAILED
@@ -3546,7 +3557,7 @@ class RunLedger:
                 )
             if integrity_recovery and (
                 attempt["repair_class"] != "integrity"
-                or attempt["repair_source"] != "integrity_guard"
+                or attempt["repair_source"] != action["repair_source"]
                 or attempt["reason_code"] != action["reason_code"]
             ):
                 raise LedgerTransitionError(
@@ -3568,12 +3579,10 @@ class RunLedger:
                         "evaluation recovery needs an open semantic incident matching the "
                         "review Action verdict"
                     )
-                await db.execute(
-                    "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
-                    "WHERE run_id = ? AND action_id = ? AND status = 'OPEN' "
-                    "AND repair_class = 'semantic'",
-                    (now, run_id, request.source_action_id),
-                )
+                # This operator decision confirms that the repair route or evaluator
+                # input has changed; it does not erase the underlying quality defect.
+                # Keep the semantic incident open so the next replacement receives its
+                # evidence and may resolve it only by committing successful artifacts.
                 await db.execute(
                     "UPDATE incidents SET status = 'RESOLVED', resolved_at = ? "
                     "WHERE run_id = ? AND status = 'OPEN' AND action_id IS NULL "
@@ -3620,8 +3629,8 @@ class RunLedger:
             if integrity_recovery:
                 cursor = await db.execute(
                     "SELECT * FROM incidents WHERE run_id = ? AND action_id = ? AND status = 'OPEN' "
-                    "AND repair_class = 'integrity' AND repair_source = 'integrity_guard'",
-                    (run_id, request.source_action_id),
+                    "AND repair_class = 'integrity' AND repair_source = ?",
+                    (run_id, request.source_action_id, action["repair_source"]),
                 )
                 incidents = list(await cursor.fetchall())
                 if not incidents or any(
@@ -4218,10 +4227,15 @@ class RunLedger:
         return tuple(self._incident_from_row(row) for row in rows)
 
     async def semantic_repair_attempt_count(self, incident_id: str) -> int:
-        """Count distinct replacement Actions already bound to one semantic incident."""
+        """Count replacements since the latest evidence-backed route reset."""
         row = await self._fetch_one(
-            "SELECT COUNT(DISTINCT replacement_action_id) AS count "
-            "FROM semantic_repair_bindings WHERE incident_id = ?",
+            "SELECT COUNT(DISTINCT b.replacement_action_id) AS count "
+            "FROM semantic_repair_bindings b "
+            "JOIN incidents i ON i.incident_id = b.incident_id "
+            "WHERE b.incident_id = ? AND b.bound_at > COALESCE(("
+            "SELECT MAX(u.resolved_at) FROM unblock_resolutions u "
+            "WHERE u.run_id = i.run_id AND u.source_action_id = i.action_id "
+            "AND u.replacement_action_id IS NULL), '')",
             (incident_id,),
         )
         assert row is not None
@@ -4237,6 +4251,16 @@ class RunLedger:
             (action_id,),
         )
         return tuple(str(row["incident_id"]) for row in rows)
+
+    async def semantic_repair_context(self, action_id: str) -> tuple[str, ...]:
+        """Return immutable defect evidence bound to one replacement Action."""
+        rows = await self._fetch_all(
+            "SELECT i.reason_code, i.message FROM semantic_repair_bindings b "
+            "JOIN incidents i ON i.incident_id = b.incident_id "
+            "WHERE b.replacement_action_id = ? ORDER BY b.incident_id",
+            (action_id,),
+        )
+        return tuple(f'{row["reason_code"]}: {row["message"]}' for row in rows)
 
     async def budget_spent_usd(self, run_id: str) -> float:
         """Return the ledger-owned committed budget total."""

@@ -5,8 +5,33 @@ Authorized chapters (and no others):
 - `{{ chapter }}`
 {% endfor %}
 
-For each authorized chapter, review its committed file under `chapters/controlled/`,
-run the three reviews and the gate, then promote a new immutable revision to final.
+{% if repair_context %}
+This is a repair pass. Treat every defect in the controller-authorized semantic
+repair evidence above as mandatory repair input. Do not copy the controlled chapter
+unchanged: apply the requested text and typography corrections in `chapters/final/`,
+then verify the corrected file when writing the gate evidence. In particular,
+replace half-width straight quotation marks in Chinese prose with context-appropriate
+Chinese quotation marks: replace ASCII U+0022 (`"`) pairs with U+201C/U+201D
+(`“`/`”`) and ASCII U+0027 (`'`) pairs with U+2018/U+2019 (`‘`/`’`). Merely
+claiming the replacement in gate evidence is not sufficient: the staged chapter must
+contain no ASCII quote adjacent to a CJK character. Also remove stray ASCII spaces
+between CJK characters
+without joining separate list items that should instead use Chinese punctuation or
+line breaks. Treat the exact regex `[\u4e00-\u9fff] [\u4e00-\u9fff]` as invalid everywhere,
+including author credits and inline tables of contents: join an author credit directly
+(for example `作者 著` -> `作者著`) and separate distinct list items with `；` or one
+item per line instead of an ASCII space. Re-read the staged final text and verify that
+no such pattern remains before writing `result: PASS`.
+{% endif %}
+
+This is neutral translation-quality review of a public-domain historical text. Evaluate
+the translation faithfully and apply the same literary standards to every source.
+
+Process the authorized chapters one at a time, in the order above. For each chapter,
+read its source and committed file under `chapters/controlled/`, consult the authorized
+glossary and inline quality skills, then immediately write all six required outputs before
+reading the next chapter. Do not search unrelated project paths, pre-read every chapter,
+or narrate a proposed review instead of writing its files.
 
 1. Fidelity review -> `qa/fidelity/<authorized_chapter>.md` (meaning, tone, no add/drop).
 2. Readability + imagery review -> `qa/readability/<authorized_chapter>.md` and
@@ -15,7 +40,9 @@ run the three reviews and the gate, then promote a new immutable revision to fin
 3. Terminology review -> `qa/terminology/<authorized_chapter>.md` (consistency vs
    `glossary/terms.csv`; scan for `forbidden_body_renderings`).
 4. Chapter gate -> `qa/gates/<authorized_chapter>.gate.md` with `result: PASS` only when all
-   reviews pass. On PASS, copy the controlled chapter to `chapters/final/<authorized_chapter>.md`
+   reviews pass. The gate's final non-empty line MUST be exactly the plain line
+   `result: PASS`; write no prose, punctuation, or Markdown after it. On PASS, copy the
+   controlled chapter to `chapters/final/<authorized_chapter>.md`
    (apply the title policy: produce nav_label / page_title / subtitle). `subtitle` is optional:
    populate it only when the source explicitly has a subtitle or a long source title must be
    decomposed. When the source has only a chapter number and simple title, write an empty
@@ -23,4 +50,6 @@ run the three reviews and the gate, then promote a new immutable revision to fin
    AI/translator-authored explanatory subtitle that is not grounded in the source.
 
 Exit condition: all chapters reviewed, gated PASS, and present in chapters/final/.
-Stop for controller validation; do not modify gate or control state.
+Only successful `write_file` calls count as outputs. After the required reads, use
+`write_file` immediately for every review, gate, and final chapter. Stop for controller
+validation only after every required file exists; do not modify gate or control state.

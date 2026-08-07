@@ -9,6 +9,7 @@ import pytest
 
 from abi.actions.builtins.catalog import (
     AgentActionExecutor,
+    _action_iteration_limit,
     _prompt_snapshot,
     build_action_envelope,
     build_action_registry,
@@ -38,6 +39,7 @@ from abi.types.orchestration import (
     ActionStatus,
     ActionView,
     GateDecision,
+    IncidentView,
     RunSnapshot,
     RunStatus,
     Succeeded,
@@ -136,6 +138,35 @@ def test_builtin_registry_suggests_exact_source_chapters_to_planner(tmp_path: Pa
         ),
         ActionArgument(name="samples_per_agent", value_json="1"),
         ActionArgument(name="seed", value_json="42"),
+    )
+
+    repair_snapshot = RunSnapshot(
+        run_id="run-1",
+        status=RunStatus.RUNNING,
+        incidents=(
+            IncidentView(
+                incident_id="typography-1",
+                error_code="chapter_typography_failed",
+                message=(
+                    "publication_lint failed for "
+                    "chapters/final/002_chapter_1_one.md"
+                ),
+                repair_class="semantic",
+                repair_source="validator",
+                reason_code="chapter_typography_failed",
+            ),
+        ),
+    )
+    repair_registry = build_action_registry(
+        tool_context=ToolContext(
+            project=project,
+            services=SimpleNamespace(),  # type: ignore[arg-type]
+            run_id="run-1",
+            get_run_snapshot=lambda: repair_snapshot,
+        )
+    )
+    assert repair_registry.get("chapter.review").fixed_arguments == (
+        ActionArgument(name="chapters", value_json='["002_chapter_1_one"]'),
     )
 
 
@@ -398,6 +429,48 @@ def test_preproduction_repair_prompt_requires_complete_replacement_generation() 
     assert "Do not overwrite earlier canonical files" not in rendered
 
 
+def test_chapter_review_repair_prompt_consumes_controller_evidence() -> None:
+    prompts = ActionPromptRegistry()
+    repair = ActionPromptSnapshot(
+        repair_context=("translation_quality_failed: independent review failed",),
+    )
+
+    rendered = prompts.render(
+        "chapter.review", ReviewBatchInput(chapters=("001",)), repair
+    )
+
+    assert "controller-authorized semantic" in rendered
+    assert "mandatory repair input" in rendered
+    assert "half-width straight" in rendered
+
+
+def test_system_prompt_names_only_authorized_reference_docs() -> None:
+    prompts = ActionPromptRegistry()
+
+    without_references = prompts.system_prompt(
+        "chapter.review", ActionPromptSnapshot()
+    )
+    with_references = prompts.system_prompt(
+        "preproduction.spec",
+        ActionPromptSnapshot(
+            authorized_reference_paths=("references/chapter_title_policy.md",)
+        ),
+    )
+
+    assert "do not attempt to read `references/`" in without_references
+    assert "references/quality_gate_framework.md" not in without_references
+    assert "references/chapter_title_policy.md" in with_references
+    assert "references/release_versioning.md" not in with_references
+
+
+def test_agent_iteration_limit_scales_with_large_manifests() -> None:
+    assert _action_iteration_limit(1) == 40
+    assert _action_iteration_limit(30) == 80
+
+    with pytest.raises(ValueError, match="at least one artifact"):
+        _action_iteration_limit(0)
+
+
 def test_translation_prompt_requires_source_and_five_to_eight_style_rules() -> None:
     prompts = ActionPromptRegistry()
     parameters = ChapterBatchInput(chapters=("001",))
@@ -628,6 +701,9 @@ def test_chapter_postprocessing_prompts_render_authorized_chapter_names(
         assert 'polysemy_translation_stage_review: "PASS"' in rendered
         assert 'polysemy_context_review: "PASS"' in rendered
         assert "Do not append a second expert-skill closure" in rendered
+    else:
+        assert "final non-empty line MUST be exactly" in rendered
+        assert "write no prose, punctuation, or Markdown after it" in rendered
 
 
 @pytest.mark.parametrize(
@@ -647,6 +723,7 @@ def test_gate_field_parser_accepts_common_markdown_wrappers(line: str) -> None:
         ("chapter_gate_not_passed", "chapter.review"),
         ("spotcheck_not_passed", "chapter.review"),
         ("translation_quality_failed", "chapter.review"),
+        ("chapter_typography_failed", "chapter.review"),
         ("epub_quality_failed", "preproduction.spec"),
     ),
 )

@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
 
@@ -373,6 +373,29 @@ _BUILTINS = (
 
 _BY_CAPABILITY = {item.capability: item for item in _BUILTINS}
 
+_CJK_CHAR = r"[\u4e00-\u9fff]"
+
+
+def _normalize_zh_final_text(path: str, content: str) -> str:
+    """Enforce deterministic Chinese quote glyphs at the staged write boundary."""
+    if not path.startswith("chapters/final/") or not path.endswith(".md"):
+        return content
+
+    def replace_pairs(text: str, ascii_mark: str, opening: str, closing: str) -> str:
+        is_open = False
+
+        def replacement(_match: re.Match[str]) -> str:
+            nonlocal is_open
+            result = closing if is_open else opening
+            is_open = not is_open
+            return result
+
+        pattern = rf"(?<={_CJK_CHAR}){re.escape(ascii_mark)}|{re.escape(ascii_mark)}(?={_CJK_CHAR})"
+        return re.sub(pattern, replacement, text)
+
+    content = replace_pairs(content, '"', "“", "”")
+    return replace_pairs(content, "'", "‘", "’")
+
 
 def _action_succeeded(snapshot: object, arguments: tuple[ActionArgument, ...]) -> bool:
     if len(arguments) != 1 or arguments[0].name != "capability":
@@ -453,6 +476,24 @@ def _fixed_arguments_for(
     chapters = tuple(entry.slug for entry in plan_chapters(book))
     if not chapters:
         return ()
+    if capability == "chapter.review":
+        snapshot = tool_context.get_run_snapshot()
+        chapter_repair_evidence = "\n".join(
+            incident.message
+            for incident in snapshot.incidents
+            if incident.reason_code
+            in {"chapter_typography_failed", "translation_quality_failed"}
+        )
+        affected = tuple(
+            chapter
+            for chapter in chapters
+            if (
+                f"chapters/final/{chapter}.md" in chapter_repair_evidence
+                or f"{chapter}.md" in chapter_repair_evidence
+            )
+        )
+        if affected:
+            chapters = affected
     chapter_json = json.dumps(chapters, separators=(",", ":"))
     if capability == "source.split":
         return (
@@ -604,10 +645,24 @@ def _prompt_snapshot(
         "publication_mode": context.publication_mode,
         "book_slug": context.book_slug,
         "profile": context.profile,
-        "repair_context": tuple(
+        "repair_context": context.repair_context
+        or tuple(
             f"{incident.reason_code}: {incident.message}"
             for incident in context.snapshot.incidents
             if incident.repair_class == "semantic"
+        ),
+        "authorized_reference_paths": tuple(
+            relpath
+            for relpath in (
+                "references/quality_gate_framework.md",
+                "references/quality_standard.md",
+                "references/chapter_title_policy.md",
+                "references/stratified_random_spotcheck.md",
+                "references/release_versioning.md",
+                "references/epub_assets_figures_tables.md",
+                "references/english_source_notes.md",
+            )
+            if permissions.can_read(relpath)
         ),
     }
     if capability != "chapter.translate" or not isinstance(parameters, ChapterBatchInput):
@@ -694,6 +749,13 @@ def _skill_context(
     return "\n\n".join(sections)
 
 
+def _action_iteration_limit(manifest_size: int) -> int:
+    """Bound the agent loop while leaving room for read/write turns per artifact."""
+    if manifest_size < 1:
+        raise ValueError("agent Action manifest must contain at least one artifact")
+    return max(40, manifest_size * 2 + 20)
+
+
 class AgentActionExecutor:
     """One implementation path for all agent and composite built-in Actions."""
 
@@ -711,8 +773,70 @@ class AgentActionExecutor:
     async def __call__(
         self, context: ActionExecutionContext, parameters: FrozenModel
     ) -> ActionOutcomeEnvelope:
-        result = await self._execute(context, parameters, resume=None, inspect_only=False)
+        if (
+            self._capability == "chapter.review"
+            and isinstance(parameters, ReviewBatchInput)
+            and len(parameters.chapters) > 1
+        ):
+            return await self._execute_chapter_reviews(context, parameters)
+        result = await self._execute(
+            context, parameters, resume=None, inspect_only=False, thread_scope=None
+        )
         return cast(ActionOutcomeEnvelope, result)
+
+    async def _execute_chapter_reviews(
+        self,
+        context: ActionExecutionContext,
+        parameters: ReviewBatchInput,
+    ) -> ActionOutcomeEnvelope:
+        """Run one bounded agent loop per chapter, then prove the full frozen manifest."""
+        for chapter in parameters.chapters:
+            result = cast(
+                ActionOutcomeEnvelope,
+                await self._execute(
+                    context,
+                    ReviewBatchInput(chapters=(chapter,)),
+                    resume=None,
+                    inspect_only=False,
+                    thread_scope=chapter,
+                ),
+            )
+            if not isinstance(result.outcome, Succeeded):
+                return result
+
+        action_id = context.action_id
+        if action_id is None:
+            parameter_hash = hashlib.sha256(
+                parameters.model_dump_json().encode()
+            ).hexdigest()[:12]
+            action_id = f"{self._capability}:{parameter_hash}"
+        store = ArtifactStore(context.project, None)
+        try:
+            manifest = expand_expected_artifacts(
+                self._capability, action_id, parameters
+            )
+            bundle = store.rebuild_exact_staged_bundle(
+                action_id, context.attempt, manifest
+            )
+        except ArtifactConflictError as exc:
+            return ActionOutcomeEnvelope(
+                action_id=action_id,
+                attempt=context.attempt,
+                outcome=RepairRequired(
+                    repair_class="integrity",
+                    repair_source="action_outcome",
+                    reason_code="artifact_bundle_conflict",
+                    defect_codes=("artifact_bundle_conflict",),
+                    message=str(exc),
+                ),
+            )
+        finally:
+            store.close()
+        return ActionOutcomeEnvelope(
+            action_id=action_id,
+            attempt=context.attempt,
+            outcome=Succeeded(artifact_bundle=bundle, evidence_refs=()),
+        )
 
     async def resume_hitl(
         self,
@@ -725,7 +849,9 @@ class AgentActionExecutor:
 
         if not isinstance(resume, HitlResume):
             raise TypeError("agent Action HITL continuation requires HitlResume")
-        result = await self._execute(context, parameters, resume=resume, inspect_only=False)
+        result = await self._execute(
+            context, parameters, resume=resume, inspect_only=False, thread_scope=None
+        )
         return cast(ActionOutcomeEnvelope, result)
 
     async def inspect_hitl(
@@ -739,7 +865,9 @@ class AgentActionExecutor:
 
         if not isinstance(resume, HitlResume):
             raise TypeError("agent Action HITL inspection requires HitlResume")
-        return await self._execute(context, parameters, resume=resume, inspect_only=True)
+        return await self._execute(
+            context, parameters, resume=resume, inspect_only=True, thread_scope=None
+        )
 
     async def _execute(
         self,
@@ -748,6 +876,7 @@ class AgentActionExecutor:
         *,
         resume: AgentResume | None,
         inspect_only: bool,
+        thread_scope: str | None,
     ) -> object:
         parameter_hash = hashlib.sha256(parameters.model_dump_json().encode()).hexdigest()[:12]
         action_id = context.action_id or f"{self._capability}:{parameter_hash}"
@@ -866,6 +995,12 @@ class AgentActionExecutor:
             writer=writer,
             expected_artifacts={item.canonical_relpath: item for item in manifest.entries},
             spotcheck_input=parameters if isinstance(parameters, SpotcheckInput) else None,
+            write_transform=(
+                _normalize_zh_final_text
+                if self._capability == "chapter.review"
+                and context.target_lang.lower().startswith("zh")
+                else None
+            ),
         )
         try:
             tools = belt.resolve(tuple(tool.name for tool in envelope.tools))
@@ -901,9 +1036,12 @@ class AgentActionExecutor:
                 user_prompt=user_prompt,
                 tools=tools,
                 agent_name=self._capability.replace(".", "_"),
-                thread_id=f"{context.run_id}/{action_id}/{context.attempt}",
+                thread_id=(
+                    f"{context.run_id}/{action_id}/{context.attempt}"
+                    + (f":{thread_scope}" if thread_scope is not None else "")
+                ),
                 checkpoint_path=context.project.action_checkpoints,
-                max_iterations=40,
+                max_iterations=_action_iteration_limit(len(manifest.entries)),
                 may_have_side_effects=False,
                 resume=resume,
                 approval_tools=envelope.approval_tools,
@@ -967,6 +1105,45 @@ class AgentActionExecutor:
                         )
                 else:
                     outcome = finalized_outcome(result.outcome)
+                    if (
+                        isinstance(outcome, RetryableFailure)
+                        and outcome.error_code == "agent_incomplete_outputs"
+                    ):
+                        emitted_paths = {
+                            entry.canonical_relpath for entry in writer.entries
+                        }
+                        missing_paths = tuple(
+                            entry.canonical_relpath
+                            for entry in manifest.entries
+                            if entry.canonical_relpath not in emitted_paths
+                        )
+                        completion_request = replace(
+                            request,
+                            user_prompt=(
+                                request.user_prompt
+                                + "\n\n# Required manifest completion\n\n"
+                                "The previous bounded agent loop completed before emitting "
+                                "the full authorized manifest. Continue the same Action using "
+                                "the original task context above, but write only every missing "
+                                "output listed below. Existing outputs are immutable: read them "
+                                "if useful, but do not rewrite them. Do not stop until each "
+                                "missing path has a successful write_file call.\n\n"
+                                "Missing outputs:\n"
+                                + "\n".join(f"- `{path}`" for path in missing_paths)
+                            ),
+                            thread_id=f"{request.thread_id}:manifest-completion",
+                            max_iterations=_action_iteration_limit(len(missing_paths)),
+                            resume=None,
+                        )
+                        completion_result = (
+                            await self._tool_context.services.agent.run_action(
+                                completion_request
+                            )
+                        )
+                        if isinstance(completion_result.outcome, AgentCompleted):
+                            outcome = finalized_outcome(completion_result.outcome)
+                        else:
+                            outcome = completion_result.outcome
             else:
                 outcome = result.outcome
             return ActionOutcomeEnvelope(
@@ -1147,6 +1324,18 @@ class DeterministicActionExecutor:
                 if gate_failure is not None:
                     error_code, failed_gate = gate_failure
                     detail = "; ".join(failed_gate.hard_errors) or failed_gate.message
+                    if error_code == "publication_lint_failed":
+                        return ActionOutcomeEnvelope(
+                            action_id=action_id,
+                            attempt=context.attempt,
+                            outcome=RepairRequired(
+                                repair_class="semantic",
+                                repair_source="action_outcome",
+                                reason_code="chapter_typography_failed",
+                                defect_codes=(error_code,),
+                                message=detail,
+                            ),
+                        )
                     return ActionOutcomeEnvelope(
                         action_id=action_id,
                         attempt=context.attempt,
@@ -1269,6 +1458,7 @@ def build_action_registry(*, tool_context: ToolContext | None = None) -> ActionR
             ("spotcheck_not_passed", "chapter.review"),
             ("independent_review_protocol_invalid", "review.independent"),
             ("translation_quality_failed", "chapter.review"),
+            ("chapter_typography_failed", "chapter.review"),
             ("epub_quality_failed", "preproduction.spec"),
             ("release_not_passed", "release.prepare"),
             ("final_manifest_missing", "output.finalize"),

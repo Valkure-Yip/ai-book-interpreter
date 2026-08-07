@@ -73,6 +73,19 @@ def test_publication_lint_flags_absolute_path(tmp_path: Path) -> None:
     assert any("absolute path" in e for e in res.hard_errors)
 
 
+def test_publication_lint_rejects_ascii_quotes_adjacent_to_cjk(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project.chapters_final / "003_bad.md").write_text(
+        '# 第三章\n\n所谓"现金交易"和\'永恒真理\'都应使用全角引号。\n',
+        encoding="utf-8",
+    )
+
+    res = publication_lint(project)
+
+    assert not res.ok
+    assert any("half-width ASCII quotation mark" in error for error in res.hard_errors)
+
+
 def test_asset_check_flags_missing_image(tmp_path: Path) -> None:
     project = _project(tmp_path)
     (project.chapters_final / "004_img.md").write_text(

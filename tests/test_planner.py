@@ -443,14 +443,17 @@ async def test_planner_returns_valid_patch_from_structured_provider_boundary() -
     assert kwargs == {
         "agent_name": "orchestration.planner",
         "prompt_version": "dynamic-plan-v1",
-        "metadata": {"logical_invocation_id": "planner:run-1:plan:1"},
+        "metadata": {
+            "run_id": "run-1",
+            "logical_invocation_id": "planner:run-1:plan:1",
+        },
         "max_retries": 2,
     }
 
 
 @pytest.mark.asyncio
-async def test_planner_rejects_provider_patch_beyond_five_actions() -> None:
-    """Catch a planner horizon expanding beyond the policy-safe five actions."""
+async def test_planner_turns_invalid_provider_horizon_into_rejectable_patch() -> None:
+    """Catch an invalid provider horizon crashing before durable policy rejection."""
     router = DeterministicPlannerProvider(
         PlanPatch(
             objective="too many actions",
@@ -462,5 +465,24 @@ async def test_planner_rejects_provider_patch_beyond_five_actions() -> None:
         )
     )
 
-    with pytest.raises(ValueError, match="at most 5 actions"):
-        await Planner(router=router).plan(_context_with_ingest_eligible())
+    patch = await Planner(router=router).plan(_context_with_ingest_eligible())
+
+    assert len(patch.proposed_actions) == 1
+    assert patch.proposed_actions[0].capability == "planner.contract.invalid"
+    assert "returned 6 actions" in patch.rationale
+
+
+@pytest.mark.asyncio
+async def test_planner_turns_empty_provider_patch_into_rejectable_patch() -> None:
+    router = DeterministicPlannerProvider(
+        PlanPatch(
+            objective="empty",
+            proposed_actions=(),
+            rationale="invalid empty response",
+        )
+    )
+
+    patch = await Planner(router=router).plan(_context_with_ingest_eligible())
+
+    assert patch.proposed_actions[0].capability == "planner.contract.invalid"
+    assert "returned 0 actions" in patch.rationale

@@ -80,12 +80,14 @@ class Scheduler:
         *,
         committed_action_ids: Collection[str] = (),
         eligible_capabilities: Collection[str] | None = None,
+        recovery_action_ids: Collection[str] = (),
     ) -> tuple[_ActionT, ...]:
         """Admit ready Actions by descending priority and stable action identity."""
         committed = frozenset(committed_action_ids)
         eligible = (
             None if eligible_capabilities is None else frozenset(eligible_capabilities)
         )
+        recoveries = frozenset(recovery_action_ids)
         selected: list[_ActionT] = []
         batch_reads: set[str] = set()
         batch_writes: set[str] = set()
@@ -93,7 +95,11 @@ class Scheduler:
         for action in ordered:
             if len(selected) >= self._max_parallel:
                 break
-            if eligible is not None and action.capability not in eligible:
+            if (
+                eligible is not None
+                and action.capability not in eligible
+                and action.action_id not in recoveries
+            ):
                 continue
             if any(dependency not in committed for dependency in action.dependencies):
                 continue

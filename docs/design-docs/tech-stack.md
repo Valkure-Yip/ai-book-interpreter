@@ -159,11 +159,13 @@ trace (root)         id = run_id
 | `false` / `0` | 用 Langfuse `mask` 钩子把字符串内容替换为 `[REDACTED]`，保留消息结构与 token / latency / model 等 metadata | 处理版权书籍；合规环境 |
 
 实现：
-- `providers/observability/langfuse_client.py::build_langfuse_handler` 根据开关，按需把 `_redacting_mask` 作为 `mask=` 注入 `CallbackHandler`。
+- `providers/observability/langfuse_client.py` 先构造 Langfuse v4 client，并根据开关按需把 `_redacting_mask` 作为 `mask=` 注入 client；每次 LangChain invocation 再创建独立 `CallbackHandler`，避免并行 Action 共享 handler 状态。
+- 每个 agent Action / structured planner call 是一个稳定命名的 trace；`run_id` 写入 `langfuse_session_id`，把同一本书的所有 traces 聚合为一个 session。动态的 action ID、attempt 和 capability 只进入 metadata/tags，不进入 trace 名称。
+- 嵌套 LangGraph agent 除 LangChain metadata 外还使用 Langfuse v4 `propagate_attributes`，确保 session、trace name 与 tags 落到 trace root，而不是只停留在子 observation metadata。
 - mask 函数递归遍历输入：`str → [REDACTED]`、`list/dict → 递归`、`role`/`type` 等结构 key 保留、原始数字/布尔保留。
 - 段落 ID / 章节 ID / book_id 是 hash，本身无内容信息，由本地 `events.jsonl` 承担——不依赖 Langfuse 是否上传全文。
 - CLI 启动横幅 + run 结尾摘要均显式打印 `payload=full|redacted`，避免"以为开了其实没开"。
-- run 结束 `router.flush()` 阻塞 Langfuse client，避免短任务 trace 丢失。
+- run 结束通过共享 client 调用 `flush()`，阻塞等待所有 Action / planner traces 上传，避免短任务退出导致 trace 丢失。
 
 ### 降级行为
 
@@ -194,7 +196,7 @@ dependencies = [
   "pydantic>=2.7,<3",
   "langchain>=0.3,<0.4",
   "langchain-openai>=0.2,<0.3",
-  "langfuse>=2.50,<3",
+  "langfuse>=4.14.1,<5",
   "typer>=0.12,<1",
   "rich>=13,<14",
   "ebooklib>=0.18,<0.19",

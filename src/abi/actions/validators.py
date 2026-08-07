@@ -203,9 +203,37 @@ def _terminal_review_result(text: str) -> str | None:
 
 def _review_failure_excerpt(text: str) -> str:
     compact = " ".join(text.split())
+    affected_files = tuple(
+        dict.fromkeys(
+            re.findall(r"chapters/final/[a-z0-9_.-]+\.md", text, flags=re.IGNORECASE)
+        )
+    )
+    affected_prefix = (
+        "affected_files: " + ", ".join(affected_files) + "; "
+        if affected_files
+        else ""
+    )
     if len(compact) <= 2000:
-        return compact
-    return f"{compact[:1000]} ... {compact[-1000:]}"
+        return affected_prefix + compact
+    return f"{affected_prefix}{compact[:1000]} ... {compact[-1000:]}"
+
+
+def _independent_review_failure_reason(
+    reviewer: str, report: str, route: str
+) -> str:
+    if reviewer == "agent_a":
+        return "translation_quality_failed"
+    chapter_typography_markers = (
+        "chapters/final/",
+        "publication_lint",
+        "stray space between cjk",
+        "straight quotation",
+        "half-width",
+    )
+    evidence = f"{report}\n{route}".lower()
+    if any(marker in evidence for marker in chapter_typography_markers):
+        return "chapter_typography_failed"
+    return "epub_quality_failed"
 
 
 def _source_split(
@@ -428,10 +456,15 @@ def _review_independent(
         capability, ReviewBatchInput, view, parameters, bundle
     ):
         return invalid
-    failure_reasons = {
-        "agent_a": "translation_quality_failed",
-        "agent_b": "epub_quality_failed",
-    }
+    try:
+        route = view.read_text("reviews/revision_route.md")
+    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
+        return _semantic_failure(
+            capability,
+            view,
+            "independent_review_protocol_invalid",
+            f"reviews/revision_route.md is unreadable: {exc}",
+        )
     for reviewer in ("agent_a", "agent_b"):
         path = f"reviews/{reviewer}/review.md"
         try:
@@ -455,18 +488,9 @@ def _review_independent(
             return _semantic_failure(
                 capability,
                 view,
-                failure_reasons[reviewer],
+                _independent_review_failure_reason(reviewer, report, route),
                 f"{path} reported a real quality failure: {_review_failure_excerpt(report)}",
             )
-    try:
-        route = view.read_text("reviews/revision_route.md")
-    except (OSError, PermissionError, UnicodeError, ValueError) as exc:
-        return _semantic_failure(
-            capability,
-            view,
-            "independent_review_protocol_invalid",
-            f"reviews/revision_route.md is unreadable: {exc}",
-        )
     if _terminal_review_result(route) != "PASS":
         return _semantic_failure(
             capability,

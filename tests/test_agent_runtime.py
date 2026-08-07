@@ -546,6 +546,91 @@ def _runtime(tmp_path: Path, model: BaseChatModel, *, cap: float | None = None) 
     return runner._set_model_for_testing(runtime, model)
 
 
+def test_agent_runtime_keeps_parallel_read_only_tool_calls() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    response = runner.ModelResponse(
+        result=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "read_file", "args": {"path": "one"}, "id": "call-1"},
+                    {"name": "read_file", "args": {"path": "two"}, "id": "call-2"},
+                ],
+            )
+        ]
+    )
+
+    limited = runner._limit_tool_call_batch(response)
+
+    assert isinstance(limited.result[0], AIMessage)
+    assert [call["id"] for call in limited.result[0].tool_calls] == ["call-1", "call-2"]
+
+
+def test_agent_runtime_serializes_mutating_tool_calls() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    response = runner.ModelResponse(
+        result=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "read_file", "args": {"path": "one"}, "id": "call-1"},
+                    {"name": "write_file", "args": {"path": "one"}, "id": "call-2"},
+                    {"name": "write_file", "args": {"path": "two"}, "id": "call-3"},
+                ],
+            )
+        ]
+    )
+
+    limited = runner._limit_tool_call_batch(response)
+
+    assert isinstance(limited.result[0], AIMessage)
+    assert [call["id"] for call in limited.result[0].tool_calls] == ["call-2"]
+
+
+def test_agent_runtime_detects_provider_content_filter_finish_reason() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    filtered = runner.ModelResponse(
+        result=[
+            AIMessage(
+                content="",
+                response_metadata={"finish_reason": "content_filter"},
+            )
+        ]
+    )
+    complete = runner.ModelResponse(
+        result=[AIMessage(content="done", response_metadata={"finish_reason": "stop"})]
+    )
+
+    assert runner._response_is_content_filtered(filtered)
+    assert not runner._response_is_content_filtered(complete)
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_retries_filtered_model_turn_with_a_fixed_bound() -> None:
+    runner = importlib.import_module("abi.providers.agent_runtime.runner")
+    filtered = runner.ModelResponse(
+        result=[
+            AIMessage(
+                content="",
+                response_metadata={"finish_reason": "content_filter"},
+            )
+        ]
+    )
+    complete = runner.ModelResponse(result=[AIMessage(content="done")])
+    responses = iter((filtered, complete))
+    calls = 0
+
+    async def handler(request: object) -> object:
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    result = await runner._invoke_with_content_filter_retries(object(), handler)
+
+    assert result is complete
+    assert calls == 2
+
+
 @pytest.mark.parametrize(
     ("thinking_mode", "expected_extra_body"),
     (
@@ -582,6 +667,7 @@ def test_agent_runtime_applies_explicit_provider_thinking_mode(
     runtime._get_model()
 
     assert len(captured) == 1
+    assert captured[0]["model_kwargs"] == {"parallel_tool_calls": False}
     if expected_extra_body is None:
         assert "extra_body" not in captured[0]
     else:

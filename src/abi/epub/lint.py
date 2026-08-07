@@ -21,6 +21,9 @@ _REPLACEMENT_CHARS = ("\ufffd", "\x00")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 # A CJK char directly followed by an ASCII letter/space then CJK is suspicious
 _CJK_SPACE_RE = re.compile(r"[\u4e00-\u9fff] [\u4e00-\u9fff]")
+_CJK_ASCII_QUOTE_RE = re.compile(
+    r'(?:["\'](?=[\u4e00-\u9fff])|(?<=[\u4e00-\u9fff])["\'])'
+)
 
 
 def _check_text(rel: str, text: str, *, cjk_target: bool, errors: list[str], warnings: list[str]) -> None:
@@ -38,6 +41,8 @@ def _check_text(rel: str, text: str, *, cjk_target: bool, errors: list[str], war
     if cjk_target and _CJK_RE.search(text):
         if _CJK_SPACE_RE.search(text):
             warnings.append(f"{rel}: stray space between CJK characters")
+        if _CJK_ASCII_QUOTE_RE.search(text):
+            errors.append(f"{rel}: half-width ASCII quotation mark adjacent to CJK text")
         if text.count(";") > max(5, len(text) // 400):
             warnings.append(f"{rel}: heavy semicolon use for a CJK target")
 

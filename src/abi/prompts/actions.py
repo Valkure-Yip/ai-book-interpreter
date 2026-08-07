@@ -45,6 +45,7 @@ class ActionPromptSnapshot(FrozenModel):
     style_rules: tuple[str, ...] = ()
     matched_terms: tuple[str, ...] = ()
     repair_context: tuple[str, ...] = ()
+    authorized_reference_paths: tuple[str, ...] = ()
 
 
 class ActionPromptRegistry:
